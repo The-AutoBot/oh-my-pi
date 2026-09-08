@@ -23,6 +23,9 @@ const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 /** Max enveloped frames buffered while a reconnect is pending; overflow is dropped. */
 const MAX_PENDING_SENDS = 256;
+/** Keep browser audio latency bounded instead of filling the WebSocket's internal send buffer. */
+const MAX_REALTIME_BUFFERED_BYTES = 5 * 1_024;
+const DROPPED_REALTIME = Promise.resolve(false);
 
 export interface CollabSocketOptions {
 	/** wss://host[:port]/r/<roomId> — no query string. */
@@ -46,12 +49,16 @@ export class CollabSocket {
 	#attempt = 0;
 	/** Terminal state: intentional close or fatal failure. Cleared by connect(). */
 	#closed = false;
-	/** Serializes seal() so frames hit the wire in send() order. */
+	/** Serializes reliable and live-input control seals so their wire order stays stable. */
 	#sendChain: Promise<void> = Promise.resolve();
 	/** Serializes open() so frames are delivered in arrival order. */
 	#recvChain: Promise<void> = Promise.resolve();
 	/** Envelopes sealed while disconnected, flushed on the next open. */
 	#pendingSends: Uint8Array<ArrayBuffer>[] = [];
+	/** A lossy live-input chunk is currently sealing or being written. */
+	#realtimeChunkSealing = false;
+	/** Invalidates a chunk that began sealing before a live-input control. */
+	#realtimeChunkGeneration = 0;
 
 	constructor(opts: CollabSocketOptions) {
 		this.#opts = opts;
@@ -87,10 +94,81 @@ export class CollabSocket {
 			});
 	}
 
+	/**
+	 * Sends a volatile live-input frame without retaining it across a disconnect.
+	 *
+	 * Chunks never enter a promise queue: one may seal at a time and a later
+	 * chunk is dropped immediately. Claim/start/stop controls stay in the
+	 * reliable send chain, preserving their order without waiting for a chunk
+	 * seal; each control invalidates an older chunk before it can replay.
+	 */
+	sendRealtime(frame: GuestFrame, targetPeer = 0): Promise<boolean> {
+		if (frame.t === "live-input-chunk") return this.#sendRealtimeChunk(frame, targetPeer);
+
+		this.#invalidateRealtimeChunks();
+		const task = this.#sendChain.then(async () => {
+			if (this.#closed) return false;
+			const ws = this.#ws;
+			if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+			const sealed = await seal(await this.#opts.key, frame);
+			const current = this.#ws;
+			if (this.#closed || current !== ws || current.readyState !== WebSocket.OPEN) return false;
+			current.send(packEnvelope(targetPeer, sealed));
+			return true;
+		});
+		this.#sendChain = task.then(
+			() => undefined,
+			() => undefined,
+		);
+		return task.catch(() => false);
+	}
+
+	#sendRealtimeChunk(frame: Extract<GuestFrame, { t: "live-input-chunk" }>, targetPeer: number): Promise<boolean> {
+		const ws = this.#ws;
+		if (
+			this.#closed ||
+			this.#realtimeChunkSealing ||
+			!ws ||
+			ws.readyState !== WebSocket.OPEN ||
+			ws.bufferedAmount >= MAX_REALTIME_BUFFERED_BYTES
+		) {
+			return DROPPED_REALTIME;
+		}
+		this.#realtimeChunkSealing = true;
+		return this.#sealRealtimeChunk(frame, targetPeer, ws, this.#realtimeChunkGeneration);
+	}
+
+	async #sealRealtimeChunk(
+		frame: Extract<GuestFrame, { t: "live-input-chunk" }>,
+		targetPeer: number,
+		ws: WebSocket,
+		generation: number,
+	): Promise<boolean> {
+		try {
+			const sealed = await seal(await this.#opts.key, frame);
+			if (
+				this.#closed ||
+				this.#realtimeChunkGeneration !== generation ||
+				this.#ws !== ws ||
+				ws.readyState !== WebSocket.OPEN ||
+				ws.bufferedAmount >= MAX_REALTIME_BUFFERED_BYTES
+			) {
+				return false;
+			}
+			ws.send(packEnvelope(targetPeer, sealed));
+			return true;
+		} catch {
+			return false;
+		} finally {
+			this.#realtimeChunkSealing = false;
+		}
+	}
+
 	/** Intentional close: clears any retry timer, suppresses reconnect. A later connect() starts fresh. */
 	close(): void {
 		const hadActivity = this.#ws !== null || this.#retryTimer !== undefined;
 		this.#clearRetry();
+		this.#invalidateRealtimeChunks();
 		const wasClosed = this.#closed;
 		this.#closed = true;
 		this.#pendingSends.length = 0;
@@ -169,6 +247,7 @@ export class CollabSocket {
 	}
 
 	#handleClose(code: number, reason: string): void {
+		this.#invalidateRealtimeChunks();
 		if (this.#closed) return;
 		const fatalReason = FATAL_CLOSE_REASONS[code];
 		if (fatalReason !== undefined) {
@@ -183,6 +262,7 @@ export class CollabSocket {
 
 	/** Decryption failure: wrong key or corrupted frame. Never reconnect. */
 	#failFatal(reason: string): void {
+		this.#invalidateRealtimeChunks();
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#clearRetry();
@@ -197,6 +277,10 @@ export class CollabSocket {
 			}
 		}
 		this.onClose?.(reason, false);
+	}
+
+	#invalidateRealtimeChunks(): void {
+		this.#realtimeChunkGeneration++;
 	}
 
 	#scheduleRetry(): void {

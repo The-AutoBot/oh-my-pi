@@ -53,6 +53,8 @@ export class CollabSocket {
 	#recvChain: Promise<void> = Promise.resolve();
 	/** Envelopes sealed while disconnected, flushed on the next open. */
 	#pendingSends: Uint8Array[] = [];
+	/** One AES-GCM seal may be in flight for a lossy realtime frame. */
+	#realtimeSealing = false;
 
 	constructor(opts: CollabSocketOptions) {
 		this.#opts = opts;
@@ -104,6 +106,42 @@ export class CollabSocket {
 			.catch((err: unknown) => {
 				logger.debug("collab: send failed", { error: String(err) });
 			});
+	}
+
+	/**
+	 * Seal and send one latency-sensitive frame without using the reconnect or
+	 * backpressure queues. Returns `false` when it was dropped before sealing.
+	 */
+	sendRealtime(frame: CollabFrame, targetPeer = 0): boolean {
+		const ws = this.#ws;
+		if (
+			this.#closed ||
+			!ws ||
+			ws.readyState !== WebSocket.OPEN ||
+			ws.bufferedAmount >= WS_BACKPRESSURE_THRESHOLD ||
+			this.#realtimeSealing
+		) {
+			return false;
+		}
+		this.#realtimeSealing = true;
+		void seal(this.#opts.key, frame)
+			.then(sealed => {
+				this.#realtimeSealing = false;
+				if (
+					this.#closed ||
+					this.#ws !== ws ||
+					ws.readyState !== WebSocket.OPEN ||
+					ws.bufferedAmount >= WS_BACKPRESSURE_THRESHOLD
+				) {
+					return;
+				}
+				ws.send(packEnvelope(targetPeer, sealed));
+			})
+			.catch((err: unknown) => {
+				this.#realtimeSealing = false;
+				logger.debug("collab: realtime send failed", { error: String(err) });
+			});
+		return true;
 	}
 
 	#enqueuePendingSend(envelope: Uint8Array, frameType: CollabFrame["t"]): void {

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use napi::{
+	Status,
 	bindgen_prelude::{Float32Array, Result},
 	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
 };
@@ -17,6 +18,19 @@ use pi_voice::live::{DEFAULT_OPEN_TIMEOUT_MS, LiveCallbacks, LivePeerCore};
 type StringCallback = ThreadsafeFunction<String, UnknownReturnValue>;
 type LevelCallback = ThreadsafeFunction<f64, UnknownReturnValue>;
 
+/// Bound the native-to-JavaScript PCM bridge. A full queue drops the newest
+/// output frame so slow browser delivery cannot accumulate decoded audio.
+const OUTPUT_CALLBACK_QUEUE_FRAMES: usize = 8;
+type OutputCallback = ThreadsafeFunction<
+	Float32Array,
+	UnknownReturnValue,
+	Float32Array,
+	Status,
+	true,
+	false,
+	OUTPUT_CALLBACK_QUEUE_FRAMES,
+>;
+
 /// WebRTC peer that accepts 16 kHz mono PCM and renders remote Opus audio.
 #[napi]
 pub struct LiveWebRtcPeer {
@@ -25,8 +39,8 @@ pub struct LiveWebRtcPeer {
 
 #[napi]
 impl LiveWebRtcPeer {
-	/// Create an idle peer and register its event, output-level, and failure
-	/// callbacks.
+	/// Create an idle peer and register its event, output-level, failure, and
+	/// optional decoded output-audio callbacks.
 	#[napi(constructor)]
 	pub fn new(
 		#[napi(ts_arg_type = "(error: Error | null, payload: string) => void")]
@@ -34,6 +48,10 @@ impl LiveWebRtcPeer {
 		#[napi(ts_arg_type = "(error: Error | null, level: number) => void")] on_level: LevelCallback,
 		#[napi(ts_arg_type = "(error: Error | null, message: string) => void")]
 		on_failure: StringCallback,
+		#[napi(
+			ts_arg_type = "((error: Error | null, samples: Float32Array) => void) | undefined | null"
+		)]
+		on_output: Option<OutputCallback>,
 	) -> Self {
 		Self {
 			inner: Arc::new(LivePeerCore::new(LiveCallbacks {
@@ -42,6 +60,14 @@ impl LiveWebRtcPeer {
 				}),
 				level:   Box::new(move |level| {
 					on_level.call(Ok(level), ThreadsafeFunctionCallMode::NonBlocking);
+				}),
+				output:  on_output.map(|on_output| {
+					Box::new(move |samples: &[f32]| {
+						let _ = on_output.call(
+							Ok(Float32Array::new(samples.to_vec())),
+							ThreadsafeFunctionCallMode::NonBlocking,
+						);
+					}) as Box<dyn Fn(&[f32]) + Send + Sync>
 				}),
 				failure: Box::new(move |message| {
 					on_failure.call(Ok(message), ThreadsafeFunctionCallMode::NonBlocking);
@@ -97,6 +123,13 @@ impl LiveWebRtcPeer {
 			.inner
 			.set_muted(muted)
 			.map_err(napi::Error::from_reason)
+	}
+
+	/// Enable or disable host-speaker playback while preserving decoded output
+	/// callbacks for a remote browser owner.
+	#[napi]
+	pub fn set_output_muted(&self, muted: bool) {
+		self.inner.set_output_muted(muted);
 	}
 
 	/// Close media, the data channel, the peer connection, and speaker playback.

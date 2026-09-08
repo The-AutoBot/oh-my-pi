@@ -532,6 +532,10 @@ export class CollabGuestLink {
 				this.#ctx.ui.requestRender();
 				break;
 			}
+			case "live-state":
+				// Terminal guests have no live-mode control surface, but must
+				// consume this host broadcast without treating it as malformed.
+				break;
 			case "bus":
 				// Mirrored host EventBus traffic (task subagent lifecycle/progress)
 				// feeding the observer HUD and Agent Hub progress columns. The

@@ -119,6 +119,30 @@
 	border-color: var(--border-strong);
 }
 
+.sh-btn-live {
+	padding: 4px 8px;
+}
+
+.sh-live-label {
+	font: 500 11px / 1.5 var(--font-mono);
+	white-space: nowrap;
+}
+
+.sh-btn-live[data-state="requesting"],
+.sh-btn-live[data-state="waiting"],
+.sh-btn-live[data-state="busy"] {
+	color: var(--warn);
+}
+
+.sh-btn-live[data-state="permission-denied"],
+.sh-btn-live[data-state="revoked"] {
+	color: var(--err);
+}
+
+.sh-btn-audio-error {
+	color: var(--err);
+}
+
 /* ---- theme toggle (system / light / dark) ---- */
 .sh-theme-toggle {
 	display: inline-flex;

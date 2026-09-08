@@ -132,6 +132,7 @@ describe("collab guest running-subagents badge", () => {
 				state: makeState(),
 				agents,
 				entryCount: 0,
+				liveInput: "none",
 			});
 		};
 		hostSocket.onOpen = () => hostOpen.resolve();

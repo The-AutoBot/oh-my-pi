@@ -108,6 +108,7 @@ describe("collab guest bus mirror", () => {
 					state: makeState(),
 					agents: [],
 					entryCount: 0,
+					liveInput: "none",
 				} as CollabFrame);
 			}
 		};

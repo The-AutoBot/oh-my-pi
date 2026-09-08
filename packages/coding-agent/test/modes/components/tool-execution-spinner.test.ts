@@ -424,6 +424,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 					},
 					agents: [],
 					entryCount: 0,
+					liveInput: "none",
 				});
 			};
 			hostSocket.connect();

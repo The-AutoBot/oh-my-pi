@@ -194,10 +194,10 @@ export declare class HighlightStream {
 /** WebRTC peer that accepts 16 kHz mono PCM and renders remote Opus audio. */
 export declare class LiveWebRtcPeer {
   /**
-   * Create an idle peer and register its event, output-level, and failure
-   * callbacks.
+   * Create an idle peer and register its event, output-level, failure, and
+   * optional decoded output-audio callbacks.
    */
-  constructor(onEvent: (error: Error | null, payload: string) => void, onLevel: (error: Error | null, level: number) => void, onFailure: (error: Error | null, message: string) => void)
+  constructor(onEvent: (error: Error | null, payload: string) => void, onLevel: (error: Error | null, level: number) => void, onFailure: (error: Error | null, message: string) => void, onOutput?: ((error: Error | null, samples: Float32Array) => void) | undefined | null)
   /** Start the native media peer and return its SDP offer. */
   createOffer(): Promise<string>
   /** Apply the remote SDP answer returned by Codex signaling. */
@@ -211,6 +211,11 @@ export declare class LiveWebRtcPeer {
    * frames.
    */
   setMuted(muted: boolean): void
+  /**
+   * Enable or disable host-speaker playback while preserving decoded output
+   * callbacks for a remote browser owner.
+   */
+  setOutputMuted(muted: boolean): void
   /** Close media, the data channel, the peer connection, and speaker playback. */
   close(): Promise<void>
 }

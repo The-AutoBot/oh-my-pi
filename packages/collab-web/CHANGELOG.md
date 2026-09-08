@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Writable collab guests can explicitly share a phone microphone with bounded PCM capture and receive lease-targeted assistant audio playback; read-only guests do not see audio controls.
+
 ## [18.1.3] - 2026-09-02
 
 ### Fixed

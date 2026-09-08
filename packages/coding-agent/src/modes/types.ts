@@ -2,12 +2,15 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
 import type { Component, Container, EditorTheme, Loader, Spacer, Text, TUI } from "@oh-my-pi/pi-tui";
+import type { LiveInput } from "@oh-my-pi/pi-wire";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
 import type {
 	AutocompleteProviderFactory,
+	EnsureCollabOptions,
+	EnsureCollabResult,
 	ExtensionCustomOptions,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -160,6 +163,15 @@ export interface InteractiveModeContext {
 	lspServers?: LspStartupServerInfo[];
 	collabHost?: CollabHost;
 	collabGuest?: CollabGuestLink;
+	ensureCollab(options?: EnsureCollabOptions): Promise<EnsureCollabResult>;
+	/** Whether the host's realtime voice controller is connecting, active, or closing. */
+	readonly liveActive: boolean;
+	/** Input currently feeding the host's realtime voice session. */
+	readonly liveInput: LiveInput;
+	/** Subscribe to realtime voice active/input state transitions. */
+	onLiveStateChange(listener: (active: boolean, input: LiveInput) => void): () => void;
+	/** Subscribe to decoded assistant PCM from a remote-input live session. */
+	onRemoteLiveOutput(listener: (samples: Float32Array) => void): () => void;
 	eventController: EventController;
 	eventBus?: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -420,8 +432,14 @@ export interface InteractiveModeContext {
 	handleRenameCommand(title: string): Promise<void>;
 	handleMemoryCommand(text: string): Promise<void>;
 	handleSTTToggle(): Promise<void>;
-	/** Start or stop the Codex-backed realtime voice session. */
+	/** Start or stop the Codex-backed realtime voice session using the host microphone. */
 	handleLiveCommand(): Promise<void>;
+	/** Start a realtime session that accepts only remote collab audio frames. */
+	startRemoteLiveInput(): Promise<boolean>;
+	/** Push one decoded browser microphone frame into a remote realtime session. */
+	pushRemoteLiveInput(samples: Float32Array): boolean;
+	/** Stop the remote realtime session without affecting a local `/live` call. */
+	stopRemoteLiveInput(): Promise<boolean>;
 	executeCompaction(
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto?: boolean,

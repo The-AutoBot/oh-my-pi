@@ -25,6 +25,23 @@ const LIVE_CALL_ID_PATTERN = /^rtc_[\w-]+$/;
 
 type Lifecycle = "idle" | "connecting" | "connected" | "closing" | "closed";
 
+type NativeOutputCallback = (error: Error | null, samples: Float32Array) => void;
+
+interface NativeLiveWebRtcPeer extends LiveWebRtcPeer {
+	setOutputMuted(muted: boolean): void;
+}
+
+type NativeLiveWebRtcPeerConstructor = new (
+	onEvent: (error: Error | null, payload: string) => void,
+	onLevel: (error: Error | null, level: number) => void,
+	onFailure: (error: Error | null, message: string) => void,
+	onOutput?: NativeOutputCallback | null,
+) => NativeLiveWebRtcPeer;
+
+// The native declaration is generated with the addon; retain the expanded
+// runtime shape while source-mode callers rebuild it.
+const NativeLiveWebRtcPeer = LiveWebRtcPeer as unknown as NativeLiveWebRtcPeerConstructor;
+
 interface LiveSignalingResult {
 	answer: string;
 	callId: string;
@@ -48,6 +65,8 @@ class LiveSignalingError extends Error {
 export interface LiveTransportCallbacks {
 	onEvent(event: LiveServerEvent): void;
 	onOutputLevel(level: number): void;
+	/** Decoded 48 kHz mono assistant PCM before optional speaker playback. */
+	onOutputAudio?(samples: Float32Array): void;
 }
 
 /** Configuration required to establish a Codex live call. */
@@ -58,6 +77,8 @@ export interface LiveTransportOptions {
 	voice: string;
 	callbacks: LiveTransportCallbacks;
 	signal?: AbortSignal;
+	/** Mute only host-speaker output; decoded output callbacks remain active. */
+	outputMuted?: boolean;
 }
 
 /** Extracts the server-assigned `rtc_*` call ID from a signaling Location header. */
@@ -117,7 +138,7 @@ function abortReason(signal: AbortSignal | undefined): Error {
 /** Native WebRTC transport for a Codex Frameless Bidi live session. */
 export class CodexLiveTransport {
 	readonly #options: LiveTransportOptions;
-	#peer: LiveWebRtcPeer | undefined;
+	#peer: NativeLiveWebRtcPeer | undefined;
 	readonly #realtimeSessionId = crypto.randomUUID();
 	#sideband: Bun.WebSocket | undefined;
 	#state: Lifecycle = "idle";
@@ -125,11 +146,13 @@ export class CodexLiveTransport {
 	#closePromise: Promise<void> | undefined;
 	#sendTail: Promise<void> = Promise.resolve();
 	#muted = false;
+	#outputMuted = false;
 	#unexpectedFailureReported = false;
 	readonly #abortListener: () => void;
 
 	constructor(options: LiveTransportOptions) {
 		this.#options = options;
+		this.#outputMuted = options.outputMuted ?? false;
 		this.#abortListener = () => {
 			void this.close();
 		};
@@ -153,7 +176,7 @@ export class CodexLiveTransport {
 	}
 
 	async #connect(): Promise<void> {
-		const peer = new LiveWebRtcPeer(
+		const peer = new NativeLiveWebRtcPeer(
 			(error, payload) => {
 				if (error) {
 					this.#handlePeerFailure(error.message);
@@ -169,13 +192,24 @@ export class CodexLiveTransport {
 				}
 			},
 			(error, message) => this.#handlePeerFailure(error?.message ?? message),
+			this.#options.callbacks.onOutputAudio
+				? (error, samples) => {
+						if (error) {
+							this.#handlePeerFailure(error.message);
+						} else {
+							this.#handleOutputAudio(samples);
+						}
+					}
+				: undefined,
 		);
 		this.#peer = peer;
+		peer.setOutputMuted(this.#outputMuted);
 		const offer = await peer.createOffer();
 		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
 		const signaling = await this.#signal(offer);
 		await peer.acceptAnswer(signaling.answer);
 		peer.setMuted(this.#muted);
+		peer.setOutputMuted(this.#outputMuted);
 		await peer.waitForOpen();
 		if (this.#state !== "connecting") throw abortReason(this.#options.signal);
 		await this.#connectSideband(signaling.callId, signaling.access, signaling.attestation);
@@ -358,6 +392,13 @@ export class CodexLiveTransport {
 		this.#reportFailure(message);
 	}
 
+	#handleOutputAudio(samples: Float32Array): void {
+		if (this.#state !== "connected" || samples.length === 0) return;
+		try {
+			this.#options.callbacks.onOutputAudio?.(samples);
+		} catch {}
+	}
+
 	#reportFailure(message: string): void {
 		if ((this.#state !== "connecting" && this.#state !== "connected") || this.#unexpectedFailureReported) {
 			return;
@@ -392,6 +433,12 @@ export class CodexLiveTransport {
 	async setMuted(muted: boolean): Promise<void> {
 		this.#muted = muted;
 		if (this.#state === "connected") this.#peer?.setMuted(muted);
+	}
+
+	/** Enable or disable local speaker output without muting decoded output callbacks. */
+	async setOutputMuted(muted: boolean): Promise<void> {
+		this.#outputMuted = muted;
+		if (this.#state === "connected") this.#peer?.setOutputMuted(muted);
 	}
 
 	/** Stop sideband signaling and the native WebRTC media peer. Safe to call repeatedly. */

@@ -35,6 +35,8 @@ import type {
 	ContextEvent,
 	ContextEventResult,
 	ContextUsage,
+	EnsureCollabOptions,
+	EnsureCollabResult,
 	Extension,
 	ExtensionActions,
 	ExtensionCommandContext,
@@ -74,6 +76,7 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 } from "./types";
+import { CollabNonInteractiveError } from "./types";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -88,6 +91,10 @@ let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
+}
+
+async function throwCollabNonInteractive(): Promise<never> {
+	throw new CollabNonInteractiveError();
 }
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
@@ -114,10 +121,12 @@ export function testSetSessionShutdownHandlerTimeoutMs(timeoutMs: number): void 
 	sessionShutdownHandlerTimeoutMs = timeoutMs;
 }
 
-/** Per-event handler budget. Defaults to the generic cap; `session_shutdown`
- *  uses its own short cap so teardown stays prompt. */
+/** Per-event handler budget. Teardown-related lifecycle events use the short
+ *  shutdown cap so extension cleanup cannot stall process exit. */
 function handlerTimeoutForEvent(eventType: string): number {
-	return eventType === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs;
+	return eventType === "session_shutdown" || eventType === "collab_stopped"
+		? sessionShutdownHandlerTimeoutMs
+		: extensionHandlerTimeoutMs;
 }
 
 const EXTENSION_HANDLER_TIMEOUT = Symbol("extensionHandlerTimeout");
@@ -446,6 +455,7 @@ export class ExtensionRunner {
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
+	#ensureCollabFn: (options?: EnsureCollabOptions) => Promise<EnsureCollabResult> = throwCollabNonInteractive;
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
@@ -685,6 +695,7 @@ export class ExtensionRunner {
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		this.#ensureCollabFn = contextActions.ensureCollab ?? throwCollabNonInteractive;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -1187,6 +1198,7 @@ export class ExtensionRunner {
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
+			ensureCollab: options => this.#ensureCollabFn(options),
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),

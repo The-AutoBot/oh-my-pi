@@ -3,6 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt } from "@oh-my-pi/pi-utils";
+import type { LiveInput } from "@oh-my-pi/pi-wire";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
@@ -44,6 +45,9 @@ export interface LiveSessionCallbacks {
 	onTerminal(error?: Error): void;
 }
 
+/** The input source used by one connected realtime session. */
+export type LiveSessionInput = Exclude<LiveInput, "none">;
+
 /** Dependencies and presentation callbacks for a live session. */
 export interface LiveSessionControllerOptions {
 	/** Agent session that performs all delegated coding work. */
@@ -51,9 +55,15 @@ export interface LiveSessionControllerOptions {
 	/** UI callbacks for live session state. */
 	callbacks: LiveSessionCallbacks;
 	/** Extracts visible assistant text using the caller's normal UI rules. */
-	extractAssistantText(message: AssistantMessage): string;
+	extractAssistantText: (message: AssistantMessage) => string;
 	/** Realtime output voice, defaulting to sol. */
 	voice?: string;
+	/** Input source; `/live` defaults to the terminal-local microphone. */
+	input?: LiveSessionInput;
+	/** Receives decoded 48 kHz mono output for remote-input browser playback. */
+	onOutputAudio?(samples: Float32Array): void;
+	/** Mute host speakers while preserving decoded output callbacks. */
+	outputMuted?: boolean;
 }
 
 function errorFrom(cause: unknown): Error {
@@ -93,6 +103,8 @@ export class LiveSessionController {
 	readonly #callbacks: LiveSessionCallbacks;
 	readonly #extractAssistantText: (message: AssistantMessage) => string;
 	readonly #voice: string;
+	readonly #input: LiveSessionInput;
+	readonly #onOutputAudio: ((samples: Float32Array) => void) | undefined;
 
 	#transport: CodexLiveTransport | undefined;
 	#recorder: AudioCapture | undefined;
@@ -104,6 +116,7 @@ export class LiveSessionController {
 	#terminalEmitted = false;
 	#failure: Error | undefined;
 	#muted = false;
+	#outputMuted = false;
 	#phase: LivePhase = "connecting";
 	#inputLevel = 0;
 	#outputLevel = 0;
@@ -121,6 +134,9 @@ export class LiveSessionController {
 		this.#callbacks = options.callbacks;
 		this.#extractAssistantText = options.extractAssistantText;
 		this.#voice = options.voice?.trim() || DEFAULT_LIVE_VOICE;
+		this.#input = options.input ?? "local";
+		this.#onOutputAudio = options.onOutputAudio;
+		this.#outputMuted = options.outputMuted ?? this.#input === "remote";
 	}
 
 	/** Current realtime call phase. */
@@ -133,7 +149,12 @@ export class LiveSessionController {
 		return this.#muted;
 	}
 
-	/** Connects the realtime surface and starts microphone streaming. */
+	/** Input source selected for this controller's lifetime. */
+	get input(): LiveSessionInput {
+		return this.#input;
+	}
+
+	/** Connects the realtime surface and starts the selected input source. */
 	async start(): Promise<void> {
 		if (this.#stopped) {
 			throw (
@@ -156,9 +177,16 @@ export class LiveSessionController {
 				sessionId: this.#session.sessionId,
 				instructions,
 				voice: this.#voice,
+				outputMuted: this.#outputMuted,
 				callbacks: {
 					onEvent: event => this.#guardEvent(() => this.#handleLiveEvent(event)),
 					onOutputLevel: level => this.#guardEvent(() => this.#handleOutputLevel(level)),
+					...(this.#onOutputAudio
+						? {
+								onOutputAudio: (samples: Float32Array) =>
+									this.#guardEvent(() => this.#handleOutputAudio(samples)),
+							}
+						: {}),
 				},
 			});
 			this.#transport = transport;
@@ -173,22 +201,24 @@ export class LiveSessionController {
 			if (this.#stopped) {
 				throw this.#failure ?? new Error("The live session stopped before recording began.");
 			}
-			const recorder = new AudioCapture(16_000, (error, samples) => {
-				if (error) {
-					this.#reportFailure(error);
-					return;
+			if (this.#input === "local") {
+				const recorder = new AudioCapture(16_000, (error, samples) => {
+					if (error) {
+						this.#reportFailure(error);
+						return;
+					}
+					this.#handleInputAudio(samples);
+				});
+				if (this.#stopped) {
+					try {
+						recorder.stop();
+					} catch {
+						// Preserve the failure that stopped startup.
+					}
+					throw this.#failure ?? new Error("The live session stopped while recording began.");
 				}
-				this.#handleMicrophoneAudio(samples);
-			});
-			if (this.#stopped) {
-				try {
-					recorder.stop();
-				} catch {
-					// Preserve the failure that stopped startup.
-				}
-				throw this.#failure ?? new Error("The live session stopped while recording began.");
+				this.#recorder = recorder;
 			}
-			this.#recorder = recorder;
 			this.#refreshAudioPhase();
 		} catch (cause) {
 			const error = errorFrom(cause);
@@ -211,6 +241,13 @@ export class LiveSessionController {
 		if (transport) {
 			void transport.setMuted(this.#muted).catch(cause => this.#reportFailure(errorFrom(cause)));
 		}
+	}
+
+	/** Enable or disable host-speaker playback while keeping remote output taps active. */
+	async setOutputMuted(muted: boolean): Promise<void> {
+		if (this.#stopped) return;
+		this.#outputMuted = muted;
+		await this.#transport?.setOutputMuted(muted);
 	}
 
 	/** Stops recording, closes the live session, and emits one terminal callback. */
@@ -357,18 +394,33 @@ export class LiveSessionController {
 		if (!this.#activeDelegationId) this.#refreshAudioPhase();
 	}
 
-	#handleMicrophoneAudio(samples: Float32Array): void {
-		if (this.#stopped || !this.#transport) return;
-		if (this.#muted) return;
+	#handleOutputAudio(samples: Float32Array): void {
+		if (this.#input !== "remote") return;
+		this.#onOutputAudio?.(samples);
+	}
+
+	/**
+	 * Feeds one 16 kHz mono remote-input frame into the existing live transport.
+	 * Remote controllers never instantiate {@link AudioCapture}.
+	 */
+	pushRemoteAudio(samples: Float32Array): boolean {
+		if (this.#input !== "remote") return false;
+		return this.#handleInputAudio(samples);
+	}
+
+	#handleInputAudio(samples: Float32Array): boolean {
+		if (this.#stopped || !this.#transport || this.#muted) return false;
 		this.#inputLevel = microphoneLevel(samples);
 		this.#emitLevels();
 		const outputActive = this.#outputLevel > OUTPUT_ACTIVE_LEVEL;
 		const echoThreshold = Math.max(MIN_BARGE_IN_LEVEL, this.#outputLevel * OUTPUT_ECHO_RATIO);
-		if (outputActive && this.#inputLevel < echoThreshold) return;
+		if (outputActive && this.#inputLevel < echoThreshold) return true;
 		try {
 			this.#transport.pushAudio(samples);
+			return true;
 		} catch (cause) {
 			this.#reportFailure(errorFrom(cause));
+			return false;
 		}
 	}
 

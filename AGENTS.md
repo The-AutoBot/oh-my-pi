@@ -334,3 +334,7 @@ Location: `packages/*/CHANGELOG.md` (per package).
 2. Run `bun run release`.
 
 The script handles version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+
+## Recent Updates
+
+- 2026-09-07: Added collaboration lifecycle support and protocol-v4 browser live-audio contracts.

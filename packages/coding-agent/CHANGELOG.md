@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Extensions can start or reuse interactive collaboration sessions and observe their lifecycle and pending-input state.
+- Authorized browser guests can provide live voice input and receive assistant audio without using the host microphone.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed

@@ -53,10 +53,11 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import type { LiveInput } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../capability";
 import { restartArgv } from "../cli/flag-tables";
 import type { CollabGuestLink } from "../collab/guest";
-import type { CollabHost } from "../collab/host";
+import { CollabHost } from "../collab/host";
 import { formatKeyHint, KeybindingsManager } from "../config/keybindings";
 import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
@@ -71,6 +72,8 @@ import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
+	EnsureCollabOptions,
+	EnsureCollabResult,
 	ExtensionCustomOptions,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -710,8 +713,113 @@ export class InteractiveMode implements InteractiveModeContext {
 	fileSlashCommands: Set<string> = new Set();
 	skillCommands: Map<string, Skill> = new Map();
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
-	collabHost?: CollabHost;
-	collabGuest?: CollabGuestLink;
+	#collabHost?: CollabHost;
+	#collabGuest?: CollabGuestLink;
+	#collabStartPromise?: Promise<EnsureCollabResult>;
+	#collabStartingHost?: CollabHost;
+	#startedCollabHosts = new WeakSet<CollabHost>();
+
+	get collabHost(): CollabHost | undefined {
+		return this.#collabHost;
+	}
+
+	set collabHost(host: CollabHost | undefined) {
+		this.#collabHost = host;
+	}
+
+	get collabGuest(): CollabGuestLink | undefined {
+		return this.#collabGuest;
+	}
+
+	set collabGuest(guest: CollabGuestLink | undefined) {
+		if (guest && guest !== this.#collabGuest) {
+			const host = this.#collabHost ?? this.#collabStartingHost;
+			if (host) {
+				if (this.#collabHost === host) this.#collabHost = undefined;
+				void host.stop("joined another collab session");
+			}
+		}
+		this.#collabGuest = guest;
+	}
+
+	ensureCollab(options: EnsureCollabOptions = {}): Promise<EnsureCollabResult> {
+		if (this.collabHost) return Promise.resolve(this.#collabResult(this.collabHost, true));
+		if (this.#collabStartPromise) {
+			return this.#collabStartPromise.then(() => {
+				if (!this.collabHost) throw new Error("Collaboration stopped while the host was starting.");
+				return this.#collabResult(this.collabHost, true);
+			});
+		}
+
+		const starting = this.#startCollab(options);
+		this.#collabStartPromise = starting;
+		return starting.finally(() => {
+			if (this.#collabStartPromise === starting) this.#collabStartPromise = undefined;
+		});
+	}
+
+	async #startCollab(options: EnsureCollabOptions): Promise<EnsureCollabResult> {
+		if (this.collabGuest) throw new Error("Already in a collab session as a guest. Leave first.");
+
+		const relayInput = options.relayUrl ?? this.settings.get("collab.relayUrl") ?? "";
+		if (!relayInput) {
+			throw new Error("No relay configured. Set collab.relayUrl in /settings or pass a relay URL.");
+		}
+		const relayUrl = relayInput.includes("://") ? relayInput : `wss://${relayInput}`;
+		const webUrl = options.webUrl ?? this.settings.get("collab.webUrl") ?? "";
+		const host = new CollabHost(this, stoppedHost => this.#handleCollabStopped(stoppedHost));
+		this.#collabStartingHost = host;
+		try {
+			await host.start(relayUrl, webUrl);
+			if (this.#isShuttingDown) {
+				await host.stop("host shutdown");
+				throw new Error("Collaboration stopped because the session is closing.");
+			}
+			if (this.collabGuest) {
+				await host.stop("joined another collab session");
+				throw new Error("Already in a collab session as a guest. Leave first.");
+			}
+			this.collabHost = host;
+			this.#startedCollabHosts.add(host);
+			await this.#emitCollabStarted(host);
+			if (this.collabHost !== host) {
+				throw new Error("Collaboration stopped while the started handlers were running.");
+			}
+			return this.#collabResult(host, false);
+		} finally {
+			if (this.#collabStartingHost === host) this.#collabStartingHost = undefined;
+		}
+	}
+
+	#collabLinks(host: CollabHost) {
+		return Object.freeze({
+			link: host.link,
+			webLink: host.webLink,
+			viewLink: host.viewLink,
+			webViewLink: host.webViewLink,
+		});
+	}
+
+	#collabResult(host: CollabHost, reused: boolean): EnsureCollabResult {
+		return Object.freeze({ ...this.#collabLinks(host), reused });
+	}
+
+	async #emitCollabStarted(host: CollabHost): Promise<void> {
+		await this.session.extensionRunner?.emit(
+			Object.freeze({ type: "collab_started" as const, ...this.#collabLinks(host) }),
+		);
+	}
+
+	async #handleCollabStopped(host: CollabHost): Promise<void> {
+		if (!this.#startedCollabHosts.delete(host)) return;
+		await this.#emitCollabStopped(host);
+	}
+
+	async #emitCollabStopped(host: CollabHost): Promise<void> {
+		await this.session.extensionRunner?.emit(
+			Object.freeze({ type: "collab_stopped" as const, ...this.#collabLinks(host) }),
+		);
+	}
 
 	#pendingCommandOutput: Component[] = [];
 	#pendingCommandOutputSessionId: string | undefined;
@@ -768,6 +876,18 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 	get eventBus(): EventBus | undefined {
 		return this.#eventBus;
+	}
+	get liveActive(): boolean {
+		return this.#liveCommandController.active;
+	}
+	get liveInput(): LiveInput {
+		return this.#liveCommandController.input;
+	}
+	onLiveStateChange(listener: (active: boolean, input: LiveInput) => void): () => void {
+		return this.#liveCommandController.onLiveStateChange(listener);
+	}
+	onRemoteLiveOutput(listener: (samples: Float32Array) => void): () => void {
+		return this.#liveCommandController.onRemoteOutputAudio(listener);
 	}
 	readonly #extensionUiController: ExtensionUiController;
 	readonly #inputController: InputController;
@@ -4870,6 +4990,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */
 	async #teardown(): Promise<void> {
+		await this.#collabStartingHost?.stop("host shutdown");
+		await this.#collabStartPromise?.catch(() => undefined);
+		await this.collabHost?.stop("host shutdown");
 		await this.#liveCommandController.stop();
 
 		this.#btwController.dispose();
@@ -5588,6 +5711,28 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		await this.#liveCommandController.handleCommand();
+	}
+
+	/**
+	 * Starts live mode for an authenticated remote microphone owner without
+	 * opening AudioCapture on this host.
+	 */
+	startRemoteLiveInput(): Promise<boolean> {
+		if (this.#sttController && this.#sttController.state !== "idle") {
+			this.showWarning("Finish the current speech-to-text capture before starting live mode.");
+			return Promise.resolve(false);
+		}
+		return this.#liveCommandController.startRemoteInput();
+	}
+
+	/** Passes a validated, decoded browser microphone frame to remote live mode. */
+	pushRemoteLiveInput(samples: Float32Array): boolean {
+		return this.#liveCommandController.pushRemoteAudio(samples);
+	}
+
+	/** Stops only a remote-input live session. */
+	stopRemoteLiveInput(): Promise<boolean> {
+		return this.#liveCommandController.stopRemoteInput();
 	}
 
 	#setMicCursor(color: { r: number; g: number; b: number }): void {

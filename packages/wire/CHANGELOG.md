@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Upgraded the collaboration protocol to version 4. Hosts and guests now exchange live input ownership and audio frames; earlier clients are rejected during the handshake.
+
 ## [16.3.0] - 2026-07-02
 
 ### Breaking Changes

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { unpackEnvelope } from "../../src/collab/protocol";
 import { CollabSocket } from "../../src/collab/relay-client";
 
 const ORIGINAL_WEBSOCKET = globalThis.WebSocket;
@@ -117,6 +118,46 @@ describe("CollabSocket send backpressure", () => {
 			vi.advanceTimersByTime(DRAIN_RETRY_MS);
 			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
 			expect(ws.sent).toHaveLength(1);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("drops targeted realtime output under pressure instead of replaying it after drain", async () => {
+		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/backpressure",
+			role: "host",
+			key: {} as CryptoKey,
+		});
+		const output = {
+			t: "live-output-chunk" as const,
+			leaseId: "lease-1",
+			seq: 0,
+			format: "pcm_s16le" as const,
+			sampleRate: 48_000 as const,
+			channels: 1 as const,
+			frameSamples: 1,
+			data: "AA",
+		};
+
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0];
+			if (!ws) throw new Error("CollabSocket did not construct a WebSocket");
+			ws.open();
+			expect(socket.sendRealtime(output, 17)).toBe(false);
+			ws.bufferedAmount = 0;
+			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
+			expect(ws.sent).toHaveLength(0);
+
+			expect(socket.sendRealtime(output, 17)).toBe(true);
+			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
+			expect(ws.sent).toHaveLength(1);
+			expect(unpackEnvelope(ws.sent[0]!)?.peerId).toBe(17);
 		} finally {
 			socket.close();
 		}

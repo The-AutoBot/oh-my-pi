@@ -1,6 +1,12 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
-import { LiveSessionController, type LiveSessionControllerOptions, type LiveTranscript } from "../../live/controller";
+import type { LiveInput } from "@oh-my-pi/pi-wire";
+import {
+	LiveSessionController,
+	type LiveSessionControllerOptions,
+	type LiveSessionInput,
+	type LiveTranscript,
+} from "../../live/controller";
 import { LIVE_MODEL } from "../../live/protocol";
 import { LiveVisualizer } from "../../live/visualizer";
 import { vocalizer } from "../../tts/vocalizer";
@@ -12,6 +18,8 @@ import { createAssistantMessageComponent } from "../utils/interactive-context-he
 
 const ANIMATION_INTERVAL_MS = 80;
 type LiveSessionFactory = (options: LiveSessionControllerOptions) => LiveSessionController;
+type LiveStateListener = (active: boolean, input: LiveInput) => void;
+type RemoteOutputListener = (samples: Float32Array) => void;
 
 const LIVE_MESSAGE_USAGE: AssistantMessage["usage"] = {
 	input: 0,
@@ -30,6 +38,12 @@ export class LiveCommandController {
 	readonly #ctx: InteractiveModeContext;
 	readonly #createSession: LiveSessionFactory | undefined;
 
+	#activeListeners = new Set<(active: boolean) => void>();
+	#liveStateListeners = new Set<LiveStateListener>();
+	#remoteOutputListeners = new Set<RemoteOutputListener>();
+	#lastEmittedActive = false;
+	#lastEmittedInput: LiveInput = "none";
+	#commandChain: Promise<void> = Promise.resolve();
 	#session: LiveSessionController | undefined;
 	#settling: Promise<void> | undefined;
 	#visualizer: LiveVisualizer | undefined;
@@ -52,14 +66,86 @@ export class LiveCommandController {
 		return this.#session !== undefined || this.#settling !== undefined;
 	}
 
+	/** Input currently feeding live mode; closing sessions report no input. */
+	get input(): LiveInput {
+		return this.#session?.input ?? "none";
+	}
+
+	/** Subscribe to transitions of {@link active}. */
+	onActiveChange(listener: (active: boolean) => void): () => void {
+		this.#activeListeners.add(listener);
+		return () => this.#activeListeners.delete(listener);
+	}
+
+	/** Subscribe to active/input state changes for collaboration replication. */
+	onLiveStateChange(listener: LiveStateListener): () => void {
+		this.#liveStateListeners.add(listener);
+		return () => this.#liveStateListeners.delete(listener);
+	}
+
+	/** Subscribe to decoded assistant PCM from an active remote-input session. */
+	onRemoteOutputAudio(listener: RemoteOutputListener): () => void {
+		this.#remoteOutputListeners.add(listener);
+		return () => this.#remoteOutputListeners.delete(listener);
+	}
+
 	/** Start live mode, or stop the currently active session. */
-	async handleCommand(): Promise<void> {
+	handleCommand(): Promise<void> {
+		const command = this.#commandChain.then(() => this.#handleCommand());
+		this.#commandChain = command.catch(() => {});
+		return command;
+	}
+
+	/**
+	 * Starts a live session whose audio is supplied by a remote collab peer.
+	 * This never opens the terminal host microphone.
+	 */
+	startRemoteInput(): Promise<boolean> {
+		const command = this.#commandChain.then(() => this.#startRemoteInput());
+		this.#commandChain = command.then(
+			() => {},
+			() => {},
+		);
+		return command;
+	}
+
+	/** Delivers a validated remote audio frame to the active remote session. */
+	pushRemoteAudio(samples: Float32Array): boolean {
+		const session = this.#session;
+		return session?.input === "remote" ? session.pushRemoteAudio(samples) : false;
+	}
+
+	/** Stops only a remote-input session, leaving a local `/live` call intact. */
+	stopRemoteInput(): Promise<boolean> {
+		const command = this.#commandChain.then(async () => {
+			const session = this.#session;
+			if (session?.input !== "remote") return false;
+			await this.stop();
+			return true;
+		});
+		this.#commandChain = command.then(
+			() => {},
+			() => {},
+		);
+		return command;
+	}
+
+	async #startRemoteInput(): Promise<boolean> {
+		if (this.#session || this.#settling) return false;
+		return this.#start("remote");
+	}
+
+	async #handleCommand(): Promise<void> {
 		if (this.#session) {
 			await this.stop();
 			return;
 		}
 		if (this.#settling) await this.#settling;
-		await this.#start();
+		if (this.#session) {
+			await this.stop();
+			return;
+		}
+		await this.#start("local");
 	}
 
 	/** Stop the active live session and restore the editor. */
@@ -91,7 +177,7 @@ export class LiveCommandController {
 		}
 	}
 
-	async #start(): Promise<void> {
+	async #start(input: LiveSessionInput): Promise<boolean> {
 		this.#assistantTranscriptTurn = 0;
 		this.#assistantTranscriptStartedAt = 0;
 		const visualizer = new LiveVisualizer({
@@ -107,6 +193,7 @@ export class LiveCommandController {
 			session: this.#ctx.session,
 			extractAssistantText: message => this.#ctx.extractAssistantText(message),
 			voice: this.#ctx.settings.get("live.voice"),
+			input,
 			callbacks: {
 				onPhase: phase => {
 					if (this.#visualizer !== visualizer) return;
@@ -132,18 +219,35 @@ export class LiveCommandController {
 				},
 				onTerminal: error => this.#finish(session, error),
 			},
+			...(input === "remote"
+				? {
+						onOutputAudio: (samples: Float32Array) => {
+							if (this.#session !== session || session.input !== "remote") return;
+							for (const listener of this.#remoteOutputListeners) listener(samples);
+						},
+						outputMuted: true,
+					}
+				: {}),
 		};
 		const session = this.#createSession ? this.#createSession(options) : new LiveSessionController(options);
 		this.#session = session;
+		this.#emitLiveStateChange();
 
 		try {
 			await session.start();
 		} catch (cause) {
 			if (this.#session === session) {
-				await session.stop();
+				try {
+					await session.stop();
+				} catch (stopCause) {
+					logger.debug("Live session cleanup after failed start failed", {
+						error: errorFrom(stopCause).message,
+					});
+				}
 				this.#finish(session, errorFrom(cause));
 			}
 		}
+		return this.#session === session;
 	}
 
 	#presentAssistantTranscript(transcript: LiveTranscript): void {
@@ -218,6 +322,22 @@ export class LiveCommandController {
 		this.#ctx.ui.requestRender();
 	}
 
+	#emitActiveChange(): void {
+		const active = this.active;
+		if (active === this.#lastEmittedActive) return;
+		this.#lastEmittedActive = active;
+		for (const listener of this.#activeListeners) listener(active);
+	}
+
+	#emitLiveStateChange(): void {
+		const active = this.active;
+		const input = this.input;
+		if (active === this.#lastEmittedActive && input === this.#lastEmittedInput) return;
+		this.#lastEmittedInput = input;
+		for (const listener of this.#liveStateListeners) listener(active, input);
+		this.#emitActiveChange();
+	}
+
 	#finish(session: LiveSessionController, error?: Error): void {
 		if (this.#session !== session) return;
 		this.#session = undefined;
@@ -227,8 +347,11 @@ export class LiveCommandController {
 			logger.debug("Live session cleanup failed", { error: errorFrom(cause).message });
 		});
 		this.#settling = settling;
+		this.#emitLiveStateChange();
 		void settling.finally(() => {
-			if (this.#settling === settling) this.#settling = undefined;
+			if (this.#settling !== settling) return;
+			this.#settling = undefined;
+			this.#emitLiveStateChange();
 		});
 	}
 

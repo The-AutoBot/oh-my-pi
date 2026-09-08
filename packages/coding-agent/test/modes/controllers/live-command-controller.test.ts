@@ -60,11 +60,13 @@ afterEach(() => {
 });
 
 describe("LiveCommandController", () => {
-	it("forwards the selected voice across the live-session boundary", async () => {
+	it("forwards the selected voice and local input across the live-session boundary", async () => {
 		const { ctx } = createContext();
 		let receivedVoice: string | undefined;
+		let receivedInput: "local" | "remote" | undefined;
 		const controller = new LiveCommandController(ctx, options => {
 			receivedVoice = options.voice;
+			receivedInput = options.input;
 			const session = new LiveSessionController(options);
 			vi.spyOn(session, "start").mockResolvedValue();
 			vi.spyOn(session, "stop").mockResolvedValue();
@@ -74,6 +76,36 @@ describe("LiveCommandController", () => {
 		try {
 			await controller.handleCommand();
 			expect(receivedVoice).toBe("vale");
+			expect(receivedInput).toBe("local");
+		} finally {
+			await controller.stop();
+		}
+	});
+
+	it("starts, feeds, and stops an explicit remote input session without selecting host-local capture", async () => {
+		const { ctx } = createContext();
+		let receivedInput: "local" | "remote" | undefined;
+		const pushedFrames: Float32Array[] = [];
+		const controller = new LiveCommandController(ctx, options => {
+			receivedInput = options.input;
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			vi.spyOn(session, "pushRemoteAudio").mockImplementation(frame => {
+				pushedFrames.push(frame);
+				return true;
+			});
+			return session;
+		});
+		const samples = new Float32Array([0.25, -0.5]);
+
+		try {
+			expect(await controller.startRemoteInput()).toBe(true);
+			expect(receivedInput).toBe("remote");
+			expect(controller.input).toBe("remote");
+			expect(controller.pushRemoteAudio(samples)).toBe(true);
+			expect(pushedFrames).toEqual([samples]);
+			expect(await controller.stopRemoteInput()).toBe(true);
 		} finally {
 			await controller.stop();
 		}
@@ -88,6 +120,8 @@ describe("LiveCommandController", () => {
 			vi.spyOn(session, "stop").mockImplementation(stop);
 			return session;
 		});
+		const activeStates: boolean[] = [];
+		controller.onActiveChange(active => activeStates.push(active));
 
 		await controller.handleCommand();
 		expect(controller.active).toBe(true);
@@ -108,5 +142,36 @@ describe("LiveCommandController", () => {
 		// clears; drain microtasks deterministically instead of sleeping.
 		for (let i = 0; controller.active && i < 20; i++) await Promise.resolve();
 		expect(controller.active).toBe(false);
+		expect(activeStates).toEqual([true, false]);
+	});
+
+	it("serializes toggles that arrive while a prior session is still settling", async () => {
+		const { ctx } = createContext();
+		const cleanup = Promise.withResolvers<void>();
+		const sessions: LiveSessionController[] = [];
+		const controller = new LiveCommandController(ctx, options => {
+			const session = new LiveSessionController(options);
+			const index = sessions.length;
+			sessions.push(session);
+			vi.spyOn(session, "start").mockResolvedValue();
+			if (index === 0) {
+				let stopCalls = 0;
+				vi.spyOn(session, "stop").mockImplementation(() => {
+					stopCalls++;
+					return stopCalls === 1 ? Promise.resolve() : cleanup.promise;
+				});
+			} else {
+				vi.spyOn(session, "stop").mockResolvedValue();
+			}
+			return session;
+		});
+
+		await controller.handleCommand();
+		await controller.stop();
+		const toggles = [controller.handleCommand(), controller.handleCommand()];
+		cleanup.resolve();
+		await Promise.all(toggles);
+
+		expect(sessions).toHaveLength(2);
 	});
 });

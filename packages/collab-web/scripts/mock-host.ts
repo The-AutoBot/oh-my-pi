@@ -200,6 +200,7 @@ function handleHello(name: string, proto: number, fromPeer: number): void {
 			state: buildState(),
 			agents: agents.map(agent => ({ ...agent })),
 			entryCount: entries.length,
+			liveInput: "none",
 		},
 		fromPeer,
 	);

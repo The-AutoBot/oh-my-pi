@@ -159,6 +159,28 @@ describe("ExtensionRunner", () => {
 		expect(runner.createContext().mode).toBe("tui");
 	});
 
+	it("rejects ensureCollab outside the interactive TUI even when given room options", async () => {
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+
+		await expect(
+			runner.createContext().ensureCollab({
+				relayUrl: "ws://localhost:8788",
+				webUrl: "https://dashboard.example.test",
+			}),
+		).rejects.toMatchObject({
+			name: "CollabNonInteractiveError",
+			code: "collab-noninteractive",
+			message: "Collaboration is only available in interactive mode.",
+		});
+	});
+
 	it("uses required context actions when command actions are unavailable", async () => {
 		const result = await loadTestExtensions();
 		const runner = new ExtensionRunner(

@@ -12,6 +12,7 @@ import type {
 	BusChannel,
 	CollabUiRequest,
 	GuestFrame,
+	LiveInput,
 	ParsedCollabLink,
 	Participant,
 	SessionState,
@@ -62,7 +63,7 @@ export type CollabSessionState = SessionState & {
  * that serialize into those shapes.
  */
 export type CollabFrame =
-	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
+	// guest -> host frames are taken verbatim from the wire grammar.
 	| Exclude<GuestFrame, { t: "prompt" }>
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	// host -> guest
@@ -79,6 +80,10 @@ export type CollabFrame =
 			 * (or a chunk arrives with `final: true`).
 			 */
 			entryCount: number;
+			/** Whether the host's realtime voice mode is active. */
+			liveActive?: boolean;
+			/** Input currently feeding the host's realtime voice session. */
+			liveInput: LiveInput;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
@@ -94,6 +99,24 @@ export type CollabFrame =
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentSessionEvent }
 	| { t: "state"; state: CollabSessionState }
+	| { t: "live-state"; active: boolean; input: LiveInput }
+	| {
+			t: "live-output-chunk";
+			leaseId: string;
+			seq: number;
+			format: "pcm_s16le";
+			sampleRate: 48_000;
+			channels: 1;
+			frameSamples: number;
+			data: string;
+	  }
+	| {
+			t: "live-input-lease";
+			requestId: string;
+			status: "granted" | "busy" | "read-only" | "unavailable" | "revoked";
+			leaseId?: string;
+			message?: string;
+	  }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	/** Full agent-registry snapshot (debounced on registry change). */

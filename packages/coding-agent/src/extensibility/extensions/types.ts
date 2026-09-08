@@ -452,6 +452,39 @@ export interface ExtensionModelQuery {
 /** Runtime host mode exposed to Pi-compatible extensions. */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+/**
+ * Optional URLs for a collaboration host. Omitted values use the active
+ * interactive session's collaboration settings.
+ */
+export interface EnsureCollabOptions {
+	relayUrl?: string;
+	webUrl?: string;
+}
+
+/** Immutable full-control and read-only links for an active collaboration host. */
+export interface CollabLinks {
+	readonly link: string;
+	readonly webLink: string;
+	readonly viewLink: string;
+	readonly webViewLink: string;
+}
+
+/** Result of {@link ExtensionContext.ensureCollab}. */
+export interface EnsureCollabResult extends CollabLinks {
+	/** `true` when this call reused the session's existing host. */
+	readonly reused: boolean;
+}
+
+/** Raised when an extension requests collaboration from a noninteractive host. */
+export class CollabNonInteractiveError extends Error {
+	readonly code = "collab-noninteractive";
+
+	constructor() {
+		super("Collaboration is only available in interactive mode.");
+		this.name = "CollabNonInteractiveError";
+	}
+}
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -465,6 +498,12 @@ export interface ExtensionContext {
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
 	hasUI: boolean;
+	/**
+	 * Start collaboration for this interactive session, or reuse its active host.
+	 * The returned links grant session access; extensions MUST NOT log them.
+	 * Rejects with {@link CollabNonInteractiveError} outside interactive mode.
+	 */
+	ensureCollab(options?: EnsureCollabOptions): Promise<EnsureCollabResult>;
 	/** Current working directory */
 	cwd: string;
 	/** Session manager (read-only) */
@@ -734,6 +773,26 @@ export type {
 	SessionTreeEvent,
 	TreePreparation,
 } from "../shared-events";
+
+// ============================================================================
+// Collaboration Events
+// ============================================================================
+
+/** Fired once a collaboration host becomes active for this interactive session. */
+export interface CollabStartedEvent extends CollabLinks {
+	type: "collab_started";
+}
+
+/** Fired once an active collaboration host has stopped. */
+export interface CollabStoppedEvent extends CollabLinks {
+	type: "collab_stopped";
+}
+
+/** Fired when the active collaboration host gains or clears pending interactive input. */
+export interface CollabInputStateEvent {
+	type: "collab_input_state";
+	needsInput: boolean;
+}
 
 // ============================================================================
 // Agent Events
@@ -1068,6 +1127,9 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 export type ExtensionEvent =
 	| ResourcesDiscoverEvent
 	| SessionEvent
+	| CollabStartedEvent
+	| CollabStoppedEvent
+	| CollabInputStateEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
@@ -1235,6 +1297,9 @@ export interface ExtensionAPI {
 
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
+	on(event: "collab_started", handler: ExtensionHandler<CollabStartedEvent>): void;
+	on(event: "collab_stopped", handler: ExtensionHandler<CollabStoppedEvent>): void;
+	on(event: "collab_input_state", handler: ExtensionHandler<CollabInputStateEvent>): void;
 	on(
 		event: "session_before_switch",
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
@@ -1722,6 +1787,8 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	/** Present only in the interactive TUI; other hosts reject with `collab-noninteractive`. */
+	ensureCollab?: (options?: EnsureCollabOptions) => Promise<EnsureCollabResult>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

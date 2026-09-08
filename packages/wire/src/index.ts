@@ -321,6 +321,9 @@ export type CollabUiRequestDraft =
 
 export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
 
+/** Input that currently feeds the host's realtime voice session. */
+export type LiveInput = "none" | "local" | "remote";
+
 export type GuestFrame =
 	| {
 			t: "hello";
@@ -336,6 +339,17 @@ export type GuestFrame =
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
+	| { t: "live-input-claim"; requestId: string }
+	| {
+			t: "live-input-start";
+			leaseId: string;
+			format: "pcm_s16le";
+			sampleRate: 16_000;
+			channels: 1;
+			frameSamples: 320;
+	  }
+	| { t: "live-input-chunk"; leaseId: string; seq: number; data: string }
+	| { t: "live-input-stop"; leaseId: string; reason: "user" | "track-ended" | "transport" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
 
@@ -356,6 +370,10 @@ export type HostFrame =
 			 * with `final: true`).
 			 */
 			entryCount: number;
+			/** Whether the host's realtime voice mode is active. */
+			liveActive?: boolean;
+			/** Input currently feeding the host's realtime voice session. */
+			liveInput: LiveInput;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
@@ -369,6 +387,29 @@ export type HostFrame =
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentEvent }
 	| { t: "state"; state: SessionState }
+	| { t: "live-state"; active: boolean; input: LiveInput }
+	/**
+	 * Targeted decoded assistant audio for the browser that owns the active
+	 * remote microphone lease. `data` is base64url-encoded mono PCM16 LE.
+	 */
+	| {
+			t: "live-output-chunk";
+			leaseId: string;
+			seq: number;
+			format: "pcm_s16le";
+			sampleRate: 48_000;
+			channels: 1;
+			frameSamples: number;
+			data: string;
+	  }
+	/** Targeted response to a browser microphone ownership claim. */
+	| {
+			t: "live-input-lease";
+			requestId: string;
+			status: "granted" | "busy" | "read-only" | "unavailable" | "revoked";
+			leaseId?: string;
+			message?: string;
+	  }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	| { t: "agents"; agents: AgentSnapshot[] }
@@ -393,8 +434,10 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: adds host live state plus writable-peer remote input leases, fixed
+ *   PCM16 input chunks, and targeted decoded 48 kHz mono assistant audio.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

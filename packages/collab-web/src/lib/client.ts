@@ -13,7 +13,9 @@ import type {
 	AssistantMessage,
 	CollabUiRequest,
 	CollabUiResponseValue,
+	GuestFrame,
 	HostFrame,
+	LiveInput,
 	SessionEntry,
 	SessionHeader,
 	SessionState,
@@ -25,6 +27,19 @@ import { COLLAB_PROTO, encodeBase64Url, parseCollabLink } from "./link";
 import { CollabSocket } from "./socket";
 
 export type ConnectionPhase = "connecting" | "waiting" | "live" | "reconnecting" | "ended";
+
+export type LiveInputStopReason = Extract<GuestFrame, { t: "live-input-stop" }>["reason"];
+export type LiveOutputChunkFrame = Extract<HostFrame, { t: "live-output-chunk" }>;
+
+export type LiveInputLeaseStatus = "idle" | "claiming" | "granted" | "busy" | "read-only" | "unavailable" | "revoked";
+
+export interface LiveInputLeaseState {
+	status: LiveInputLeaseStatus;
+	requestId: string | null;
+	leaseId: string | null;
+	message: string | null;
+	started: boolean;
+}
 
 export interface ActiveTool {
 	toolCallId: string;
@@ -59,6 +74,12 @@ export interface GuestSnapshot {
 	activeTools: ReadonlyMap<string, ActiveTool>;
 	/** agent_start..agent_end, reconciled by state.isStreaming. */
 	working: boolean;
+	/** Whether the host's realtime voice mode is currently active. */
+	liveActive: boolean;
+	/** Input currently feeding live voice; host-local and browser-remote remain distinct. */
+	liveInput: LiveInput;
+	/** This peer's browser microphone claim/lease state. */
+	liveInputLease: LiveInputLeaseState;
 	/** True when this guest joined through a read-only (view) link. */
 	readOnly: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
@@ -73,6 +94,14 @@ const TRANSCRIPT_TIMEOUT_MS = 10_000;
 const WELCOME_TIMEOUT_MS = 30_000;
 /** Mirrors the TUI guest's SNAPSHOT_PROGRESS_TIMEOUT_MS: every snapshot chunk must make progress. */
 const SNAPSHOT_PROGRESS_TIMEOUT_MS = 30_000;
+const PCM_FRAME_BASE64URL_LENGTH = 854;
+const IDLE_LIVE_INPUT_LEASE: LiveInputLeaseState = {
+	status: "idle",
+	requestId: null,
+	leaseId: null,
+	message: null,
+	started: false,
+};
 
 /**
  * One fetch-transcript round trip.
@@ -94,13 +123,16 @@ export class GuestClient {
 	/** base64url write token from a full link; absent when joined via a view link. */
 	readonly #writeToken: string | undefined;
 	readonly #listeners = new Set<() => void>();
+	readonly #liveOutputListeners = new Set<(frame: LiveOutputChunkFrame) => void>();
 	readonly #pendingTranscripts = new Map<number, PendingTranscript>();
 	#reqSeq = 0;
+	#liveRequestSeq = 0;
 	#noticeSeq = 0;
 	#everConnected = false;
 	#welcomed = false;
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
+	readonly #canceledLiveClaims = new Map<string, LiveInputStopReason>();
 
 	#phase: ConnectionPhase = "connecting";
 	#endedReason: string | null = null;
@@ -115,6 +147,9 @@ export class GuestClient {
 	#activeTools: ReadonlyMap<string, ActiveTool> = new Map();
 	#working = false;
 	#readOnly = false;
+	#liveActive = false;
+	#liveInput: LiveInput = "none";
+	#liveInputLease: LiveInputLeaseState = IDLE_LIVE_INPUT_LEASE;
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
@@ -164,6 +199,17 @@ export class GuestClient {
 		};
 	}
 
+	/**
+	 * Volatile decoded assistant-audio delivery. Unlike {@link subscribe}, this
+	 * path never rebuilds the React snapshot for high-frequency PCM chunks.
+	 */
+	subscribeLiveOutput(listener: (frame: LiveOutputChunkFrame) => void): () => void {
+		this.#liveOutputListeners.add(listener);
+		return () => {
+			this.#liveOutputListeners.delete(listener);
+		};
+	}
+
 	/** Cached stable reference; replaced (with fresh collection refs) per applied frame. */
 	getSnapshot(): GuestSnapshot {
 		return this.#snapshot;
@@ -183,6 +229,114 @@ export class GuestClient {
 
 	sendAbort(): void {
 		this.#socket.send({ t: "abort" });
+	}
+
+	/**
+	 * Requests exclusive browser-microphone ownership. The volatile claim is
+	 * never replayed after reconnect, so permission remains click-scoped.
+	 */
+	claimLiveInput(): string | null {
+		if (
+			this.#readOnly ||
+			this.#phase !== "live" ||
+			this.#liveInputLease.status === "claiming" ||
+			this.#liveInputLease.status === "granted"
+		) {
+			return null;
+		}
+		const requestId = `live-${Date.now().toString(36)}-${++this.#liveRequestSeq}`;
+		this.#liveInputLease = {
+			status: "claiming",
+			requestId,
+			leaseId: null,
+			message: null,
+			started: false,
+		};
+		this.#commit();
+		void this.#socket.sendRealtime({ t: "live-input-claim", requestId }).then(sent => {
+			if (sent) return;
+			this.#canceledLiveClaims.delete(requestId);
+			if (this.#liveInputLease.requestId !== requestId || this.#liveInputLease.status !== "claiming") return;
+			this.#liveInputLease = {
+				status: "unavailable",
+				requestId,
+				leaseId: null,
+				message: "The live connection is unavailable.",
+				started: false,
+			};
+			this.#commit();
+		});
+		return requestId;
+	}
+
+	/**
+	 * Cancels a claim that has not produced a lease yet. A late grant is
+	 * immediately released rather than becoming an orphaned host lease.
+	 */
+	cancelLiveInputClaim(requestId: string, reason: LiveInputStopReason): void {
+		if (this.#liveInputLease.status !== "claiming" || this.#liveInputLease.requestId !== requestId) return;
+		this.#canceledLiveClaims.set(requestId, reason);
+		this.#liveInputLease = IDLE_LIVE_INPUT_LEASE;
+		this.#commit();
+	}
+
+	async startLiveInput(leaseId: string): Promise<boolean> {
+		const lease = this.#liveInputLease;
+		if (
+			this.#readOnly ||
+			this.#phase !== "live" ||
+			lease.status !== "granted" ||
+			lease.leaseId !== leaseId ||
+			lease.started
+		) {
+			return false;
+		}
+		const sent = await this.#socket.sendRealtime({
+			t: "live-input-start",
+			leaseId,
+			format: "pcm_s16le",
+			sampleRate: 16_000,
+			channels: 1,
+			frameSamples: 320,
+		});
+		if (
+			!sent ||
+			this.#liveInputLease.status !== "granted" ||
+			this.#liveInputLease.leaseId !== leaseId ||
+			this.#phase !== "live"
+		) {
+			return false;
+		}
+		this.#liveInputLease = { ...this.#liveInputLease, started: true };
+		this.#commit();
+		return true;
+	}
+
+	sendLiveInputChunk(leaseId: string, seq: number, data: string): Promise<boolean> {
+		const lease = this.#liveInputLease;
+		if (
+			this.#readOnly ||
+			this.#phase !== "live" ||
+			lease.status !== "granted" ||
+			lease.leaseId !== leaseId ||
+			!lease.started ||
+			!this.#liveActive ||
+			this.#liveInput !== "remote" ||
+			!Number.isSafeInteger(seq) ||
+			seq < 0 ||
+			data.length !== PCM_FRAME_BASE64URL_LENGTH
+		) {
+			return Promise.resolve(false);
+		}
+		return this.#socket.sendRealtime({ t: "live-input-chunk", leaseId, seq, data });
+	}
+
+	stopLiveInput(leaseId: string, reason: LiveInputStopReason): Promise<boolean> {
+		const lease = this.#liveInputLease;
+		if (lease.status !== "granted" || lease.leaseId !== leaseId) return Promise.resolve(false);
+		this.#liveInputLease = IDLE_LIVE_INPUT_LEASE;
+		this.#commit();
+		return this.#socket.sendRealtime({ t: "live-input-stop", leaseId, reason });
 	}
 
 	sendAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text?: string): void {
@@ -223,6 +377,15 @@ export class GuestClient {
 		if (this.#phase === "ended") return;
 		if (willReconnect) {
 			this.#phase = "reconnecting";
+			if (this.#liveInputLease.status !== "idle") {
+				this.#liveInputLease = {
+					...this.#liveInputLease,
+					status: "unavailable",
+					leaseId: null,
+					message: "The live connection was interrupted.",
+					started: false,
+				};
+			}
 			this.#commit();
 			return;
 		}
@@ -269,6 +432,16 @@ export class GuestClient {
 
 	/** Surfaces apply failures instead of letting the socket's recv chain swallow them. */
 	#applyFrameSafe(frame: HostFrame): void {
+		if (frame.t === "live-output-chunk") {
+			for (const listener of this.#liveOutputListeners) {
+				try {
+					listener(frame);
+				} catch {
+					// One playback consumer must not break ordered socket delivery.
+				}
+			}
+			return;
+		}
 		try {
 			this.#applyFrame(frame);
 		} catch (err) {
@@ -298,6 +471,10 @@ export class GuestClient {
 				this.#lifecycle = new Map();
 				this.#working = frame.state.isStreaming;
 				this.#readOnly = frame.readOnly === true;
+				this.#liveActive = frame.liveActive === true;
+				this.#liveInput = frame.liveInput;
+				this.#liveInputLease = IDLE_LIVE_INPUT_LEASE;
+				this.#canceledLiveClaims.clear();
 				this.#clearUiRequests();
 				this.#welcomed = true;
 				this.#clearWelcomeTimer();
@@ -349,6 +526,43 @@ export class GuestClient {
 					}
 				}
 				break;
+			case "live-state":
+				this.#liveActive = frame.active;
+				this.#liveInput = frame.input;
+				break;
+			case "live-input-lease": {
+				const canceledReason = this.#canceledLiveClaims.get(frame.requestId);
+				if (canceledReason !== undefined) {
+					this.#canceledLiveClaims.delete(frame.requestId);
+					if (frame.status === "granted" && frame.leaseId) {
+						void this.#socket.sendRealtime({
+							t: "live-input-stop",
+							leaseId: frame.leaseId,
+							reason: canceledReason,
+						});
+					}
+					break;
+				}
+				if (this.#liveInputLease.requestId !== frame.requestId) break;
+				if (frame.status === "granted" && !frame.leaseId) {
+					this.#liveInputLease = {
+						status: "unavailable",
+						requestId: frame.requestId,
+						leaseId: null,
+						message: "The host returned an invalid microphone lease.",
+						started: false,
+					};
+					break;
+				}
+				this.#liveInputLease = {
+					status: frame.status,
+					requestId: frame.requestId,
+					leaseId: frame.status === "granted" ? (frame.leaseId ?? null) : null,
+					message: frame.message ?? null,
+					started: false,
+				};
+				break;
+			}
 			case "agents":
 				this.#agents = [...frame.agents];
 				break;
@@ -517,6 +731,9 @@ export class GuestClient {
 			streamDone: this.#streamDone,
 			activeTools: this.#activeTools,
 			working: this.#working,
+			liveActive: this.#liveActive,
+			liveInput: this.#liveInput,
+			liveInputLease: this.#liveInputLease,
 			readOnly: this.#readOnly,
 			uiRequest: this.#uiRequest,
 			notices: this.#notices,

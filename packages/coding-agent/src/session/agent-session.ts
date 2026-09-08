@@ -142,7 +142,7 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../extensibility/extensions";
-import { emitSessionShutdownEvent } from "../extensibility/extensions";
+import { CollabNonInteractiveError, emitSessionShutdownEvent } from "../extensibility/extensions";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
@@ -6495,6 +6495,9 @@ export class AgentSession {
 				// `void this.dispose()` raced process.exit() and could leave an
 				// OMP-owned Chromium alive (#5643).
 				void this.dispose().finally(() => process.exit(0));
+			},
+			ensureCollab: async () => {
+				throw new CollabNonInteractiveError();
 			},
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),

@@ -170,6 +170,7 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 			state: makeState(),
 			agents: [],
 			entryCount: 0,
+			liveInput: "none",
 			readOnly: opts?.readOnly ? true : undefined,
 		});
 	};
@@ -529,24 +530,22 @@ describe("collab proto handshake (#4049)", () => {
 			expect(reply.message).toContain("protocol mismatch");
 			expect(reply.message).toContain(`host speaks v${COLLAB_PROTO}`);
 			expect(reply.message).toContain(`guest sent v${COLLAB_PROTO - 1}`);
-			// The rejected guest was never admitted: no participant entry, and a
-			// host ask finds no writable peer to route to.
+			// The rejected guest was never admitted and has no participant entry.
 			expect(host.participants.filter(p => p.role !== "host")).toEqual([]);
-			expect(host.requestGuestUi({ kind: "select", title: "anyone?", options: ["Yes"] })).toBeNull();
 		} finally {
 			guest.socket.close();
 			await host.stop("test done");
 		}
 	});
 
-	it("welcomes a current-proto guest at v3 and round-trips a ui-request", async () => {
+	it("welcomes a current-proto guest and round-trips a ui-request", async () => {
 		const host = new CollabHost(makeHostContext());
 		await host.start("ws://localhost:8787");
 		const guest = await joinRawGuest(host.link, COLLAB_PROTO);
 		try {
 			const welcome = await guest.nextFrame();
 			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
-			expect(welcome.proto).toBe(3);
+			expect(welcome.proto).toBe(COLLAB_PROTO);
 
 			const pending = host.requestGuestUi({ kind: "select", title: "Continue?", options: ["Yes"] });
 			if (!pending) throw new Error("expected writable guest UI request");

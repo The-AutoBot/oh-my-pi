@@ -56,6 +56,9 @@ const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const MAX_DECODED_OPUS_SAMPLES: usize = 5_760;
 const OUTPUT_LEVEL_SAMPLES: usize = 2_400;
 const OUTPUT_FRAME_SAMPLES: usize = 960;
+/// Browser output frames are capped at 60 ms so a bounded jitter buffer can
+/// shed stale audio without a long replay.
+const MAX_OUTPUT_CALLBACK_SAMPLES: usize = 2_880;
 /// Default `wait_for_open` timeout, exposed so the N-API adapter can apply it
 /// when TypeScript passes no override.
 pub const DEFAULT_OPEN_TIMEOUT_MS: u32 = 20_000;
@@ -92,6 +95,8 @@ pub struct LiveCallbacks {
 	pub event:   Box<dyn Fn(String) + Send + Sync>,
 	/// RMS output level in `[0, 1]`, one report per level window.
 	pub level:   Box<dyn Fn(f64) + Send + Sync>,
+	/// Decoded 48 kHz mono assistant PCM, before optional local speaker output.
+	pub output:  Option<Box<dyn Fn(&[f32]) + Send + Sync>>,
 	/// Terminal transport failure; reported at most once per peer.
 	pub failure: Box<dyn Fn(String) + Send + Sync>,
 }
@@ -115,6 +120,7 @@ pub struct LivePeerCore {
 	started:          AtomicBool,
 	closing:          AtomicBool,
 	muted:            AtomicBool,
+	output_muted:     AtomicBool,
 	failure_reported: AtomicBool,
 	queued_samples:   AtomicUsize,
 }
@@ -130,6 +136,7 @@ impl LivePeerCore {
 			started: AtomicBool::new(false),
 			closing: AtomicBool::new(false),
 			muted: AtomicBool::new(false),
+			output_muted: AtomicBool::new(false),
 			failure_reported: AtomicBool::new(false),
 			queued_samples: AtomicUsize::new(0),
 		}
@@ -320,6 +327,12 @@ impl LivePeerCore {
 		Ok(())
 	}
 
+	/// Enable or disable local speaker output without affecting decoded output
+	/// callbacks. Remote browser sessions use this to prevent host echo.
+	pub fn set_output_muted(&self, muted: bool) {
+		self.output_muted.store(muted, Ordering::Release);
+	}
+
 	/// Whether close has begun; lets the adapter's `Drop` skip spawning a
 	/// redundant close task.
 	pub fn is_closing(&self) -> bool {
@@ -332,6 +345,15 @@ impl LivePeerCore {
 
 	fn report_level(&self, level: f64) {
 		(self.callbacks.level)(level.clamp(0.0, 1.0));
+	}
+
+	fn report_output(&self, samples: &[f32]) {
+		let Some(callback) = self.callbacks.output.as_ref() else {
+			return;
+		};
+		for frame in samples.chunks(MAX_OUTPUT_CALLBACK_SAMPLES) {
+			callback(frame);
+		}
 	}
 
 	fn mark_open(&self) {
@@ -647,14 +669,14 @@ async fn receive_output_audio(
 					if let Ok(samples) =
 						decoder.decode_float(&[], &mut decoded[..OUTPUT_FRAME_SAMPLES], false)
 					{
-						if !write_output(&playback_tx, &decoded[..samples], &core) {
+						if !emit_output(&playback_tx, &decoded[..samples], &core) {
 							return;
 						}
 						level.observe(&decoded[..samples], &core);
 					}
 				}
 				if let Ok(samples) = decoder.decode_float(&packet.payload, &mut decoded, true) {
-					if !write_output(&playback_tx, &decoded[..samples], &core) {
+					if !emit_output(&playback_tx, &decoded[..samples], &core) {
 						return;
 					}
 					level.observe(&decoded[..samples], &core);
@@ -664,7 +686,7 @@ async fn receive_output_audio(
 		expected_sequence = Some(sequence.wrapping_add(1));
 		match decoder.decode_float(&packet.payload, &mut decoded, false) {
 			Ok(samples) => {
-				if !write_output(&playback_tx, &decoded[..samples], &core) {
+				if !emit_output(&playback_tx, &decoded[..samples], &core) {
 					return;
 				}
 				level.observe(&decoded[..samples], &core);
@@ -677,6 +699,27 @@ async fn receive_output_audio(
 			},
 		}
 	}
+}
+
+/// Tap decoded output before local speaker delivery. Returning `false` means
+/// the remote session intentionally mutes host playback, not that its audio
+/// callback failed.
+fn tap_output(samples: &[f32], core: &Weak<LivePeerCore>) -> bool {
+	let Some(core) = core.upgrade() else {
+		return true;
+	};
+	if core.closing.load(Ordering::Acquire) {
+		return false;
+	}
+	core.report_output(samples);
+	!core.output_muted.load(Ordering::Acquire)
+}
+
+fn emit_output(playback_tx: &PlaybackWriter, samples: &[f32], core: &Weak<LivePeerCore>) -> bool {
+	if !tap_output(samples, core) {
+		return true;
+	}
+	write_output(playback_tx, samples, core)
 }
 
 fn write_output(playback_tx: &PlaybackWriter, samples: &[f32], core: &Weak<LivePeerCore>) -> bool {
@@ -718,5 +761,42 @@ impl OutputLevel {
 				self.samples = 0;
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use parking_lot::Mutex;
+
+	use super::{LiveCallbacks, LivePeerCore, MAX_OUTPUT_CALLBACK_SAMPLES, tap_output};
+
+	#[test]
+	fn decoded_output_taps_remote_pcm_while_local_speaker_path_stays_enabled_by_default() {
+		let captured = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+		let output = Arc::clone(&captured);
+		let core = Arc::new(LivePeerCore::new(LiveCallbacks {
+			event:   Box::new(|_| {}),
+			level:   Box::new(|_| {}),
+			output:  Some(Box::new(move |samples| output.lock().push(samples.to_vec()))),
+			failure: Box::new(|_| {}),
+		}));
+		let weak = Arc::downgrade(&core);
+		let samples = vec![0.25; MAX_OUTPUT_CALLBACK_SAMPLES + 1];
+
+		assert!(tap_output(&samples, &weak), "local live output must still reach the host speaker");
+		let frames = captured.lock();
+		assert_eq!(frames.len(), 2, "large decoded output must respect the browser frame cap");
+		assert_eq!(frames[0].as_slice(), &samples[..MAX_OUTPUT_CALLBACK_SAMPLES]);
+		assert_eq!(frames[1].as_slice(), &samples[MAX_OUTPUT_CALLBACK_SAMPLES..]);
+		drop(frames);
+
+		core.set_output_muted(true);
+		assert!(
+			!tap_output(&[-0.5, 0.5], &weak),
+			"remote live output must skip host speaker playback"
+		);
+		assert_eq!(captured.lock().last().map(Vec::as_slice), Some(&[-0.5, 0.5][..]));
 	}
 }
