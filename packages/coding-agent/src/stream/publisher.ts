@@ -29,10 +29,16 @@ export interface StreamPublisherOptions {
 
 export interface LazyStreamPublisherOptions extends Omit<StreamPublisherOptions, "redactor"> {
 	loadRedactor: () => Promise<StreamRedactor>;
+	/** Checked before local-secret loading and immediately before TUI attachment. */
+	isCurrent?: () => boolean;
+	/** Cancels an in-flight socket or redactor load when its session context is superseded. */
+	signal?: AbortSignal;
 }
 
 interface OpenedStreamSocket {
 	socket: net.Socket;
+	/** Terminally reject this not-yet-attached socket and begin bounded graceful teardown. */
+	close(): void;
 	takeQueuedFrames(): StreamStreamerFrame[];
 	setFrameHandler(handler: (frame: StreamStreamerFrame) => void): void;
 }
@@ -63,7 +69,11 @@ function parseFrame(line: string): StreamStreamerFrame | null {
 	}
 }
 
-async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor">): Promise<OpenedStreamSocket | null> {
+async function openStreamSocket(
+	options: Omit<StreamPublisherOptions, "redactor">,
+	signal?: AbortSignal,
+): Promise<OpenedStreamSocket | null> {
+	if (signal?.aborted) return null;
 	let endpoint: string;
 	try {
 		endpoint = await streamSocketEndpoint(options.cwd);
@@ -71,35 +81,62 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 		logConnectFailure(error);
 		return null;
 	}
+	if (signal?.aborted) return null;
 
 	const socket = net.createConnection(endpoint);
 	let input = "";
-	let settled = false;
+	let accepted = false;
+	let terminal = false;
 	let frameHandler: ((frame: StreamStreamerFrame) => void) | undefined;
 	const queuedFrames: StreamStreamerFrame[] = [];
 	const { promise, resolve } = Promise.withResolvers<OpenedStreamSocket | null>();
-	const timer = setTimeout(() => {
-		if (settled) return;
-		settled = true;
-		logger.debug("stream: local publisher connection timed out");
-		socket.destroy();
-		resolve(null);
-	}, CONNECT_TIMEOUT_MS);
-	timer.unref();
+	let handshakeTimer: NodeJS.Timeout | undefined;
+	let forceDestroyTimer: NodeJS.Timeout | undefined;
 
-	const finishNull = (error?: unknown): void => {
-		if (settled) return;
-		settled = true;
-		clearTimeout(timer);
-		if (error !== undefined) logConnectFailure(error);
-		socket.destroy();
+	const destroyAfterFinish = (): void => {
+		if (forceDestroyTimer) {
+			clearTimeout(forceDestroyTimer);
+			forceDestroyTimer = undefined;
+		}
+		if (!socket.destroyed) socket.destroy();
+	};
+	const closeUnattached = (): void => {
+		if (terminal) return;
+		terminal = true;
+		if (handshakeTimer) {
+			clearTimeout(handshakeTimer);
+			handshakeTimer = undefined;
+		}
 		resolve(null);
+		if (socket.destroyed) return;
+		if (socket.writableFinished) {
+			destroyAfterFinish();
+			return;
+		}
+		socket.once("finish", destroyAfterFinish);
+		forceDestroyTimer = setTimeout(destroyAfterFinish, CONNECT_TIMEOUT_MS);
+		forceDestroyTimer.unref();
+		if (!socket.writableEnded) socket.end();
+	};
+	const abort = (): void => closeUnattached();
+	const finishNull = (error?: unknown): void => {
+		if (accepted || terminal) return;
+		if (error !== undefined) logConnectFailure(error);
+		closeUnattached();
 	};
 
+	handshakeTimer = setTimeout(() => {
+		if (accepted || terminal) return;
+		logger.debug("stream: local publisher connection timed out");
+		finishNull();
+	}, CONNECT_TIMEOUT_MS);
+	handshakeTimer.unref();
+
 	socket.on("error", error => {
-		if (!settled) finishNull(error);
+		if (!accepted && !terminal) finishNull(error);
 	});
 	socket.once("connect", () => {
+		if (terminal || signal?.aborted) return;
 		const hello: StreamSessionFrame = {
 			t: "hello",
 			proto: STREAM_LOCAL_PROTO,
@@ -119,8 +156,8 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 			input = input.slice(newline + 1);
 			if (!line) continue;
 			const frame = parseFrame(line);
-			if (!frame) continue;
-			if (!settled) {
+			if (!frame || terminal) continue;
+			if (!accepted) {
 				if (frame.t !== "welcome") {
 					finishNull(new Error("streamer did not welcome session"));
 					return;
@@ -129,10 +166,14 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 					finishNull(new Error(`streamer protocol mismatch: ${frame.proto}`));
 					return;
 				}
-				settled = true;
-				clearTimeout(timer);
+				accepted = true;
+				if (handshakeTimer) {
+					clearTimeout(handshakeTimer);
+					handshakeTimer = undefined;
+				}
 				resolve({
 					socket,
+					close: closeUnattached,
 					takeQueuedFrames: () => queuedFrames.splice(0),
 					setFrameHandler: handler => {
 						frameHandler = handler;
@@ -145,8 +186,19 @@ async function openStreamSocket(options: Omit<StreamPublisherOptions, "redactor"
 		}
 	});
 	socket.once("close", () => {
-		if (!settled) finishNull();
+		clearTimeout(handshakeTimer);
+		handshakeTimer = undefined;
+		clearTimeout(forceDestroyTimer);
+		forceDestroyTimer = undefined;
+		socket.removeListener("finish", destroyAfterFinish);
+		signal?.removeEventListener("abort", abort);
+		if (!accepted && !terminal) {
+			terminal = true;
+			resolve(null);
+		}
 	});
+	signal?.addEventListener("abort", abort, { once: true });
+	if (signal?.aborted) abort();
 	return promise;
 }
 
@@ -221,11 +273,13 @@ export function normalizeStreamRow(row: string): string {
 
 /** Publishes one interactive session's already-redacted terminal rows. */
 export class StreamPublisher {
+	static #paintListenerOwners = new WeakMap<TUI, StreamPublisher>();
 	readonly #socket: net.Socket;
 	readonly #tui: TUI;
 	readonly #redactor: StreamRedactor;
 	readonly #onStatus: StreamPublisherOptions["onStatus"];
 	readonly #onChat: StreamPublisherOptions["onChat"];
+	#paintListener = (paint: TuiPaint): void => this.#handlePaint(paint);
 	#disposed = false;
 	#flushTimer: NodeJS.Timeout | undefined;
 	#pendingViewport: StreamRow[] | undefined;
@@ -252,29 +306,44 @@ export class StreamPublisher {
 
 	/** Connect and complete the protocol handshake before collecting local secrets. */
 	static async connectLazy(options: LazyStreamPublisherOptions): Promise<StreamPublisher | null> {
-		const opened = await openStreamSocket(options);
+		const opened = await openStreamSocket(options, options.signal);
 		if (!opened) return null;
+		if (options.signal?.aborted || (options.isCurrent && !options.isCurrent())) {
+			opened.close();
+			return null;
+		}
 		let redactor: StreamRedactor;
 		try {
 			redactor = await options.loadRedactor();
 		} catch (error) {
 			logger.debug("stream: could not initialize row redaction", { error: String(error) });
-			opened.socket.destroy();
+			opened.close();
 			return null;
 		}
-		return StreamPublisher.#create(opened, options, redactor);
+		return StreamPublisher.#create(opened, options, redactor, options.isCurrent, options.signal);
 	}
 
 	static #create(
 		opened: OpenedStreamSocket,
 		options: Omit<StreamPublisherOptions, "redactor">,
 		redactor: StreamRedactor,
+		isCurrent?: () => boolean,
+		signal?: AbortSignal,
 	): StreamPublisher | null {
-		if (opened.socket.destroyed) return null;
+		if (opened.socket.destroyed || signal?.aborted || (isCurrent && !isCurrent())) {
+			opened.close();
+			return null;
+		}
 		const publisher = new StreamPublisher(opened.socket, options, redactor);
 		opened.setFrameHandler(frame => publisher.#handleFrame(frame));
 		publisher.#onStatus({ viewers: 0 });
-		publisher.#tui.setPaintListener(paint => publisher.#handlePaint(paint));
+		if (signal?.aborted || (isCurrent && !isCurrent())) {
+			publisher.dispose();
+			opened.close();
+			return null;
+		}
+		StreamPublisher.#paintListenerOwners.set(publisher.#tui, publisher);
+		publisher.#tui.setPaintListener(publisher.#paintListener);
 		for (const frame of opened.takeQueuedFrames()) publisher.#handleFrame(frame);
 		return publisher;
 	}
@@ -443,12 +512,18 @@ export class StreamPublisher {
 		}
 	}
 
+	#detachPaintListener(): void {
+		if (StreamPublisher.#paintListenerOwners.get(this.#tui) !== this) return;
+		StreamPublisher.#paintListenerOwners.delete(this.#tui);
+		this.#tui.setPaintListener(null);
+	}
+
 	#detach(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		if (this.#flushTimer) clearTimeout(this.#flushTimer);
 		this.#flushTimer = undefined;
-		this.#tui.setPaintListener(null);
+		this.#detachPaintListener();
 		this.#onStatus(null);
 		this.#socket.destroy();
 	}
@@ -458,7 +533,7 @@ export class StreamPublisher {
 		this.#disposed = true;
 		if (this.#flushTimer) clearTimeout(this.#flushTimer);
 		this.#flushTimer = undefined;
-		this.#tui.setPaintListener(null);
+		this.#detachPaintListener();
 		this.#onStatus(null);
 		this.#socket.end();
 	}

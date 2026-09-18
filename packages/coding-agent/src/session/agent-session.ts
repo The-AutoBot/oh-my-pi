@@ -2385,6 +2385,7 @@ export class AgentSession {
 			this.#irc.hasPending() ||
 			this.#pendingNextTurnMessages.length > 0 ||
 			this.#postPromptTasks.size > 0 ||
+			this.#inFlightEventHandlers.size > 0 ||
 			this.#usagePreflightAbortControllers.size > 0 ||
 			this.#queuedMessageDrainScheduled ||
 			this.#activeAgentContinue !== undefined ||

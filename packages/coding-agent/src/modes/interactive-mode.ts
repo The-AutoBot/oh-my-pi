@@ -309,6 +309,12 @@ interface WorkingMessageAccentCacheKey {
 	sessionAccentEnabled: boolean;
 }
 
+interface StreamPublisherBinding {
+	generation: number;
+	cwd: string;
+	sessionId: string;
+}
+
 function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): string {
 	if (!accent) return shimmerText(message, theme);
 	accent.palette ??= { low: "dim", mid: { ansi: accent.main }, high: { ansi: accent.main }, bold: true };
@@ -939,6 +945,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	#lastCollabHost?: CollabHost;
 	#collabGuest?: CollabGuestLink;
 	#streamPublisher: StreamPublisher | undefined;
+	#streamPublisherBinding: StreamPublisherBinding | undefined;
+	#streamPublisherAbortController: AbortController | undefined;
+	#streamPublisherGeneration = 0;
+	#streamPublisherStopped = false;
 
 	/** Owned room; use {@link collabController}.host for current-session reuse and links. */
 	get collabHost(): CollabHost | undefined {
@@ -1194,7 +1204,128 @@ export class InteractiveMode implements InteractiveModeContext {
 	releaseAutoBotProtectedStartupControls(): boolean {
 		if (!this.#autoBotProtectedStartupControlsHeld || this.#autoBotProtectedStartupExitRequested) return false;
 		this.#autoBotProtectedStartupControlsHeld = false;
+		void this.#connectStreamPublisher();
 		return true;
+	}
+
+	#canPublishStream(): boolean {
+		return (
+			this.isInitialized &&
+			!this.#streamPublisherStopped &&
+			!this.#isShuttingDown &&
+			!this.shutdownRequested &&
+			!this.#autoBotProtectedStartupControlsHeld &&
+			!this.#autoBotProtectedStartupExitRequested &&
+			!this.session.isSessionTransitioning
+		);
+	}
+
+	#isCurrentStreamPublisherBinding(binding: StreamPublisherBinding): boolean {
+		return (
+			this.#streamPublisherBinding === binding &&
+			this.#streamPublisherGeneration === binding.generation &&
+			this.sessionManager.getSessionId() === binding.sessionId &&
+			path.resolve(this.sessionManager.getCwd()) === binding.cwd &&
+			this.#canPublishStream()
+		);
+	}
+
+	#invalidateStreamPublisher(): number {
+		const publisher = this.#streamPublisher;
+		const abortController = this.#streamPublisherAbortController;
+		const hadBinding = this.#streamPublisherBinding !== undefined;
+		this.#streamPublisherGeneration++;
+		this.#streamPublisherBinding = undefined;
+		this.#streamPublisherAbortController = undefined;
+		this.#streamPublisher = undefined;
+		publisher?.dispose();
+		abortController?.abort();
+		if (publisher || hadBinding) {
+			this.statusLine.setStreamStatus(null);
+			this.ui.requestRender();
+		}
+		return this.#streamPublisherGeneration;
+	}
+
+	async #connectStreamPublisher(): Promise<void> {
+		if (!this.#canPublishStream()) return;
+		const cwd = path.resolve(this.sessionManager.getCwd());
+		const sessionId = this.sessionManager.getSessionId();
+		const existing = this.#streamPublisherBinding;
+		if (existing && existing.cwd === cwd && existing.sessionId === sessionId) return;
+
+		this.#invalidateStreamPublisher();
+		const binding: StreamPublisherBinding = {
+			generation: this.#streamPublisherGeneration,
+			cwd,
+			sessionId,
+		};
+		this.#streamPublisherBinding = binding;
+		const redactPatterns = this.settings.get("stream.redactPatterns");
+		const abortController = new AbortController();
+		this.#streamPublisherAbortController = abortController;
+		let publisher: StreamPublisher | null;
+		try {
+			publisher = await StreamPublisher.connectLazy({
+				cwd,
+				sessionId,
+				title: path.basename(cwd),
+				tui: this.ui,
+				isCurrent: () => this.#isCurrentStreamPublisherBinding(binding),
+				signal: abortController.signal,
+				loadRedactor: () => StreamRedactor.load(cwd, redactPatterns),
+				onStatus: status => {
+					if (!this.#isCurrentStreamPublisherBinding(binding)) return;
+					this.statusLine.setStreamStatus(status);
+					this.ui.requestRender();
+				},
+				onChat: message => {
+					if (!this.#isCurrentStreamPublisherBinding(binding)) return;
+					const chat = truncateToWidth(
+						replaceTabs(sanitizeText(`${message.name}: ${message.text}`)).replace(/[\r\n]+/g, " "),
+						TRUNCATE_LENGTHS.LINE,
+					);
+					this.showStatus(chat);
+				},
+			});
+		} catch (error) {
+			logger.debug("stream: interactive publisher initialization failed", { error: String(error) });
+			return;
+		}
+		if (!publisher) return;
+		if (!this.#isCurrentStreamPublisherBinding(binding)) {
+			publisher.dispose();
+			return;
+		}
+		this.#streamPublisher = publisher;
+		this.ui.renderNow();
+	}
+
+	#suspendStreamPublisherForSessionTransition(): void {
+		if (this.#streamPublisherStopped) return;
+		const binding: StreamPublisherBinding = {
+			generation: this.#invalidateStreamPublisher(),
+			cwd: path.resolve(this.sessionManager.getCwd()),
+			sessionId: this.sessionManager.getSessionId(),
+		};
+		void this.#restoreStreamPublisherAfterSessionTransition(binding);
+	}
+
+	async #restoreStreamPublisherAfterSessionTransition(binding: StreamPublisherBinding): Promise<void> {
+		await this.session.waitForSessionTransition();
+		if (
+			this.#streamPublisherGeneration !== binding.generation ||
+			this.sessionManager.getSessionId() !== binding.sessionId ||
+			path.resolve(this.sessionManager.getCwd()) !== binding.cwd ||
+			!this.#canPublishStream()
+		)
+			return;
+		await this.#connectStreamPublisher();
+	}
+
+	#stopStreamPublisher(): void {
+		this.#streamPublisherStopped = true;
+		this.#invalidateStreamPublisher();
 	}
 
 	/**
@@ -1245,10 +1376,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * keeps the current process authoritative.
 	 */
 	getAutoBotUpdateDeferralReason(): string | undefined {
-		if (!this.isInitialized || this.#isShuttingDown || this.shutdownRequested) return "interactive teardown is active";
+		if (!this.isInitialized || this.#isShuttingDown || this.shutdownRequested)
+			return "interactive teardown is active";
 		if (this.#autoBotUpdateExitRequested !== undefined) return "an explicit user exit is pending";
 		if (this.ui.hasOverlay()) return "a modal interface is open";
-		if (this.#focusController.isTransitioning || this.focusedAgentId !== undefined) return "session focus is changing";
+		if (this.#focusController.isTransitioning || this.focusedAgentId !== undefined)
+			return "session focus is changing";
 		if (this.#inputController.isExternalEditorActive) return "an external editor owns the draft";
 		if (
 			this.editor.getText().length > 0 ||
@@ -1287,7 +1420,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		) {
 			return "an interactive side request is active";
 		}
-		if (AgentRegistry.global().list().some(ref => ref.id !== MAIN_AGENT_ID && ref.session !== null)) {
+		if (
+			AgentRegistry.global()
+				.list()
+				.some(ref => ref.id !== MAIN_AGENT_ID && ref.session !== null)
+		) {
 			return "a non-main agent still has a live session";
 		}
 		if (AgentLifecycleManager.global().hasPendingAgentTransition()) {
@@ -1977,27 +2114,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		// TUI's multiplexer, output-backlog, and image safety gates.
 		this.ui.renderNow();
 
-		const streamCwd = this.sessionManager.getCwd();
-		this.#streamPublisher =
-			(await StreamPublisher.connectLazy({
-				cwd: streamCwd,
-				sessionId: this.sessionManager.getSessionId(),
-				title: path.basename(streamCwd),
-				tui: this.ui,
-				loadRedactor: () => StreamRedactor.load(streamCwd, this.settings.get("stream.redactPatterns")),
-				onStatus: status => {
-					this.statusLine.setStreamStatus(status);
-					this.ui.requestRender();
-				},
-				onChat: message => {
-					const chat = truncateToWidth(
-						replaceTabs(sanitizeText(`${message.name}: ${message.text}`)).replace(/[\r\n]+/g, " "),
-						TRUNCATE_LENGTHS.LINE,
-					);
-					this.showStatus(chat);
-				},
-			})) ?? undefined;
-		if (this.#streamPublisher) this.ui.renderNow();
+		// Identity changes from /new and /branch bypass the before-switch reconciler.
+		// Suspend here too; reconnect only after the transition has settled.
+		this.#eventBusUnsubscribers.push(
+			this.session.registerSessionChangeCallback(() => this.#suspendStreamPublisherForSessionTransition()),
+		);
+		if (!this.#autoBotProtectedStartupControlsHeld) {
+			await this.#connectStreamPublisher();
+		}
 
 		// Prewarm the local tiny-title worker off the submit hot path: spawn it
 		// now, idle and unref'd, so the first submit reuses a live subprocess
@@ -2026,6 +2150,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setSessionBeforeSwitchReconciler?.(async () => {
 			await this.#liveCommandController.stop();
 			await this.#quiesceVibeForSessionSwitch();
+			// Target UI can render before the session identity callback runs. Close the
+			// source stream before that happens; its pending binding restores on rollback.
+			this.#suspendStreamPublisherForSessionTransition();
 		});
 		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
 		await logger.time("InteractiveMode.init:reconcileMode", () => this.#reconcileModeFromSession());
@@ -2299,8 +2426,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	async applyCwdChange(newCwd: string): Promise<boolean> {
 		const previousCwd = getProjectDir();
+		const rebindStreamAfterCwdChange =
+			!this.session.isSessionTransitioning && path.resolve(newCwd) !== path.resolve(previousCwd);
 		try {
 			setProjectDir(newCwd);
+			if (rebindStreamAfterCwdChange) this.#invalidateStreamPublisher();
 		} catch (error) {
 			this.showError(
 				`Cannot change working directory to ${newCwd}: ${error instanceof Error ? error.message : String(error)}`,
@@ -2376,10 +2506,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showError(
 				`Cannot change working directory to ${newCwd}: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			if (rebindStreamAfterCwdChange) void this.#connectStreamPublisher();
 			return false;
 		}
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.statusLine.applyCwdChange();
+		if (rebindStreamAfterCwdChange) void this.#connectStreamPublisher();
 		return true;
 	}
 
@@ -5842,8 +5974,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#appearanceRefreshRequest = undefined;
 		this.#autoBotInputFenceUnsubscribe?.();
 		this.#autoBotInputFenceUnsubscribe = undefined;
-		this.#streamPublisher?.dispose();
-		this.#streamPublisher = undefined;
+		this.#stopStreamPublisher();
 		// Last chance to refresh the startup status placeholder for the next launch.
 		this.#persistComposerStatus();
 		if (this.loadingAnimation) {
@@ -6020,8 +6151,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showStatus("Still closing… (flushing memory backend / network)");
 		}, STILL_CLOSING_DELAY_MS);
 		try {
-			this.#streamPublisher?.dispose();
-			this.#streamPublisher = undefined;
+			this.#stopStreamPublisher();
 			// Guests get goodbye and the registry entry disappears before the
 			// session is disposed, under the same still-closing progress notice.
 			await this.collabController.shutdown("host exited");

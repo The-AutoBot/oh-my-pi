@@ -172,6 +172,77 @@ describe("AgentSession dispose releases retained memory", () => {
 		expect(current.rawSseDebugBuffer.snapshot().records).toHaveLength(0);
 	});
 
+	it("keeps AutoBot update admission busy until a message-end extension mutation settles", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("expected bundled model");
+		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		const handlerStarted = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("message_end", async () => {
+					handlerStarted.resolve();
+					await releaseHandler.promise;
+					sessionManager.appendCustomEntry("extension-message-end", { state: "settled" });
+				});
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"block-autobot-message-end",
+		);
+		const extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
+		const current = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry,
+			agentId: "Main",
+			extensionRunner,
+		});
+		session = current;
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "completed before update admission" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+
+		current.agent.emitExternalEvent({ type: "message_end", message });
+		await handlerStarted.promise;
+
+		expect(current.hasPendingAutoBotUpdateWork()).toBe(true);
+
+		releaseHandler.resolve();
+		await current.waitForIdle();
+
+		expect(
+			current.sessionManager
+				.getEntries()
+				.some(entry => entry.type === "custom" && entry.customType === "extension-message-end"),
+		).toBe(true);
+		expect(current.hasPendingAutoBotUpdateWork()).toBe(false);
+	});
+
 	it("drains pending notifications before releasing retained session memory", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");

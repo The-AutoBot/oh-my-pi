@@ -279,10 +279,15 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 		const prefix = `${JSON.stringify(HEADER)}\n`;
 		const content = `${prefix}${JSON.stringify(msg("large", "s1", "🚀".repeat(256 * 1024)))}\n${JSON.stringify(msg("tail", "large", "outside byte limit"))}`;
 		const file = await writeTemp(content);
+		const maxBytes = Buffer.byteLength(prefix) + 256 * 1024 + 1;
 		const visited: FileEntry[] = [];
 		let malformedRecords = 0;
+		let bytesConsumed = 0;
 		await sessionLoader.visitEntriesFromFileStream(file, entry => void visited.push(entry), {
-			maxBytes: Buffer.byteLength(prefix) + 256 * 1024 + 1,
+			maxBytes,
+			onBytesConsumed: bytes => {
+				bytesConsumed += bytes;
+			},
 			onMalformedRecord: () => {
 				malformedRecords++;
 			},
@@ -290,6 +295,26 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 
 		expect(entryIds(visited)).toEqual(["s1"]);
 		expect(malformedRecords).toBe(1);
+		expect(bytesConsumed).toBe(maxBytes);
+	});
+
+	it("visits a complete capped multiline record before its delimiter", async () => {
+		const header = JSON.stringify(HEADER);
+		const capped = `${JSON.stringify(msg("capped", "s1", "inside byte limit"), null, 2)} \t\r`;
+		const content = `${header}\n${capped}\n${JSON.stringify(msg("tail", "capped", "outside byte limit"))}`;
+		const file = await writeTemp(content);
+		const visited: FileEntry[] = [];
+		let malformedRecords = 0;
+		await sessionLoader.visitEntriesFromFileStream(file, entry => void visited.push(entry), {
+			maxBytes: Buffer.byteLength(`${header}\n${capped}`),
+			maxRecords: 2,
+			onMalformedRecord: () => {
+				malformedRecords++;
+			},
+		});
+
+		expect(entryIds(visited)).toEqual(["s1", "capped"]);
+		expect(malformedRecords).toBe(0);
 	});
 
 	it("stops after the first chunk of a delimiter-free file when the record cap is zero", async () => {
