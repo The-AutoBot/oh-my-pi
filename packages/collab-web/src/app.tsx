@@ -11,10 +11,13 @@ import { Transcript } from "./components/transcript/Transcript";
 import { GuestClient } from "./lib/client";
 import { usePhoneMic } from "./lib/use-phone-mic";
 import { useGuestSnapshot } from "./lib/use-guest";
+import { managedLeaveHref, managedReplacementHref, managedRoomRoute, type ManagedRoomRoute } from "./lib/managed-room";
 import type { ToolRenderHost } from "./tool-render";
 import "./components/shell/shell.css";
 
 const NAME_KEY = "omp.collab.name";
+const ROOM_DISCOVERY_INITIAL_DELAY_MS = 3_000;
+const ROOM_DISCOVERY_MAX_DELAY_MS = 30_000;
 
 interface Creds {
 	link: string;
@@ -40,7 +43,12 @@ function hashLink(): string | null {
 export function App(): ReactNode {
 	const [client, setClient] = useState<GuestClient | null>(null);
 	const [connectError, setConnectError] = useState<string | null>(null);
+	const [discoveryEnabled, setDiscoveryEnabled] = useState(true);
+	const [discoveryMessage, setDiscoveryMessage] = useState<string | null>(null);
 	const credsRef = useRef<Creds | null>(null);
+	const managedRoute = useMemo(() => managedRoomRoute(new URLSearchParams(window.location.search)), []);
+
+	useManagedRoomDiscovery(managedRoute, discoveryEnabled, setDiscoveryMessage);
 
 	const connect = useCallback((link: string, name: string): void => {
 		let next: GuestClient;
@@ -66,14 +74,16 @@ export function App(): ReactNode {
 	}, []);
 
 	const leave = useCallback((): void => {
+		setDiscoveryEnabled(false);
 		setClient(prev => {
 			prev?.close();
 			return null;
 		});
-		history.replaceState(null, "", window.location.pathname + window.location.search);
+		history.replaceState(null, "", managedLeaveHref(new URL(window.location.href)));
 	}, []);
 
 	const rejoin = useCallback((): void => {
+		setDiscoveryEnabled(true);
 		const creds = credsRef.current;
 		if (creds) connect(creds.link, creds.name);
 	}, [connect]);
@@ -109,18 +119,93 @@ export function App(): ReactNode {
 	}, [client]);
 
 	if (!client) {
-		return <ConnectScreen defaultName={storedName()} error={connectError} onConnect={connect} />;
+		return <ConnectScreen defaultName={storedName()} error={connectError ?? discoveryMessage} onConnect={connect} />;
 	}
-	return <Session client={client} onLeave={leave} onRejoin={rejoin} />;
+	return <Session client={client} onLeave={leave} onRejoin={rejoin} discoveryMessage={discoveryMessage} />;
+}
+
+function useManagedRoomDiscovery(
+	route: ManagedRoomRoute | null,
+	enabled: boolean,
+	setMessage: (message: string | null) => void,
+): void {
+	useEffect(() => {
+		if (route === null || !enabled) {
+			setMessage(null);
+			return;
+		}
+
+		let active = true;
+		let delayMs = ROOM_DISCOVERY_INITIAL_DELAY_MS;
+		let timer: Timer | undefined;
+		let controller: AbortController | undefined;
+		const requestUrl = `/api/sessions?${new URLSearchParams({ pcId: route.pcId, sessionId: route.sessionId })}`;
+
+		const schedule = (): void => {
+			if (!active) return;
+			timer = setTimeout(() => {
+				timer = undefined;
+				void poll();
+			}, delayMs);
+		};
+
+		const poll = async (): Promise<void> => {
+			controller = new AbortController();
+			try {
+				const response = await fetch(requestUrl, {
+					cache: "no-store",
+					credentials: "include",
+					headers: { Accept: "application/json" },
+					signal: controller.signal,
+				});
+				if (!active) return;
+				if (response.status === 401 || response.status === 403) {
+					setMessage("Sign in again to resume this room.");
+					return;
+				}
+				if (!response.ok) {
+					setMessage("Waiting for the session room to reconnect.");
+					delayMs = Math.min(delayMs * 2, ROOM_DISCOVERY_MAX_DELAY_MS);
+					schedule();
+					return;
+				}
+				const currentUrl = new URL(window.location.href);
+				const replacement = managedReplacementHref(await response.json(), currentUrl, route);
+				if (!active) return;
+				if (replacement !== null) {
+					// Fragment-only navigation does not remount React, so reload the validated room document.
+					active = false;
+					window.history.replaceState(null, "", replacement);
+					window.location.reload();
+					return;
+				}
+				setMessage("Waiting for the session room to reconnect.");
+				delayMs = ROOM_DISCOVERY_INITIAL_DELAY_MS;
+			} catch (error) {
+				if (!active || (error instanceof DOMException && error.name === "AbortError")) return;
+				setMessage("Waiting for the session room to reconnect.");
+				delayMs = Math.min(delayMs * 2, ROOM_DISCOVERY_MAX_DELAY_MS);
+			}
+			schedule();
+		};
+
+		void poll();
+		return () => {
+			active = false;
+			controller?.abort();
+			clearTimeout(timer);
+		};
+	}, [enabled, route, setMessage]);
 }
 
 interface SessionProps {
 	client: GuestClient;
 	onLeave(): void;
 	onRejoin(): void;
+	discoveryMessage: string | null;
 }
 
-function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
+function Session({ client, onLeave, onRejoin, discoveryMessage }: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const phoneMic = usePhoneMic(client);
 	const [railOpen, setRailOpen] = useState(false);
@@ -215,7 +300,13 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 					/>
 				</>
 			)}
-			<Banners phase={snap.phase} endedReason={snap.endedReason} onRejoin={onRejoin} onNewLink={onLeave} />
+			<Banners
+				phase={snap.phase}
+				endedReason={snap.endedReason}
+				onRejoin={onRejoin}
+				onNewLink={onLeave}
+				discoveryMessage={discoveryMessage}
+			/>
 			<Toasts notices={snap.notices} />
 		</div>
 	);

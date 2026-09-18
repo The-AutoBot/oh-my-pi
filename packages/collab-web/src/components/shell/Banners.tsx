@@ -6,9 +6,10 @@ export interface BannersProps {
 	endedReason: string | null;
 	onRejoin(): void;
 	onNewLink(): void;
+	discoveryMessage: string | null;
 }
 
-export function Banners({ phase, endedReason, onRejoin, onNewLink }: BannersProps): ReactNode {
+export function Banners({ phase, endedReason, onRejoin, onNewLink, discoveryMessage }: BannersProps): ReactNode {
 	if (phase === "connecting" || phase === "waiting") {
 		return (
 			<div className="sh-banner" role="status">
@@ -30,6 +31,7 @@ export function Banners({ phase, endedReason, onRejoin, onNewLink }: BannersProp
 			<div className="sh-ended" role="alertdialog" aria-label="session ended">
 				<div className="sh-ended-card">
 					<div className="sh-ended-title">session ended</div>
+					{discoveryMessage && <div className="sh-ended-reason">{discoveryMessage}</div>}
 					{endedReason && <div className="sh-ended-reason">{endedReason}</div>}
 					<div className="sh-ended-actions">
 						<button type="button" className="sh-btn sh-btn-primary" onClick={onRejoin}>

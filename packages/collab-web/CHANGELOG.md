@@ -5,6 +5,21 @@
 ### Added
 
 - Writable collab guests can explicitly share a phone microphone with bounded PCM capture and receive lease-targeted assistant audio playback; read-only guests do not see audio controls.
+## [18.2.1] - 2026-09-15
+
+### Fixed
+
+- Browser collab guests now automatically rejoin when a transient host network drop recreates the relay room ([#11858](https://github.com/can1357/oh-my-pi/issues/11858)).
+
+## [18.1.17] - 2026-09-10
+
+### Fixed
+
+- Transcript links are now allowed by the scheme the browser will actually resolve, so a destination that only becomes `javascript:` after URL normalization is dropped like any other unsafe scheme ([#11562](https://github.com/can1357/oh-my-pi/pull/11562) by [@alphastorm](https://github.com/alphastorm)).
+
+### Fixed
+
+- Coordinator-managed pages now follow replacement rooms after a CLI restart with a full reload; explicitly leaving stops discovery across reloads.
 
 ## [18.1.3] - 2026-09-02
 

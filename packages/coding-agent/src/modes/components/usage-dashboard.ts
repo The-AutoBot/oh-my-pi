@@ -5,13 +5,23 @@
  * above a GitHub-style daily activity heatmap fed by the local stats DB.
  * Enter flips into the classic full per-account report, scrollable in place.
  */
+import * as os from "node:os";
 import { resolveUsedFraction, type UsageLimit, type UsageReport } from "@oh-my-pi/pi-ai";
 import type { DailyActivityPoint } from "@oh-my-pi/omp-stats/shared-types";
-import { type Component, matchesKey, routeSgrMouseInput, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
-import { colorLuma, formatDuration, hexToRgb, rgbToHex } from "@oh-my-pi/pi-utils";
+import {
+	type Component,
+	matchesKey,
+	replaceTabs,
+	routeSgrMouseInput,
+	truncateToWidth,
+	visibleWidth,
+} from "@oh-my-pi/pi-tui";
+import { colorLuma, formatDuration, hexToRgb, rgbToHex, sanitizeText } from "@oh-my-pi/pi-utils";
 import { formatProviderName } from "../../slash-commands/helpers/format";
+import { collapseSharedUsageReports } from "../../utils/usage-display";
 import { colorToAnsi } from "../theme/color";
-import { theme } from "../theme/theme";
+import { ensureThemeSync, theme } from "../theme/theme";
+import { formatAbsoluteOnlyAmount } from "../usage-amounts";
 import {
 	matchesSelectCancel,
 	matchesSelectDown,
@@ -36,7 +46,7 @@ export interface CardWindowRow {
 	status: UsageLimit["status"];
 	/** Reset countdown of the worst account, ms from now, when in the future. */
 	resetMs?: number;
-	/** Absolute used amount (e.g. `$12.34 used`) for limits without a fraction. */
+	/** Absolute one-sided amount (e.g. `$12.34 used`, `100 credits left`) for limits without a fraction. */
 	usedText?: string;
 }
 
@@ -60,26 +70,6 @@ function formatLimitTitle(limit: UsageLimit): string {
 		return `${limit.label} (${tier})`;
 	}
 	return limit.label;
-}
-
-function isUsedOnlyAbsoluteAmount(limit: UsageLimit): boolean {
-	const amount = limit.amount;
-	return (
-		amount.unit !== "percent" &&
-		amount.unit !== "unknown" &&
-		amount.used !== undefined &&
-		Number.isFinite(amount.used) &&
-		amount.limit === undefined &&
-		amount.remaining === undefined &&
-		resolveUsedFraction(limit) === undefined
-	);
-}
-
-function formatUsedOnlyAmount(limit: UsageLimit): string {
-	const used = limit.amount.used ?? 0;
-	if (limit.amount.unit === "usd") return `$${used.toFixed(2)} used`;
-	const formatted = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(used);
-	return `${formatted} ${limit.amount.unit} used`;
 }
 
 /**
@@ -134,8 +124,9 @@ function aggregateRowStatus(windows: CardWindowRow[]): UsageLimit["status"] {
  * what's burning is on top-left; fully idle providers collapse into a tick.
  */
 export function buildProviderCards(reports: UsageReport[], nowMs: number): ProviderCard[] {
+	const displayReports = collapseSharedUsageReports(reports);
 	const grouped = new Map<string, UsageReport[]>();
-	for (const report of reports) {
+	for (const report of displayReports) {
 		const list = grouped.get(report.provider) ?? [];
 		list.push(report);
 		grouped.set(report.provider, list);
@@ -170,8 +161,7 @@ export function buildProviderCards(reports: UsageReport[], nowMs: number): Provi
 				fraction,
 				status: aggregateStatus(bucket.limits),
 				resetMs: resetsAt !== undefined && resetsAt > nowMs ? resetsAt - nowMs : undefined,
-				usedText:
-					fraction === undefined && isUsedOnlyAbsoluteAmount(worst) ? formatUsedOnlyAmount(worst) : undefined,
+				usedText: fraction === undefined ? formatAbsoluteOnlyAmount(bucket.limits) : undefined,
 			};
 		});
 		windows.sort((a, b) => (b.fraction ?? -1) - (a.fraction ?? -1));
@@ -304,6 +294,21 @@ export interface UsageDashboardOptions {
 	onClose: () => void;
 }
 
+/**
+ * Sanitize activity loading error text for safe single-line display in the TUI overlay.
+ * Strips ANSI/control sequences, expands tabs, collapses whitespace runs/newlines,
+ * shortens home directory paths to ~, and removes trailing dots.
+ */
+export function formatActivityErrorDetail(error: string, homeDir = os.homedir()): string {
+	let text = replaceTabs(sanitizeText(error)).replace(/\s+/g, " ").trim();
+	if (homeDir) {
+		const escaped = homeDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const forward = homeDir.replaceAll("\\", "/").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		text = text.replace(new RegExp(`${escaped}|${forward}`, "gi"), "~");
+	}
+	return text.replace(/\.+$/, "");
+}
+
 const CARD_MIN_WIDTH = 32;
 const CARD_GUTTER = 3;
 const CARD_MAX_WINDOWS = 4;
@@ -315,7 +320,7 @@ export class UsageDashboardComponent implements Component {
 	#view: "overview" | "detail" = "overview";
 	#scroll = 0;
 	#activity: DailyActivityPoint[] | null = null;
-	#activityError = false;
+	#activityError: string | null = null;
 	#syncing = true;
 	#detailCache: { width: number; lines: string[] } | null = null;
 	#lastViewportRows = 10;
@@ -323,6 +328,7 @@ export class UsageDashboardComponent implements Component {
 	readonly #closeController = new AbortController();
 
 	constructor(options: UsageDashboardOptions) {
+		ensureThemeSync();
 		this.#options = options;
 		this.#nowMs = Date.now();
 		this.#cards = buildProviderCards(options.reports, this.#nowMs);
@@ -336,8 +342,8 @@ export class UsageDashboardComponent implements Component {
 				this.#activity = points;
 				this.#options.requestRender();
 			}, this.#closeController.signal);
-		} catch {
-			this.#activityError = true;
+		} catch (error) {
+			this.#activityError = error instanceof Error ? error.message : String(error);
 		} finally {
 			this.#syncing = false;
 			if (!this.#closed) this.#options.requestRender();
@@ -483,7 +489,8 @@ export class UsageDashboardComponent implements Component {
 	#renderHeatmap(innerWidth: number): string[] {
 		const summary: string[] = [];
 		if (this.#activityError) {
-			return [theme.fg("dim", "Usage history unavailable (stats database could not be read).")];
+			const detail = formatActivityErrorDetail(this.#activityError);
+			return [theme.fg("dim", detail ? `Usage history unavailable (${detail}).` : "Usage history unavailable.")];
 		}
 		const points = this.#activity;
 		if (!points) return [theme.fg("dim", "Loading usage history…")];

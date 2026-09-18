@@ -6,37 +6,33 @@
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { Text } from "@oh-my-pi/pi-tui";
-import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
-import { settings } from "../../config/settings";
+import { Text, visibleWidth } from "@oh-my-pi/pi-tui";
+import type { AsyncJob, AsyncJobDetails, AsyncJobManager, AsyncJobType } from "../../async";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
 import { renderStructuredJson } from "../../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { StructuredSubagentOutput } from "../../task/types";
+import { parseConfiguredThinkingLevel } from "../../thinking";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
+import { formatArtifactErrorNotice, stripOutputNotice } from "../output-meta";
 import {
+	FEED_MODEL_BADGE_WIDTH,
 	formatBadge,
 	formatDuration,
 	formatEmptyMessage,
+	formatFeedModelBadge,
 	formatStatusIcon,
 	getPreviewLines,
+	isFeedModelBadgeEnabled,
 	PREVIEW_LIMITS,
 	replaceTabs,
 	type ToolUIColor,
 	type ToolUIStatus,
 } from "../render-utils";
 import type { AgentActivitySnapshot, CancelOutcome, CoordinationDetails, HubRenderArgs, JobSnapshot } from "./types";
-
-const WAIT_DURATION_MS: Record<string, number> = {
-	"5s": 5_000,
-	"10s": 10_000,
-	"30s": 30_000,
-	"1m": 60_000,
-	"5m": 5 * 60_000,
-};
 
 /**
  * A wait snapshot where every watched job is still running and nothing was
@@ -49,20 +45,6 @@ export function isWaitingPollDetails(details: unknown): boolean {
 	if (!d || !Array.isArray(d.jobs) || d.jobs.length === 0) return false;
 	if (d.cancelled?.length) return false;
 	return d.jobs.every(job => job?.status === "running");
-}
-
-/** Poll window for a job-watching wait: `async.pollWaitDuration` fixed value or smart ladder. */
-export function resolvePollWindow(
-	session: ToolSession,
-	manager: AsyncJobManager,
-	ownerId: string | undefined,
-): { waitMs: number; smart: boolean } {
-	const pollSetting = session.settings.get("async.pollWaitDuration");
-	const smart = pollSetting === "smart";
-	const waitMs = smart
-		? manager.nextPollWaitMs(ownerId)
-		: ((pollSetting ? WAIT_DURATION_MS[pollSetting] : undefined) ?? WAIT_DURATION_MS["30s"]);
-	return { waitMs, smart };
 }
 
 /**
@@ -112,16 +94,21 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 		}
 	}
 	const now = Date.now();
+	// Accepted runs that never terminalized: reported as actionable state
+	// instead of a generic stale-registration hint (#11079).
+	const staleAccepted = new Set(registry.staleAcceptedRuns().map(ref => ref.id));
 	const out: AgentActivitySnapshot[] = [];
 	for (const ref of registry.list()) {
 		if (ref.kind !== "sub" || ref.status !== "running") continue;
 		if (ref.id === selfId || covered.has(ref.id)) continue;
+		const acceptedAt = staleAccepted.has(ref.id) ? ref.lifecycle?.acceptedAt : undefined;
 		out.push({
 			id: ref.id,
 			...(ref.parentId ? { parentId: ref.parentId } : {}),
 			...(ref.activity ? { activity: ref.activity } : {}),
 			ageMs: Math.max(0, now - ref.createdAt),
 			live: registry.isRunning(ref),
+			...(acceptedAt !== undefined ? { acceptedAt } : {}),
 		});
 	}
 	return out;
@@ -133,7 +120,14 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
 		const activity = agent.activity ? ` — ${agent.activity}` : "";
-		const stale = agent.live ? "" : " — no turn in flight (stale registration?)";
+		// An accepted final result with no turn in flight is the #11079 leak:
+		// the run is over but the ref never terminalized, so say so actionably
+		// instead of the generic stale-registration hint.
+		const stale = agent.live
+			? ""
+			: agent.acceptedAt !== undefined
+				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running; clear it with \`hub\` cancel`
+				: " — no turn in flight (stale registration?)";
 		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
 	}
 	lines.push("", "These agents have no job entry; message them via `hub` send, transcripts at `history://<id>`.");
@@ -151,7 +145,7 @@ interface TrackedJobLike {
 	status: string;
 	label: string;
 	startTime: number;
-	latestDetails?: Record<string, unknown>;
+	latestDetails?: AsyncJobDetails;
 	resultText?: string;
 	errorText?: string;
 	structured?: StructuredSubagentOutput;
@@ -164,6 +158,9 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 		const latest = current ?? j;
 		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
 		let resolvedModel: string | undefined;
+		let resolvedModelIdentity: string | undefined;
+		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
+		let advisor = false;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
 			if (Array.isArray(progressValue)) {
@@ -182,6 +179,16 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 					const trimmed = modelValue.trim();
 					if (trimmed) resolvedModel = trimmed;
 				}
+				const identityValue = progressRecord?.resolvedModelIdentity;
+				if (typeof identityValue === "string") {
+					const trimmed = identityValue.trim();
+					if (trimmed) resolvedModelIdentity = trimmed;
+				}
+				const thinkingValue = progressRecord?.resolvedThinkingLevel;
+				if (typeof thinkingValue === "string") {
+					resolvedThinkingLevel = parseConfiguredThinkingLevel(thinkingValue);
+				}
+				advisor = progressRecord?.advisor === true;
 			}
 		}
 		return {
@@ -191,8 +198,12 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
 			...(resolvedModel ? { resolvedModel } : {}),
+			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
+			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
+			...(advisor ? { advisor: true } : {}),
 			...(!resultConsumed && latest.resultText ? { resultText: latest.resultText } : {}),
 			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
+			...(!resultConsumed && latest.latestDetails?.meta ? { meta: latest.latestDetails.meta } : {}),
 			...(!resultConsumed && latest.structured
 				? { structured: latest.structured, agentUrlId: current?.agentId ?? latest.id }
 				: {}),
@@ -289,6 +300,8 @@ export function buildJobResult(
 
 	const details: CoordinationDetails = {
 		op,
+		// The report is complete even when an individual job's raw capture failed.
+		meta: { source: { type: "report", value: "background jobs snapshot" } },
 		jobs: jobResults,
 		...(cancelOutcomes.length ? { cancelled: cancelOutcomes.map(({ id, status }) => ({ id, status })) } : {}),
 		...(agents.length ? { agents } : {}),
@@ -481,7 +494,6 @@ const PREVIEW_LINES_EXPANDED = 4;
 const LABEL_LINES_COLLAPSED = 1;
 const LABEL_LINES_EXPANDED = 3;
 const PREVIEW_LINE_WIDTH = 80;
-const MODEL_BADGE_MAX_WIDTH = 48;
 
 function statusToIcon(status: JobSnapshot["status"]): ToolUIStatus {
 	switch (status) {
@@ -618,6 +630,16 @@ export function jobsRenderResult(
 		uiTheme,
 	);
 
+	const outputMeta = result.details?.meta;
+	// Historical snapshots promoted a job failure to the root. Render it there
+	// only when no row identifies that failure; new report capture errors are distinct.
+	const aggregateArtifactError =
+		outputMeta?.artifactError &&
+		(outputMeta.source?.type === "report" ||
+			!jobs.some(job => (job.meta?.artifactError ?? job.artifactError) === outputMeta.artifactError))
+			? outputMeta.artifactError
+			: undefined;
+
 	// Sort: running first (so user sees what's still pending), then failed, then completed/cancelled.
 	const statusOrder: Record<JobSnapshot["status"], number> = {
 		running: 0,
@@ -643,7 +665,14 @@ export function jobsRenderResult(
 			// the animation state so a sealed block never hits stale shimmered
 			// bytes (spinnerFrame falls back to 0 on both sides of the seal).
 			const shimmerActive = counts.running > 0 && options.spinnerFrame !== undefined && shimmerEnabled();
-			const key = new Hasher().bool(expanded).u32(width).u32(spinnerFrame).bool(shimmerActive).digest();
+			const showModelBadge = isFeedModelBadgeEnabled();
+			const key = new Hasher()
+				.bool(expanded)
+				.u32(width)
+				.u32(spinnerFrame)
+				.bool(shimmerActive)
+				.bool(showModelBadge)
+				.digest();
 			if (!shimmerActive && cached?.key === key) return cached.lines;
 
 			const itemLines = renderTreeList<JobSnapshot>(
@@ -652,7 +681,8 @@ export function jobsRenderResult(
 					expanded,
 					maxCollapsed: COLLAPSED_LIST_LIMIT,
 					itemType: "job",
-					renderItem: job => {
+					renderItem: (job, context) => {
+						const rowWidth = Math.max(0, width - (context.prefixWidth ?? 0));
 						const lines: string[] = [];
 						const icon = formatStatusIcon(
 							statusToIcon(job.status),
@@ -660,9 +690,12 @@ export function jobsRenderResult(
 							job.status === "running" ? options.spinnerFrame : undefined,
 						);
 						const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
-						// Task jobs label themselves with their agent id, which is also
-						// the job id — drop the id column instead of stuttering it twice.
-						const idPart = job.label.trim() === job.id ? "" : ` ${uiTheme.fg("muted", job.id)}`;
+						const durationSuffix = `${uiTheme.sep.dot}${uiTheme.fg("dim", formatDuration(job.durationMs))}`;
+						const displayId = truncateToWidth(
+							replaceTabs(job.id).replace(/\s+/g, " "),
+							Math.max(0, rowWidth - visibleWidth(`${icon} ${typeBadge} ${durationSuffix}`)),
+							Ellipsis.Unicode,
+						);
 						const rawLabelLines = (job.label || "(no label)").split(/\r?\n/);
 						const maxLabelLines = expanded ? LABEL_LINES_EXPANDED : LABEL_LINES_COLLAPSED;
 						const visibleLabelLines = rawLabelLines
@@ -672,45 +705,72 @@ export function jobsRenderResult(
 							const last = visibleLabelLines[visibleLabelLines.length - 1]!;
 							visibleLabelLines[visibleLabelLines.length - 1] = `${last} …`;
 						}
-						const durationText = uiTheme.fg("dim", formatDuration(job.durationMs));
-						const modelText =
-							job.type === "task" &&
-							typeof job.resolvedModel === "string" &&
-							job.resolvedModel.trim() &&
-							settings.get("task.showResolvedModelBadge")
-								? `${uiTheme.sep.dot}${uiTheme.fg(
-										"dim",
-										truncateToWidth(
-											replaceTabs(job.resolvedModel.trim()),
-											MODEL_BADGE_MAX_WIDTH,
-											Ellipsis.Unicode,
+						const rowPrefix = `${icon} ${typeBadge} `;
+						const modelIdentity = job.resolvedModelIdentity ?? job.resolvedModel;
+						const modelBadge =
+							job.type === "task" && showModelBadge && typeof modelIdentity === "string"
+								? formatFeedModelBadge(
+										modelIdentity,
+										job.resolvedThinkingLevel,
+										job.advisor === true,
+										uiTheme,
+										Math.min(
+											FEED_MODEL_BADGE_WIDTH,
+											Math.max(0, rowWidth - visibleWidth(`${rowPrefix}${displayId}${durationSuffix}`) - 1),
 										),
-									)}`
+									)
 								: "";
+						const modelLead = modelBadge ? `${modelBadge} ` : "";
+						const headRaw = displayId;
 						// Running rows in a live block shimmer their label; once the block
 						// stops animating (sealed, or a settled snapshot — spinnerFrame
 						// cleared) they render static so scrollback never keeps a mid-sweep
 						// shimmer band.
 						const live = job.status === "running" && options.spinnerFrame !== undefined;
-						const headRaw = visibleLabelLines[0] ?? "";
 						const headLabel = live
 							? shimmerEnabled()
 								? shimmerText(headRaw, uiTheme)
 								: uiTheme.fg("accent", headRaw)
 							: uiTheme.fg("toolOutput", headRaw);
-						lines.push(
-							`${icon}${idPart} ${typeBadge} ${headLabel}${modelText}${modelText ? uiTheme.sep.dot : " "}${durationText}`,
-						);
-						for (let i = 1; i < visibleLabelLines.length; i++) {
-							lines.push(`  ${uiTheme.fg("toolOutput", visibleLabelLines[i]!)}`);
+						let row = `${rowPrefix}${modelLead}${headLabel}`;
+						const distinctLabel = job.label.trim() !== job.id;
+						const label = visibleLabelLines[0] ?? "";
+						const inlineLabel = distinctLabel && visibleWidth(`${row} ${label}${durationSuffix}`) <= rowWidth;
+						if (inlineLabel) row += ` ${uiTheme.fg("toolOutput", label)}`;
+						row += durationSuffix;
+						lines.push(truncateToWidth(row, rowWidth, ""));
+						const continuationWidth = Math.max(0, rowWidth - visibleWidth("  "));
+						for (let i = distinctLabel && !inlineLabel ? 0 : 1; i < visibleLabelLines.length; i++) {
+							lines.push(
+								`  ${uiTheme.fg("toolOutput", truncateToWidth(visibleLabelLines[i]!, continuationWidth))}`,
+							);
+						}
+						const artifactError = job.meta?.artifactError ?? job.artifactError;
+						if (artifactError) {
+							lines.push(
+								uiTheme.fg("warning", truncateToWidth(formatArtifactErrorNotice(artifactError), rowWidth)),
+							);
 						}
 
+						// Legacy rows did not retain full metadata. Strip the known warning
+						// footer so the dedicated row/root warning remains the only copy.
+						const previewError =
+							artifactError ?? (outputMeta?.source?.type !== "report" ? outputMeta?.artifactError : undefined);
+						const previewMeta = job.meta ?? (previewError ? { artifactError: previewError } : undefined);
+
 						const preview = flattenStructuredPreview(
-							stripTaskResultEnvelope(job.errorText?.trim() || job.resultText?.trim() || ""),
+							stripTaskResultEnvelope(
+								stripOutputNotice(job.errorText?.trim() || job.resultText?.trim() || "", previewMeta).trim(),
+							),
 						);
 						if (preview) {
 							const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
-							const previewLines = getPreviewLines(preview, maxLines, PREVIEW_LINE_WIDTH, Ellipsis.Unicode);
+							const previewLines = getPreviewLines(
+								preview,
+								maxLines,
+								Math.min(PREVIEW_LINE_WIDTH, continuationWidth),
+								Ellipsis.Unicode,
+							);
 							const tone = job.errorText ? "error" : "dim";
 							for (const pl of previewLines) {
 								lines.push(`  ${uiTheme.fg(tone, pl)}`);
@@ -733,25 +793,42 @@ export function jobsRenderResult(
 								expanded,
 								maxCollapsed: COLLAPSED_LIST_LIMIT,
 								itemType: "agent",
-								renderItem: agent => {
+								renderItem: (agent, context) => {
+									const rowWidth = Math.max(0, width - (context.prefixWidth ?? 0));
 									const icon = agent.live
 										? formatStatusIcon("running", uiTheme, options.spinnerFrame)
 										: formatStatusIcon("warning", uiTheme);
 									const badge = agent.live
 										? formatBadge("agent", "accent", uiTheme)
 										: formatBadge("agent · no turn", "warning", uiTheme);
+									const id = truncateToWidth(
+										replaceTabs(agent.id).replace(/\s+/g, " "),
+										Math.max(0, rowWidth - visibleWidth(`${icon}  ${badge}`)),
+										Ellipsis.Unicode,
+									);
 									const gist = agent.activity
 										? ` ${uiTheme.fg("toolOutput", truncateToWidth(replaceTabs(agent.activity), LABEL_MAX_WIDTH, Ellipsis.Unicode))}`
 										: "";
 									const parent = agent.parentId ? uiTheme.fg("dim", ` ← ${agent.parentId}`) : "";
 									const age = uiTheme.fg("dim", formatDuration(agent.ageMs));
-									return [`${icon} ${uiTheme.fg("muted", agent.id)} ${badge}${gist} ${age}${parent}`];
+									return [
+										truncateToWidth(
+											`${icon} ${uiTheme.fg("muted", id)} ${badge}${gist} ${age}${parent}`,
+											rowWidth,
+											"",
+										),
+									];
 								},
 							},
 							uiTheme,
 						);
 
-			const all = [header, ...itemLines, ...agentLines].map(l => truncateToWidth(l, width, Ellipsis.Unicode));
+			const all = [header];
+			if (aggregateArtifactError) {
+				all.push(uiTheme.fg("warning", formatArtifactErrorNotice(aggregateArtifactError)));
+			}
+			all.push(...itemLines, ...agentLines);
+			for (let i = 0; i < all.length; i++) all[i] = truncateToWidth(all[i]!, width, Ellipsis.Unicode);
 			cached = { key, lines: all };
 			return all;
 		},
