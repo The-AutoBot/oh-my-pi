@@ -181,6 +181,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      statuses: write
     outputs:
       pr_number: ${{ steps.pr.outputs.number }}
     steps:
@@ -226,6 +227,24 @@ jobs:
             exit 1
           fi
           echo "number=$existing" >> "$GITHUB_OUTPUT"
+      - name: Mark the verified candidate as validated
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_COMMIT: ${{ needs.candidate.outputs.candidate_commit }}
+          STATUS_TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$CANDIDATE_COMMIT" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::Candidate commit must be a full lowercase Git object ID" >&2
+            exit 1
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$CANDIDATE_COMMIT" \
+            -f state=success \
+            -f context='AutoBot validated candidate' \
+            -f target_url="$STATUS_TARGET_URL" \
+            -f description='Isolated candidate verification passed before publishing.'
 
   gated_auto_merge:
     name: Enable protected-branch auto-merge
