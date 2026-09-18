@@ -108,7 +108,9 @@ function assertSeparateCheckouts(operatorRoot: string, candidateRoot: string): v
 async function exactBunVersion(executable: string, expected: string, label: string): Promise<void> {
 	const result = await runCommand([executable, "--version"], { capture: true });
 	if (result.stdout.trim() !== expected) {
-		throw new AutoBotReleaseError(`${label} version must be exactly ${expected}; found ${result.stdout.trim() || "<empty>"}`);
+		throw new AutoBotReleaseError(
+			`${label} version must be exactly ${expected}; found ${result.stdout.trim() || "<empty>"}`,
+		);
 	}
 }
 
@@ -144,7 +146,9 @@ async function readRecognizedReleasePlan(
 	const plannedCandidate = requireCommit(parsed.forkCommit, "Release-plan fork commit");
 	const plannedUpstream = requireCommit(parsed.upstreamCommit, "Release-plan upstream commit");
 	if (plannedCandidate !== candidateCommit || plannedUpstream !== upstreamCommit) {
-		throw new AutoBotReleaseError("Release-plan recognition does not match the pinned candidate and upstream commits");
+		throw new AutoBotReleaseError(
+			"Release-plan recognition does not match the pinned candidate and upstream commits",
+		);
 	}
 	if (!SAFE_UPSTREAM_VERSION.test(parsed.upstreamVersion)) {
 		throw new AutoBotReleaseError("Release-plan upstream version is unsafe");
@@ -159,6 +163,10 @@ async function findRetainedCandidateMerge(
 	upstreamCommit: string,
 ): Promise<RetainedCandidateMerge> {
 	const expectedSubject = `chore(autobot): candidate upstream ${upstreamCommit.slice(0, 12)}`;
+	await runCommand(["git", "merge-base", "--is-ancestor", canonicalCommit, candidateCommit], {
+		cwd: sourceRoot,
+		capture: true,
+	});
 	const history = await runCommand(["git", "log", "--topo-order", "--format=%H%x00%s", candidateCommit], {
 		cwd: sourceRoot,
 		capture: true,
@@ -168,28 +176,39 @@ async function findRetainedCandidateMerge(
 		if (separator === -1) continue;
 		const commit = requireCommit(row.slice(0, separator), "Candidate history commit");
 		if (row.slice(separator + 1) !== expectedSubject) continue;
-		const parents = (await gitOutput(sourceRoot, ["show", "-s", "--format=%P", commit]))
-			.split(/\s+/)
-			.filter(Boolean);
+		const parents = (await gitOutput(sourceRoot, ["show", "-s", "--format=%P", commit])).split(/\s+/).filter(Boolean);
 		if (parents.length !== 2) {
 			throw new AutoBotReleaseError(`Retained AutoBot candidate ${commit} must have exactly two parents`);
 		}
 		const firstParent = requireCommit(parents[0] ?? "", "Retained candidate canonical parent");
 		const secondParent = requireCommit(parents[1] ?? "", "Retained candidate upstream parent");
 		if (firstParent !== canonicalCommit) {
-			throw new AutoBotReleaseError("Retained AutoBot candidate first parent is not the current canonical ancestor");
+			await runCommand(["git", "merge-base", "--is-ancestor", commit, canonicalCommit], {
+				cwd: sourceRoot,
+				capture: true,
+			});
 		}
 		if (secondParent !== upstreamCommit) {
-			throw new AutoBotReleaseError("Retained AutoBot candidate second parent does not match the pinned upstream commit");
+			throw new AutoBotReleaseError(
+				"Retained AutoBot candidate second parent does not match the pinned upstream commit",
+			);
 		}
-		await runCommand(["git", "merge-base", "--is-ancestor", upstreamCommit, commit], { cwd: sourceRoot, capture: true });
-		await runCommand(["git", "merge-base", "--is-ancestor", commit, candidateCommit], { cwd: sourceRoot, capture: true });
-		return { canonicalCommit: firstParent, candidateMergeCommit: commit };
+		await runCommand(["git", "merge-base", "--is-ancestor", upstreamCommit, commit], {
+			cwd: sourceRoot,
+			capture: true,
+		});
+		await runCommand(["git", "merge-base", "--is-ancestor", commit, candidateCommit], {
+			cwd: sourceRoot,
+			capture: true,
+		});
+		return { canonicalCommit, candidateMergeCommit: commit };
 	}
 	throw new AutoBotReleaseError("Pinned candidate does not retain the required reconciled AutoBot merge commit");
 }
 
-async function loadOperatorIntegrator(operatorRoot: string): Promise<{ readonly integrator: OperatorIntegrator; readonly temporary: string }> {
+async function loadOperatorIntegrator(
+	operatorRoot: string,
+): Promise<{ readonly integrator: OperatorIntegrator; readonly temporary: string }> {
 	const original = path.join(operatorRoot, "scripts", "autobot-release-integrate.ts");
 	const temporary = path.join(path.dirname(original), `.autobot-activation-integrate-${crypto.randomUUID()}.ts`);
 	const contents = await fs.readFile(original, "utf8");
@@ -260,7 +279,10 @@ async function main(): Promise<void> {
 	if (actualOrigin !== expectedRepositoryUrl) {
 		throw new AutoBotReleaseError("Candidate checkout origin is not the expected activation repository");
 	}
-	const actualHead = requireCommit(await gitOutput(candidateRoot, ["rev-parse", "--verify", "HEAD^{commit}"]), "Candidate checkout HEAD");
+	const actualHead = requireCommit(
+		await gitOutput(candidateRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
+		"Candidate checkout HEAD",
+	);
 	if (actualHead !== candidateCommit) {
 		throw new AutoBotReleaseError("Candidate checkout HEAD does not match the immutable candidate commit");
 	}
@@ -271,10 +293,6 @@ async function main(): Promise<void> {
 	if (remoteCandidateCommit !== candidateCommit) {
 		throw new AutoBotReleaseError("Candidate branch head does not match the immutable candidate commit");
 	}
-	await runCommand(["git", "merge-base", "--is-ancestor", canonicalCommit, candidateCommit], {
-		cwd: candidateRoot,
-		capture: true,
-	});
 
 	const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "omp-autobot-activation-"));
 	try {
@@ -291,7 +309,12 @@ async function main(): Promise<void> {
 			{ cwd: operatorRoot },
 		);
 		const releasePlan = await readRecognizedReleasePlan(releasePlanPath, candidateCommit, upstreamCommit);
-		const retainedMerge = await findRetainedCandidateMerge(candidateRoot, canonicalCommit, candidateCommit, upstreamCommit);
+		const retainedMerge = await findRetainedCandidateMerge(
+			candidateRoot,
+			canonicalCommit,
+			candidateCommit,
+			upstreamCommit,
+		);
 		const candidateTree = requireCommit(
 			await gitOutput(candidateRoot, ["rev-parse", "--verify", `${candidateCommit}^{tree}`]),
 			"Candidate tree",
@@ -301,8 +324,15 @@ async function main(): Promise<void> {
 		let identity: CandidateReleaseIdentity;
 		let built: CandidateBuild;
 		try {
-			identity = await loadedIntegrator.integrator.candidateReleaseIdentity(candidateRoot, retainedMerge.canonicalCommit, candidateCommit);
-			const compatibilityEpoch = requirePositiveSafeInteger(identity.compatibilityEpoch, "Candidate compatibility epoch");
+			identity = await loadedIntegrator.integrator.candidateReleaseIdentity(
+				candidateRoot,
+				retainedMerge.canonicalCommit,
+				candidateCommit,
+			);
+			const compatibilityEpoch = requirePositiveSafeInteger(
+				identity.compatibilityEpoch,
+				"Candidate compatibility epoch",
+			);
 			if (
 				!Array.isArray(identity.compatibilityReviewPaths) ||
 				!identity.compatibilityReviewPaths.every(repositoryPath => typeof repositoryPath === "string") ||
@@ -352,7 +382,9 @@ async function main(): Promise<void> {
 					releasePlanSha256: operatorReleasePlanHash.sha256,
 				},
 			});
-			console.log(`Validated immutable AutoBot candidate ${candidateCommit.slice(0, 12)} with retained merge ${retainedMerge.candidateMergeCommit.slice(0, 12)}`);
+			console.log(
+				`Validated immutable AutoBot candidate ${candidateCommit.slice(0, 12)} with retained merge ${retainedMerge.candidateMergeCommit.slice(0, 12)}`,
+			);
 		} finally {
 			await fs.rm(loadedIntegrator.temporary, { force: true }).catch(() => {});
 		}
