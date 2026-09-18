@@ -1,311 +1,112 @@
-name: Validate manually reconciled AutoBot candidate
+name: Run isolated AutoBot installer diagnostic
 
 on:
-  workflow_dispatch:
-    inputs:
-      candidate_sha:
-        description: "Full immutable candidate HEAD commit ID"
-        required: true
-        type: string
-      candidate_branch:
-        description: "Existing noncanonical branch whose head is candidate_sha"
-        required: true
-        type: string
-      upstream_sha:
-        description: "Full immutable upstream commit ID retained as the merge's second parent"
-        required: true
-        type: string
-
-concurrency:
-  group: autobot-activation-verify-${{ inputs.candidate_sha }}
-  cancel-in-progress: false
+   workflow_dispatch:
+      inputs:
+         candidate_sha:
+            description: "Lowercase 40-character candidate commit ID to diagnose"
+            required: true
+            type: string
 
 permissions:
-  contents: read
+   contents: read
 
 jobs:
-  candidate:
-    name: Verify immutable reconciled candidate
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    outputs:
-      candidate_sha: ${{ steps.request.outputs.candidate_sha }}
-      candidate_branch: ${{ steps.request.outputs.candidate_branch }}
-      upstream_sha: ${{ steps.request.outputs.upstream_sha }}
-      canonical_commit: ${{ steps.evidence.outputs.canonical_commit }}
-      retained_candidate_merge: ${{ steps.evidence.outputs.retained_candidate_merge }}
-      web_bundle_id: ${{ steps.evidence.outputs.web_bundle_id }}
-    steps:
-      - name: Require a pinned activation request on the operator helper branch
-        id: request
-        shell: bash
-        env:
-          INPUT_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-          INPUT_CANDIDATE_BRANCH: ${{ inputs.candidate_branch }}
-          INPUT_UPSTREAM_SHA: ${{ inputs.upstream_sha }}
-          EXPECTED_REPOSITORY: The-AutoBot/oh-my-pi
-          CANONICAL_BRANCH: autobot/auto-collab
-          HELPER_BRANCH: autobot/activation-validator
-        run: |
-          set -euo pipefail
-          require_commit() {
-            [[ "$1" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
-          }
-          require_branch() {
-            local value="$1"
-            [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
-            [[ "$value" != *..* && "$value" != *//* && "$value" != */ ]] || return 1
-            local segment
-            IFS=/ read -r -a segments <<< "$value"
-            for segment in "${segments[@]}"; do
-              [[ "$segment" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$segment" != *.lock ]] || return 1
-            done
-          }
-          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
-            echo "::error::Activation verification is restricted to $EXPECTED_REPOSITORY" >&2
-            exit 1
-          fi
-          if [[ "$GITHUB_REF" != "refs/heads/$HELPER_BRANCH" ]]; then
-            echo "::error::Dispatch this operational helper only from $HELPER_BRANCH" >&2
-            exit 1
-          fi
-          if ! require_commit "$INPUT_CANDIDATE_SHA" || ! require_commit "$INPUT_UPSTREAM_SHA"; then
-            echo "::error::candidate_sha and upstream_sha must be lowercase full Git object IDs" >&2
-            exit 1
-          fi
-          if ! require_branch "$INPUT_CANDIDATE_BRANCH"; then
-            echo "::error::candidate_branch must be an explicit safe branch name" >&2
-            exit 1
-          fi
-          if [[ "$INPUT_CANDIDATE_BRANCH" == "$CANONICAL_BRANCH" || "$INPUT_CANDIDATE_BRANCH" == "$HELPER_BRANCH" ]]; then
-            echo "::error::candidate_branch must be distinct from the canonical and helper branches" >&2
-            exit 1
-          fi
-          {
-            echo "candidate_sha=$INPUT_CANDIDATE_SHA"
-            echo "candidate_branch=$INPUT_CANDIDATE_BRANCH"
-            echo "upstream_sha=$INPUT_UPSTREAM_SHA"
-          } >> "$GITHUB_OUTPUT"
+   installer-diagnostic:
+      name: Build candidate native addon and run installer suite
+      runs-on: ubuntu-22.04
+      timeout-minutes: 30
+      steps:
+         - name: Require the isolated operator branch and an immutable candidate ID
+           shell: bash
+           env:
+              EXPECTED_REPOSITORY: The-AutoBot/oh-my-pi
+              EXPECTED_BRANCH: autobot/installer-diagnostic
+              CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+           run: |
+              set -euo pipefail
+              if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+                echo "::error::This diagnostic is restricted to $EXPECTED_REPOSITORY" >&2
+                exit 1
+              fi
+              if [[ "$GITHUB_REF" != "refs/heads/$EXPECTED_BRANCH" ]]; then
+                echo "::error::Dispatch this diagnostic only from $EXPECTED_BRANCH" >&2
+                exit 1
+              fi
+              if ! [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "::error::candidate_sha must be a lowercase 40-character Git commit ID" >&2
+                exit 1
+              fi
 
-      - name: Checkout immutable operator helper source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
+         - name: Checkout the isolated diagnostic definitions without credentials
+           uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              ref: ${{ github.sha }}
+              fetch-depth: 1
+              persist-credentials: false
 
-      - name: Provision pinned compiler Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: "1.4.0"
+         - name: Provision native build system dependencies
+           uses: ./.github/actions/setup-system-deps
 
-      - name: Capture separately provisioned compiler identity
-        id: compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_bun="$(command -v bun)"
-          test "$("$source_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')" = "linux-x64"
-          test "$("$source_bun" --version)" = "1.4.0"
-          compiler_directory="$RUNNER_TEMP/autobot-activation-toolchain"
-          mkdir -p "$compiler_directory"
-          compiler_bun="$compiler_directory/$(basename "$source_bun")"
-          cp "$source_bun" "$compiler_bun"
-          chmod +x "$compiler_bun"
-          test "$("$compiler_bun" --version)" = "1.4.0"
-          compiler_sha256="$(sha256sum "$compiler_bun" | cut -d ' ' -f1)"
-          [[ "$compiler_sha256" =~ ^[0-9a-f]{64}$ ]]
-          {
-            echo "path=$compiler_bun"
-            echo "sha256=$compiler_sha256"
-          } >> "$GITHUB_OUTPUT"
+         - name: Provision pinned compiler Bun
+           uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: "1.4.0"
 
-      - name: Provision pinned verification runner Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: "1.3.14"
+         - name: Capture separately provisioned compiler identity
+           id: compiler
+           shell: bash
+           run: |
+              set -euo pipefail
+              source_bun="$(command -v bun)"
+              test "$("$source_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')" = "linux-x64"
+              test "$("$source_bun" --version)" = "1.4.0"
+              compiler_directory="$RUNNER_TEMP/autobot-installer-diagnostic-toolchain"
+              mkdir -p "$compiler_directory"
+              compiler_bun="$compiler_directory/$(basename "$source_bun")"
+              cp "$source_bun" "$compiler_bun"
+              chmod +x "$compiler_bun"
+              test "$("$compiler_bun" --version)" = "1.4.0"
+              compiler_sha256="$(sha256sum "$compiler_bun" | cut -d ' ' -f1)"
+              [[ "$compiler_sha256" =~ ^[0-9a-f]{64}$ ]]
+              {
+                echo "path=$compiler_bun"
+                echo "sha256=$compiler_sha256"
+              } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the exact candidate without credentials
-        id: candidate_checkout
-        shell: bash
-        env:
-          CANDIDATE_BRANCH: ${{ steps.request.outputs.candidate_branch }}
-          CANDIDATE_SHA: ${{ steps.request.outputs.candidate_sha }}
-          REPOSITORY_URL: https://github.com/The-AutoBot/oh-my-pi.git
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          set -euo pipefail
-          candidate_root="$RUNNER_TEMP/autobot-activation-candidate"
-          git -c credential.helper= clone --no-checkout "$REPOSITORY_URL" "$candidate_root"
-          git -C "$candidate_root" -c credential.helper= fetch --no-tags origin "refs/heads/$CANDIDATE_BRANCH"
-          fetched_commit="$(git -C "$candidate_root" rev-parse 'FETCH_HEAD^{commit}')"
-          test "$fetched_commit" = "$CANDIDATE_SHA"
-          git -C "$candidate_root" checkout --detach "$CANDIDATE_SHA"
-          test "$(git -C "$candidate_root" rev-parse 'HEAD^{commit}')" = "$CANDIDATE_SHA"
-          echo "root=$candidate_root" >> "$GITHUB_OUTPUT"
+         - name: Provision the pinned verification runner Bun
+           uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: "1.3.14"
 
-      - name: Build and verify the immutable candidate with read-only credentials
-        shell: bash
-        env:
-          CANDIDATE_BRANCH: ${{ steps.request.outputs.candidate_branch }}
-          CANDIDATE_SHA: ${{ steps.request.outputs.candidate_sha }}
-          UPSTREAM_SHA: ${{ steps.request.outputs.upstream_sha }}
-          CANDIDATE_ROOT: ${{ steps.candidate_checkout.outputs.root }}
-          COMPILER_BUN: ${{ steps.compiler.outputs.path }}
-          COMPILER_BUN_SHA256: ${{ steps.compiler.outputs.sha256 }}
-          EVIDENCE_DIRECTORY: ${{ runner.temp }}/autobot-activation-evidence
-          GITHUB_TOKEN: ""
-          GH_TOKEN: ""
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          set -euo pipefail
-          runner_bun="$(command -v bun)"
-          test "$("$runner_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')" = "linux-x64"
-          test "$("$runner_bun" --version)" = "1.3.14"
-          test "$("$COMPILER_BUN" --version)" = "1.4.0"
-          test "$(sha256sum "$COMPILER_BUN" | cut -d ' ' -f1)" = "$COMPILER_BUN_SHA256"
-          "$runner_bun" scripts/autobot-activation-verify.ts \
-            --operator-root "$GITHUB_WORKSPACE" \
-            --candidate-root "$CANDIDATE_ROOT" \
-            --repository "$GITHUB_REPOSITORY" \
-            --canonical-branch "autobot/auto-collab" \
-            --candidate-branch "$CANDIDATE_BRANCH" \
-            --candidate-commit "$CANDIDATE_SHA" \
-            --upstream-commit "$UPSTREAM_SHA" \
-            --runner-bun "$runner_bun" \
-            --compiler-bun "$COMPILER_BUN" \
-            --compiler-bun-sha256 "$COMPILER_BUN_SHA256" \
-            --out "$EVIDENCE_DIRECTORY"
+         - name: Checkout the exact candidate without persisted credentials
+           uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              repository: The-AutoBot/oh-my-pi
+              ref: ${{ inputs.candidate_sha }}
+              path: candidate
+              fetch-depth: 1
+              persist-credentials: false
 
-      - name: Read sanitized verification provenance
-        id: evidence
-        shell: bash
-        env:
-          CANDIDATE_SHA: ${{ steps.request.outputs.candidate_sha }}
-          UPSTREAM_SHA: ${{ steps.request.outputs.upstream_sha }}
-          EVIDENCE: ${{ runner.temp }}/autobot-activation-evidence/verification-provenance.json
-          EXPECTED_REPOSITORY: The-AutoBot/oh-my-pi
-          CANONICAL_BRANCH: autobot/auto-collab
-        run: |
-          set -euo pipefail
-          candidate_commit="$(jq -er '.candidate.commit | strings' "$EVIDENCE")"
-          canonical_commit="$(jq -er '.canonical.commit | strings' "$EVIDENCE")"
-          retained_candidate_merge="$(jq -er '.candidate.retainedMergeCommit | strings' "$EVIDENCE")"
-          upstream_commit="$(jq -er '.upstream.commit | strings' "$EVIDENCE")"
-          web_bundle_id="$(jq -er '.webBundleId | strings' "$EVIDENCE")"
-          repository="$(jq -er '.repository | strings' "$EVIDENCE")"
-          canonical_branch="$(jq -er '.canonical.branch | strings' "$EVIDENCE")"
-          if [[ "$candidate_commit" != "$CANDIDATE_SHA" || "$upstream_commit" != "$UPSTREAM_SHA" || "$repository" != "$EXPECTED_REPOSITORY" || "$canonical_branch" != "$CANONICAL_BRANCH" || ! "$canonical_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ || ! "$retained_candidate_merge" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ || ! "$web_bundle_id" =~ ^web-[0-9a-f]{64}$ ]]; then
-            echo "::error::Verification evidence is malformed or does not match the pinned request" >&2
-            exit 1
-          fi
-          {
-            echo "canonical_commit=$canonical_commit"
-            echo "retained_candidate_merge=$retained_candidate_merge"
-            echo "web_bundle_id=$web_bundle_id"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Upload successful sanitized verification evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: autobot-activation-verification-${{ steps.request.outputs.candidate_sha }}
-          path: ${{ runner.temp }}/autobot-activation-evidence/verification-provenance.json
-          if-no-files-found: error
-          retention-days: 14
-
-  review:
-    name: Submit verified candidate for protected review
-    needs: candidate
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-      pull-requests: write
-      statuses: write
-    steps:
-      - name: Recheck the pinned branch, create or reuse the bot PR, and post validation
-        id: review
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CANDIDATE_SHA: ${{ needs.candidate.outputs.candidate_sha }}
-          CANDIDATE_BRANCH: ${{ needs.candidate.outputs.candidate_branch }}
-          UPSTREAM_SHA: ${{ needs.candidate.outputs.upstream_sha }}
-          CANONICAL_COMMIT: ${{ needs.candidate.outputs.canonical_commit }}
-          RETAINED_CANDIDATE_MERGE: ${{ needs.candidate.outputs.retained_candidate_merge }}
-          WEB_BUNDLE_ID: ${{ needs.candidate.outputs.web_bundle_id }}
-          EXPECTED_REPOSITORY: The-AutoBot/oh-my-pi
-          CANONICAL_BRANCH: autobot/auto-collab
-          HELPER_BRANCH: autobot/activation-validator
-        run: |
-          set -euo pipefail
-          require_commit() {
-            [[ "$1" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
-          }
-          require_branch() {
-            local value="$1"
-            [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
-            [[ "$value" != *..* && "$value" != *//* && "$value" != */ ]] || return 1
-            local segment
-            IFS=/ read -r -a segments <<< "$value"
-            for segment in "${segments[@]}"; do
-              [[ "$segment" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$segment" != *.lock ]] || return 1
-            done
-          }
-          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
-            echo "::error::Activation review is restricted to $EXPECTED_REPOSITORY" >&2
-            exit 1
-          fi
-          if ! require_commit "$CANDIDATE_SHA" || ! require_commit "$UPSTREAM_SHA" || ! require_commit "$CANONICAL_COMMIT" || ! require_commit "$RETAINED_CANDIDATE_MERGE"; then
-            echo "::error::Verification outputs must be lowercase full Git object IDs" >&2
-            exit 1
-          fi
-          if ! require_branch "$CANDIDATE_BRANCH" || [[ "$CANDIDATE_BRANCH" == "$CANONICAL_BRANCH" || "$CANDIDATE_BRANCH" == "$HELPER_BRANCH" ]] || ! [[ "$WEB_BUNDLE_ID" =~ ^web-[0-9a-f]{64}$ ]]; then
-            echo "::error::Verification outputs contain an unsafe branch or bundle ID" >&2
-            exit 1
-          fi
-          remote_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CANDIDATE_BRANCH" --jq '.object.sha')"
-          if [[ "$remote_sha" != "$CANDIDATE_SHA" ]]; then
-            echo "::error::Candidate branch moved after immutable verification; refusing status and PR mutation" >&2
-            exit 1
-          fi
-          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          body="$(cat <<EOF
-          ## Manual upstream reconciliation
-
-          This bot-authored PR carries the manually reconciled upstream candidate \`$CANDIDATE_SHA\` from \`$CANDIDATE_BRANCH\` into \`$CANONICAL_BRANCH\`.
-
-          The operator-dispatched activation verifier ran the immutable detached candidate commit with read-only repository credentials, verified retained two-parent merge \`$RETAINED_CANDIDATE_MERGE\` (canonical parent \`$CANONICAL_COMMIT\`, upstream parent \`$UPSTREAM_SHA\`), and completed the native/addon build, relay assets, collab-web build and package, compiled runtime \`--version\` and fresh-home \`--smoke-test\`, runtime contract suite, collab-web tests, release-security tests, installer tests, and the producer-plus-candidate compatibility-policy union.
-
-          Verification run: $run_url. The successful run contains a sanitized verification/provenance artifact (collab web bundle \`$WEB_BUNDLE_ID\`).
-
-          This is manual upstream-reconciliation verification, not a claim that ordinary PR CI ran. No approval, merge, or auto-merge was requested.
-          EOF
-          )"
-          prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$CANDIDATE_BRANCH" --state open --json number,author)"
-          pr_count="$(jq 'length' <<< "$prs")"
-          if [[ "$pr_count" == "0" ]]; then
-            pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$CANDIDATE_BRANCH" --title "chore(autobot): reconcile upstream ${UPSTREAM_SHA:0:12}" --body "$body")"
-            pr_number="${pr_url##*/}"
-          elif [[ "$pr_count" == "1" ]]; then
-            pr_number="$(jq -er '.[0].number' <<< "$prs")"
-          else
-            echo "::error::More than one open PR uses the verified candidate branch" >&2
-            exit 1
-          fi
-          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
-            echo "::error::Could not resolve the bot review PR number" >&2
-            exit 1
-          fi
-          pr_author="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json author --jq '.author.login')"
-          if [[ "$pr_author" != "github-actions[bot]" ]]; then
-            echo "::error::The existing candidate PR is not bot-authored; refusing to reuse it" >&2
-            exit 1
-          fi
-          gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --title "chore(autobot): reconcile upstream ${UPSTREAM_SHA:0:12}" --body "$body"
-          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$CANDIDATE_SHA" \
-            -f state=success \
-            -f context='AutoBot validated candidate' \
-            -f target_url="$run_url" \
-            -f description='Isolated candidate verification passed before protected review.'
-          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+         - name: Freeze dependencies, build the real native addon, and run all installer cases
+           shell: bash
+           working-directory: candidate
+           env:
+              CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+              GITHUB_TOKEN: ""
+              GH_TOKEN: ""
+              GIT_TERMINAL_PROMPT: "0"
+              AUTOBOT_COMPILER_BUN: ${{ steps.compiler.outputs.path }}
+              AUTOBOT_COMPILER_BUN_SHA256: ${{ steps.compiler.outputs.sha256 }}
+           run: |
+              set -euo pipefail
+              test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+              test -z "$(git config --local --get-regexp '^http\..*\.extraheader$' || true)"
+              runner_bun="$(command -v bun)"
+              test "$("$runner_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')" = "linux-x64"
+              test "$("$runner_bun" --version)" = "1.3.14"
+              test "$("$AUTOBOT_COMPILER_BUN" --version)" = "1.4.0"
+              test "$(sha256sum "$AUTOBOT_COMPILER_BUN" | cut -d ' ' -f1)" = "$AUTOBOT_COMPILER_BUN_SHA256"
+              "$runner_bun" install --frozen-lockfile
+              "$runner_bun" run build:native
+              "$runner_bun" test scripts/autobot-install.test.ts
