@@ -629,6 +629,125 @@ bun dev -- --version
 
 For architecture and contribution guidelines, see [packages/coding-agent/DEVELOPMENT.md](packages/coding-agent/DEVELOPMENT.md).
 
+### AutoBot managed operations
+
+AutoBot is a separate, operator-managed distribution path for a signed `omp`
+runtime. It is not the ordinary `omp.sh`, package-manager, or source
+installation flow. Its bootstrap is immutable: it accepts only a locally
+configured signed channel and locally trusted Ed25519 public keys, then stages
+verified runtimes under its private installation root.
+
+#### Operator setup and hourly producer workflows
+
+The repository contains two independent hourly GitHub Actions workflows:
+
+- **Upstream integration** runs at minute 17. It resolves the configured
+  canonical branch and fully qualified upstream ref, makes a detached candidate
+  merge, builds/tests that isolated candidate, and records its provenance. A
+  scheduled review branch/PR requires
+  `AUTOBOT_UPSTREAM_AUTOMATION=enabled` and the operator-owned
+  `AUTOBOT_AUTOMATION_TOKEN`; protected-branch auto-merge remains opt-in.
+- **Signed release promotion** runs at minute 43. It only promotes a retained,
+  reviewed candidate: it assembles every configured target, signs a verified
+  predecessor chain, publishes and re-downloads the release for verification,
+  then advances the channel as the final step. It is enabled only with
+  `AUTOBOT_RELEASE_AUTOMATION=enabled` (or a deliberate dispatch).
+
+Before enabling either workflow, repository operators must configure the
+following values themselves—none are inferred from a checkout or a workflow
+input: `AUTOBOT_CANONICAL_BRANCH`, `AUTOBOT_UPSTREAM_REPOSITORY`,
+`AUTOBOT_UPSTREAM_REF`, an exact supported `AUTOBOT_COMPILER_BUN_VERSION`,
+`AUTOBOT_COORDINATOR_PROVENANCE_SHA256`, and the exact complete
+`AUTOBOT_RELEASE_TARGETS_JSON` target set. Promotion also requires
+`AUTOBOT_PRODUCER_REF`, the channel envelope URL/repository/branch/path,
+`AUTOBOT_RELEASE_TRUSTED_KEY_ID`, its base64 public key, and the protected
+`AUTOBOT_RELEASE_SIGNING_KEY_BASE64` secret. URLs must be credential-free
+HTTPS values; the coordinator provenance digest and release signing material
+are independent operator-owned trust inputs. First-channel promotion requires
+an explicit `allow_initial` approval; later promotions verify a prior signed
+envelope and a monotonically newer release sequence.
+
+This repository currently verifies the managed native/Bun path on isolated
+Win32 x64 fixtures. These workflows and tests are not a claim that the
+AutoBot distribution has been deployed, nor cross-platform runtime
+verification.
+
+#### Install or migrate the immutable bootstrap
+
+Run the installer from a reviewed checkout with explicit values:
+
+```sh
+bun scripts/autobot-install.ts \
+  --root /absolute/path/to/autobot-root \
+  --channel-url https://example.invalid/channel/signed-envelope.json \
+  --trusted-key release-key-id=/secure/path/release-public.spki \
+  --portal-url https://portal.example.invalid/live \
+  --artifact-origin https://github.com/ \
+  --artifact-origin https://release-assets.githubusercontent.com/
+```
+
+`--root` must be new, empty, a recoverable/managed AutoBot root, or (only with
+`--migrate-legacy`) a directory containing one plain legacy `omp` binary:
+
+```sh
+bun scripts/autobot-install.ts ... --migrate-legacy
+```
+
+The installer does not read the root, channel, key, portal, or artifact
+allowlist from dotenv, bunfig, package metadata, or the current project.
+For an already managed root it does not overwrite the active runtime or stable
+launcher; it stages a verified release for the managed handoff. Migration
+refuses live legacy users/workers, records signed state first, and atomically
+replaces the legacy launcher only as its final action. Supply every exact
+HTTPS artifact origin needed by signed asset redirects—wildcards, paths,
+credentials, queries, and host-only allowlists are rejected.
+
+The installer never modifies `PATH`. To invoke the stable managed launcher as
+plain `omp`, the operator must prepend the installation root to `PATH` and
+keep that root in place; no alias, shim, or copied launcher is required.
+
+#### Hourly safe-idle handoff
+
+After authenticated startup, one update cycle at a time polls hourly. A newer
+same-compatibility release is staged before any broker reservation or shared
+handoff lock. The active session must be persisted and safe to replace: no
+agent-owned browser tab, computer/eval/Python/DAP session, stateful MCP
+transport, or owned hub service. These checks, collaboration preflight, and
+broker preflight are repeated at the mutation boundary. Deferred or contended
+work stays deferred.
+
+Connected browser guests are a separate safe-idle condition, not an
+agent-owned-tool-resource veto. The authenticated coordinator and local
+discovery record bind the replacement to the exact process/session/generation.
+Every connected managed guest must negotiate the restart capability and confirm
+its browser-local draft is recoverable; a post-acknowledgement edit or
+capability change cancels the preparation. After replacement, guests discover
+the exact new session and must fully reload before using changed capabilities.
+An older or manually connected incompatible guest defers the handoff rather
+than being forcibly replaced; browser-local drafts remain local.
+
+The replacement resumes the exact persisted session file with its exact
+session ID, profile, cwd, and session-selected current model. It reconstructs
+only the approved durable config-file list and safe launch flags. It does not
+replay original argv, a prompt, file arguments, model override, or credentials.
+Text already typed in the composer is retained through the normal session
+draft sidecar instead of being injected as a new prompt.
+
+The coordinator is authoritative for the reservation. The current reservation
+is **390 seconds**: a **270-second** worst-case execution floor plus a
+**120-second** pre-commit margin; the candidate ready deadline is
+**60 seconds**. The predecessor measures elapsed time before the irreversible
+boundary, and an existing lease is never extended.
+
+Handoffs are bound to authenticated launch ownership and exact owner/claim
+compare-and-swap journals. The bootstrap owns its child for the whole launch
+and peeks at normal exit only after a child exits `0`: a valid foreign-owned
+pending journal is left alone, while malformed or unauthenticated authority
+fails closed. A pre-activation candidate failure may restore only its recorded
+predecessor, with the broker/browser ownership restored before accepting work.
+Once activation begins, a missing acknowledgement is indeterminate: no global
+rollback or unrelated fallback is attempted.
+
 ---
 
 ## Monorepo Packages

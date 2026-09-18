@@ -1,0 +1,256 @@
+name: AutoBot upstream integration
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Fully qualified upstream ref (for example refs/heads/main)"
+        required: false
+        type: string
+      create_review:
+        description: "Push a non-canonical candidate branch and open/reuse its review PR"
+        required: true
+        default: true
+        type: boolean
+      enable_automated_merge:
+        description: "Request GitHub protected-branch auto-merge after all candidate checks pass"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: autobot-upstream-integration
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Build isolated upstream candidate
+    runs-on: ubuntu-22.04
+    outputs:
+      canonical_branch: ${{ steps.config.outputs.canonical_branch }}
+      upstream_commit: ${{ steps.provenance.outputs.upstream_commit }}
+      candidate_commit: ${{ steps.provenance.outputs.candidate_commit }}
+      upstream_version: ${{ steps.provenance.outputs.upstream_version }}
+      web_bundle_id: ${{ steps.provenance.outputs.web_bundle_id }}
+      compatibility_epoch: ${{ steps.provenance.outputs.compatibility_epoch }}
+      requires_compatibility_review: ${{ steps.provenance.outputs.requires_compatibility_review }}
+    steps:
+      - name: Require explicit production configuration
+        id: config
+        shell: bash
+        env:
+          INPUT_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          CONFIG_CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          CONFIG_UPSTREAM_REF: ${{ vars.AUTOBOT_UPSTREAM_REF }}
+          CONFIG_UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          CONFIG_COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+          CONFIG_COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          canonical_branch="$CONFIG_CANONICAL_BRANCH"
+          upstream_ref="${INPUT_UPSTREAM_REF:-$CONFIG_UPSTREAM_REF}"
+          for required in canonical_branch upstream_ref CONFIG_UPSTREAM_REPOSITORY CONFIG_COMPILER_BUN_VERSION CONFIG_COORDINATOR_PROVENANCE_SHA256; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::Missing AutoBot production configuration: $required" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$CONFIG_COMPILER_BUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._+-][0-9A-Za-z._+-]+)?$ ]]; then
+            echo "::error::AUTOBOT_COMPILER_BUN_VERSION must be an exact Bun version" >&2
+            exit 1
+          fi
+          if ! [[ "$CONFIG_COMPILER_BUN_VERSION" =~ ^1\.4\.[0-9]+([._+-][0-9A-Za-z._+-]+)?$ ]]; then
+            echo "::error::AUTOBOT_COMPILER_BUN_VERSION must be an exact Bun 1.4 release with supported compile targets" >&2
+            exit 1
+          fi
+          if ! [[ "$CONFIG_COORDINATOR_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::AUTOBOT_COORDINATOR_PROVENANCE_SHA256 must be a lowercase SHA-256 pin" >&2
+            exit 1
+          fi
+          if [[ ! "$CONFIG_UPSTREAM_REPOSITORY" =~ ^https:// ]] || [[ "$CONFIG_UPSTREAM_REPOSITORY" == *"#"* ]] || [[ "$CONFIG_UPSTREAM_REPOSITORY" == *"@"* ]] || [[ "$CONFIG_UPSTREAM_REPOSITORY" == *"?"* ]]; then
+            echo "::error::AUTOBOT_UPSTREAM_REPOSITORY must be a credential-free HTTPS URL without query or fragment" >&2
+            exit 1
+          fi
+          {
+            echo "canonical_branch=$canonical_branch"
+            echo "upstream_ref=$upstream_ref"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+      - name: Capture a separately provisioned exact compiler Bun
+        shell: bash
+        env:
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+        run: |
+          set -euo pipefail
+          source_bun="$(command -v bun)"
+          test "$("$source_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')" = "linux-x64"
+          test "$("$source_bun" --version)" = "$COMPILER_BUN_VERSION"
+          compiler_dir="$RUNNER_TEMP/autobot-toolchain"
+          mkdir -p "$compiler_dir"
+          compiler_bun="$compiler_dir/$(basename "$source_bun")"
+          cp "$source_bun" "$compiler_bun"
+          chmod +x "$compiler_bun"
+          test "$("$compiler_bun" --version)" = "$COMPILER_BUN_VERSION"
+          compiler_bun_sha256="$(sha256sum "$compiler_bun" | cut -d ' ' -f1)"
+          {
+            echo "AUTOBOT_COMPILER_BUN=$compiler_bun"
+            echo "AUTOBOT_COMPILER_BUN_SHA256=$compiler_bun_sha256"
+          } >> "$GITHUB_ENV"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Build and test a pinned merge in an isolated clone
+        shell: bash
+        env:
+          CANONICAL_BRANCH: ${{ steps.config.outputs.canonical_branch }}
+          UPSTREAM_REF: ${{ steps.config.outputs.upstream_ref }}
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+          UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          runner_bun="$(command -v bun)"
+          test "$("$runner_bun" --version)" = "1.3.14"
+          test "$("$runner_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')" = "linux-x64"
+          test "$("$AUTOBOT_COMPILER_BUN" --version)" = "$COMPILER_BUN_VERSION"
+          test "$(sha256sum "$AUTOBOT_COMPILER_BUN" | cut -d ' ' -f1)" = "$AUTOBOT_COMPILER_BUN_SHA256"
+          bun scripts/autobot-release-integrate.ts \
+            --canonical-repository "https://github.com/${GITHUB_REPOSITORY}.git" \
+            --canonical-branch "$CANONICAL_BRANCH" \
+            --upstream-repository "$UPSTREAM_REPOSITORY" \
+            --upstream-ref "$UPSTREAM_REF" \
+            --runner-bun "$runner_bun" \
+            --runner-bun-version "1.3.14" \
+            --compiler-bun "$AUTOBOT_COMPILER_BUN" \
+            --compiler-bun-version "$COMPILER_BUN_VERSION" \
+            --coordinator-source-sha256 "$COORDINATOR_PROVENANCE_SHA256" \
+            --out "$RUNNER_TEMP/autobot-upstream-candidate"
+      - name: Read pinned candidate provenance
+        id: provenance
+        shell: bash
+        env:
+          UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          provenance="$RUNNER_TEMP/autobot-upstream-candidate/candidate-provenance.json"
+          upstream_commit="$(jq -er '.upstreamCommit | strings' "$provenance")"
+          candidate_commit="$(jq -er '.candidateCommit | strings' "$provenance")"
+          upstream_version="$(jq -er '.upstreamVersion | strings' "$provenance")"
+          upstream_repository="$(jq -er '.upstreamRepository | strings' "$provenance")"
+          web_bundle_id="$(jq -er '.webBundleId | strings' "$provenance")"
+          compatibility_epoch="$(jq -er '.compatibilityEpoch' "$provenance")"
+          coordinator_source_sha256="$(jq -er '.coordinatorSourceSha256 | strings' "$provenance")"
+          compiler_bun_sha256="$(jq -er '.toolchain.compilerBunSha256 | strings' "$provenance")"
+          requires_compatibility_review="$(jq -er '.compatibilityReview.required' "$provenance")"
+          if ! [[ "$upstream_repository" = "$UPSTREAM_REPOSITORY" && "$upstream_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ && "$candidate_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ && "$upstream_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]{0,127}$ && "$web_bundle_id" =~ ^[A-Za-z0-9_-]{1,96}$ && "$coordinator_source_sha256" =~ ^[0-9a-f]{64}$ && "$coordinator_source_sha256" = "$COORDINATOR_PROVENANCE_SHA256" && "$compiler_bun_sha256" =~ ^[0-9a-f]{64}$ && "$compiler_bun_sha256" = "$AUTOBOT_COMPILER_BUN_SHA256" && "$compatibility_epoch" =~ ^[1-9][0-9]*$ && "$requires_compatibility_review" =~ ^(true|false)$ ]]; then
+            echo "::error::Candidate provenance contains an unsafe or malformed promoted value" >&2
+            exit 1
+          fi
+          {
+            echo "upstream_commit=$upstream_commit"
+            echo "candidate_commit=$candidate_commit"
+            echo "upstream_version=$upstream_version"
+            echo "web_bundle_id=$web_bundle_id"
+            echo "compatibility_epoch=$compatibility_epoch"
+            echo "requires_compatibility_review=$requires_compatibility_review"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autobot-upstream-candidate
+          path: ${{ runner.temp }}/autobot-upstream-candidate
+          if-no-files-found: error
+          retention-days: 14
+
+  review:
+    name: Submit candidate for protected-branch review
+    needs: candidate
+    if: ${{ inputs.create_review || (github.event_name == 'schedule' && vars.AUTOBOT_UPSTREAM_AUTOMATION == 'enabled') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr_number: ${{ steps.pr.outputs.number }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: autobot-upstream-candidate
+          path: ${{ runner.temp }}/autobot-upstream-candidate
+      # This job moves verified git objects only; it never checks out or executes candidate content.
+      - name: Push the reviewed candidate with a downstream-trigger credential
+        id: pr
+        shell: bash
+        env:
+          AUTOMATION_TOKEN: ${{ secrets.AUTOBOT_AUTOMATION_TOKEN }}
+          CANONICAL_BRANCH: ${{ needs.candidate.outputs.canonical_branch }}
+          UPSTREAM_COMMIT: ${{ needs.candidate.outputs.upstream_commit }}
+          CANDIDATE_COMMIT: ${{ needs.candidate.outputs.candidate_commit }}
+          REQUIRES_COMPATIBILITY_REVIEW: ${{ needs.candidate.outputs.requires_compatibility_review }}
+        run: |
+          set -euo pipefail
+          if [ -z "$AUTOMATION_TOKEN" ]; then
+            echo "::error::AUTOBOT_AUTOMATION_TOKEN must be a PAT or GitHub App token so candidate PR checks are triggered" >&2
+            exit 1
+          fi
+          export GH_TOKEN="$AUTOMATION_TOKEN"
+          gh auth setup-git
+          candidate_branch="autobot/upstream-${UPSTREAM_COMMIT}"
+          worktree="$RUNNER_TEMP/autobot-review-repository"
+          git clone --no-checkout "https://github.com/${GITHUB_REPOSITORY}.git" "$worktree"
+          git -C "$worktree" fetch --no-tags origin "refs/heads/$CANONICAL_BRANCH"
+          git -C "$worktree" fetch "$RUNNER_TEMP/autobot-upstream-candidate/candidate.bundle" "$CANDIDATE_COMMIT:refs/heads/$candidate_branch"
+          git -C "$worktree" push origin "refs/heads/$candidate_branch:refs/heads/$candidate_branch"
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$candidate_branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$existing" ]; then
+            existing="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$candidate_branch" \
+              --title "chore(autobot): integrate upstream ${UPSTREAM_COMMIT:0:12}" \
+              --body "Pinned upstream candidate. The isolated build, native-addon smoke, browser-relay embed check, and collaboration contract tests passed before this branch was pushed.
+
+              Compatibility-sensitive change review required: $REQUIRES_COMPATIBILITY_REVIEW. The immutable candidate provenance artifact lists every policy-matched path.")"
+            existing="${existing##*/}"
+          fi
+          if ! [[ "$existing" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the candidate review PR number" >&2
+            exit 1
+          fi
+          echo "number=$existing" >> "$GITHUB_OUTPUT"
+
+  gated_auto_merge:
+    name: Enable protected-branch auto-merge
+    needs: [candidate, review]
+    if: ${{ needs.review.result == 'success' && needs.candidate.outputs.requires_compatibility_review != 'true' && vars.AUTOBOT_UPSTREAM_AUTOMATION == 'enabled' && (github.event_name == 'schedule' || inputs.enable_automated_merge) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    environment: autobot-upstream-automation
+    steps:
+      - name: Request GitHub auto-merge only after protected checks and required reviews
+        shell: bash
+        env:
+          AUTOMATION_TOKEN: ${{ secrets.AUTOBOT_AUTOMATION_TOKEN }}
+          PR_NUMBER: ${{ needs.review.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ -z "$AUTOMATION_TOKEN" ]; then
+            echo "::error::AUTOBOT_AUTOMATION_TOKEN must be a PAT or GitHub App token so the canonical push triggers release promotion" >&2
+            exit 1
+          fi
+          export GH_TOKEN="$AUTOMATION_TOKEN"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::No reviewed candidate PR is available for auto-merge" >&2
+            exit 1
+          fi
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --merge

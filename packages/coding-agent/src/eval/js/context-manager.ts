@@ -434,6 +434,15 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 	);
 }
 
+/** True while an owner still has a retained or starting JavaScript evaluator. */
+export function hasVmContextsForOwner(ownerId: string | undefined): boolean {
+	if (!ownerId) return false;
+	return (
+		Array.from(sessions.values()).some(session => session.ownerIds.has(ownerId)) ||
+		Array.from(startingSessions.values()).some(session => session.ownerIds.has(ownerId))
+	);
+}
+
 /**
  * Smoke probe: spawn the JS evaluator through the worker-host entry and prove
  * it answers the `init` handshake in a real isolated subprocess (not the inline

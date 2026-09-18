@@ -127,6 +127,7 @@ describe("collab host registry (two-process smoke)", () => {
 		const instanceId = "cli-host";
 		const controlUrl = `https://collab.example/control/${marker}`;
 		const viewUrl = `https://collab.example/view/${marker}`;
+		const shutdownFile = path.join(home, "clean-shutdown");
 		// Clear every override that could redirect the registry outside the fake HOME.
 		const env: Record<string, string | undefined> = {
 			...process.env,
@@ -135,6 +136,7 @@ describe("collab host registry (two-process smoke)", () => {
 			NO_COLOR: "1",
 			OMP_SMOKE_MARKER: marker,
 			OMP_SMOKE_INSTANCE_ID: instanceId,
+			OMP_SMOKE_SHUTDOWN_FILE: shutdownFile,
 		};
 		delete env.PI_CONFIG_DIR;
 		delete env.PI_PROFILE;
@@ -190,8 +192,9 @@ describe("collab host registry (two-process smoke)", () => {
 		expect(missing.stdout).toBe("");
 		expect(missing.stderr).toMatch(/^error: [^\n]*missing-host\n$/);
 
-		// SIGTERM allows clean withdrawal, unlike the crash path above.
-		child.kill("SIGTERM");
+		// A file-based control path exercises clean withdrawal on every platform;
+		// Windows may terminate a child before a SIGTERM handler runs.
+		await fs.writeFile(shutdownFile, "shutdown");
 		expect(await child.exited).toBe(0);
 		const afterStop = await waitUntil(async () => {
 			const result = await runCli(["list", "--json"]);

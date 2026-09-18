@@ -323,6 +323,31 @@ export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
 
 /** Input that currently feeds the host's realtime voice session. */
 export type LiveInput = "none" | "local" | "remote";
+/**
+ * Optional, v4-compatible restart negotiation. A browser advertises this in
+ * `hello`; a host only emits restart frames after it has seen that advertisement.
+ * This keeps new browsers silent toward an older v4 host, while a new host
+ * conservatively defers an update for an older browser.
+ */
+export const COLLAB_RESTART_PREPARATION_CAPABILITY = "restart-preparation-v1" as const;
+/** Lets an already-welcomed guest change only its optional restart capability. */
+export const COLLAB_RESTART_CAPABILITY_UPDATE = "restart-capability-update-v1" as const;
+export type CollabGuestCapability = typeof COLLAB_RESTART_PREPARATION_CAPABILITY;
+export type CollabHostCapability =
+	| typeof COLLAB_RESTART_PREPARATION_CAPABILITY
+	| typeof COLLAB_RESTART_CAPABILITY_UPDATE;
+
+/** Bounded status returned by a guest after it tries to reserve local drafts. */
+export type CollabRestartBlockReason =
+	| "draft-storage-unavailable"
+	| "expired"
+	| "microphone-active"
+	| "reservation-conflict"
+	| "unavailable";
+
+/** A host may release a prepared guest without stopping the room. */
+export type CollabRestartCancelReason = "aborted" | "expired" | "unsafe";
+
 
 export type GuestFrame =
 	| {
@@ -335,6 +360,21 @@ export type GuestFrame =
 			 * read-only and rejects their mutating frames.
 			 */
 			writeToken?: string;
+			/**
+			 * Optional feature advertisement. Hosts that do not recognize it
+			 * ignore it; browsers must wait for the matching welcome capability
+			 * before sending any restart frame.
+			 */
+			capabilities?: CollabGuestCapability[];
+	  }
+	/** Updates only optional capabilities without resetting the welcome/snapshot/UI queue. */
+	| { t: "capabilities-update"; capabilities: CollabGuestCapability[] }
+	| { t: "restart-dirty"; dirty: boolean }
+	| {
+			t: "restart-ready";
+			requestId: string;
+			status: "ready" | "blocked";
+			reason?: CollabRestartBlockReason;
 	  }
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
@@ -376,6 +416,11 @@ export type HostFrame =
 			liveInput: LiveInput;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/**
+			 * Optional restart feature confirmation. A guest never sends a
+			 * restart frame unless this includes its advertised capability.
+			 */
+			capabilities?: CollabHostCapability[];
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
@@ -388,6 +433,13 @@ export type HostFrame =
 	| { t: "event"; event: AgentEvent }
 	| { t: "state"; state: SessionState }
 	| { t: "live-state"; active: boolean; input: LiveInput }
+	/**
+	 * Targeted preparation request. `leaseMs` is a short relative lease; each
+	 * side measures it with its own monotonic clock, avoiding wall-clock skew.
+	 */
+	| { t: "restart-prepare"; requestId: string; leaseMs: number }
+	/** Releases a guest reservation when the host will keep serving the room. */
+	| { t: "restart-cancel"; requestId: string; reason: CollabRestartCancelReason }
 	/**
 	 * Targeted decoded assistant audio for the browser that owns the active
 	 * remote microphone lease. `data` is base64url-encoded mono PCM16 LE.
@@ -436,6 +488,11 @@ export type WireFrame = GuestFrame | HostFrame;
  *   host), so they must be rejected at hello.
  * - `4`: adds host live state plus writable-peer remote input leases, fixed
  *   PCM16 input chunks, and targeted decoded 48 kHz mono assistant audio.
+ *
+ * Restart preparation remains an optional v4 capability. A host asks only
+ * peers that advertise it in `hello` or the negotiated `capabilities-update`
+ * frame; older hosts ignore both optional fields and never receive a restart
+ * frame.
  */
 export const COLLAB_PROTO = 4;
 

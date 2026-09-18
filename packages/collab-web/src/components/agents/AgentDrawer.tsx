@@ -1,8 +1,9 @@
 import type { AgentSnapshot, SessionEntry, SubagentProgressPayload } from "@oh-my-pi/pi-wire";
 import { OctagonX, RotateCcw, SendHorizontal, X } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { GuestClient } from "../../lib/client";
+import type { RestartDraftRegistry, RestartDraftSurface } from "../../lib/restart-drafts";
 import { fmtCost, fmtDuration, fmtTokens } from "../../lib/format";
 import { decideTranscriptPoll } from "../../lib/transcript-poll";
 import type { TranscriptProps } from "../transcript/Transcript";
@@ -15,17 +16,24 @@ export function AgentDrawer(props: {
 	agent: AgentSnapshot;
 	progress?: SubagentProgressPayload;
 	client: GuestClient;
+	drafts: RestartDraftRegistry;
+	draftsReady: boolean;
+	draftRecoveryVersion: number;
+	restartPreparing: boolean;
 	/** View-link guests: hide kill/revive/chat (the host rejects them anyway). */
 	readOnly?: boolean;
 	/** Forwarded to tool renderers so nested task cards can drill further. */
 	host?: TranscriptProps["host"];
 	onClose(): void;
 }): ReactNode {
-	const { agent, progress, client, readOnly, host, onClose } = props;
+	const { agent, progress, client, drafts, draftsReady, draftRecoveryVersion, restartPreparing, readOnly, host, onClose } =
+		props;
 	const [entries, setEntries] = useState<readonly SessionEntry[]>([]);
 	const [fetchError, setFetchError] = useState<string | null>(null);
 	const [draft, setDraft] = useState("");
-
+	const surface: RestartDraftSurface = { kind: "agent-chat", agentId: agent.id };
+	const composingRef = useRef(false);
+	const live = client.getSnapshot().phase === "live";
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
 			if (e.key === "Escape") onClose();
@@ -33,6 +41,12 @@ export function AgentDrawer(props: {
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
 	}, [onClose]);
+
+	useEffect(() => {
+		setDraft(drafts.get({ kind: "agent-chat", agentId: agent.id }) ?? "");
+	}, [agent.id, draftRecoveryVersion, drafts]);
+
+	useEffect(() => () => drafts.setComposing(surface, false), [agent.id, drafts]);
 
 	// Live transcript: poll the host-side session file while the drawer is
 	// open, appending parsed JSONL entries. State resets when the agent
@@ -92,10 +106,11 @@ export function AgentDrawer(props: {
 		};
 	}, [agent.id, agent.hasSessionFile, client]);
 
-	const sendChat = () => {
+	const sendChat = (): void => {
 		const text = draft.trim();
-		if (!text) return;
-		client.sendAgentCmd("chat", agent.id, text);
+		if (!text || !live || !draftsReady || restartPreparing || composingRef.current) return;
+		if (!client.sendAgentCmd("chat", agent.id, text)) return;
+		drafts.clear(surface);
 		setDraft("");
 	};
 
@@ -120,13 +135,19 @@ export function AgentDrawer(props: {
 							type="button"
 							className="ag-btn ag-btn--danger"
 							onClick={() => client.sendAgentCmd("kill", agent.id)}
+							disabled={!live || restartPreparing}
 						>
 							<OctagonX size={13} aria-hidden />
 							kill
 						</button>
 					) : null}
 					{(agent.status === "parked" || agent.status === "aborted") && !readOnly ? (
-						<button type="button" className="ag-btn" onClick={() => client.sendAgentCmd("revive", agent.id)}>
+						<button
+							type="button"
+							className="ag-btn"
+							onClick={() => client.sendAgentCmd("revive", agent.id)}
+							disabled={!live || restartPreparing}
+						>
 							<RotateCcw size={13} aria-hidden />
 							revive
 						</button>
@@ -199,10 +220,36 @@ export function AgentDrawer(props: {
 					<input
 						className="ag-chat-input"
 						value={draft}
-						placeholder={`message ${agent.displayName}…`}
-						onChange={e => setDraft(e.target.value)}
+						placeholder={draftsReady ? `message ${agent.displayName}…` : "verifying draft storage…"}
+						onChange={e => {
+							setDraft(e.target.value);
+							if (draftsReady) {
+								drafts.noteInput(surface);
+								drafts.set(surface, e.target.value);
+							}
+						}}
+						onCompositionStart={() => {
+							composingRef.current = true;
+							drafts.setComposing(surface, true);
+						}}
+						onCompositionEnd={() => {
+							drafts.noteInput(surface);
+							drafts.setComposing(surface, false);
+							setTimeout(() => {
+								composingRef.current = false;
+							}, 0);
+						}}
+						onKeyDown={e => {
+							if (e.key === "Enter" && (e.nativeEvent.isComposing || composingRef.current)) e.preventDefault();
+						}}
+						disabled={!draftsReady}
 					/>
-					<button type="submit" className="ag-iconbtn" aria-label="send" disabled={draft.trim().length === 0}>
+					<button
+						type="submit"
+						className="ag-iconbtn"
+						aria-label="send"
+						disabled={!live || !draftsReady || restartPreparing || draft.trim().length === 0}
+					>
 						<SendHorizontal size={15} aria-hidden />
 					</button>
 				</form>

@@ -6,6 +6,18 @@
 
 - Extensions can start or reuse interactive collaboration sessions and observe their lifecycle and pending-input state.
 - Authorized browser guests can provide live voice input and receive assistant audio without using the host microphone.
+- Added operator guidance for the signed AutoBot channel, immutable bootstrap installation/legacy migration, and its external hourly integration and promotion workflows.
+
+### Changed
+
+- Maintained custom 18.2.3 collaboration builds use repository-pinned Bun 1.4.0 with a matching source-built native addon through the maintained build scripts, preserving compiled `import.meta` startup.
+- Managed AutoBot updates now run serially at safe idle and resume the exact persisted session/profile/cwd/current model without replaying the original prompt. The broker reservation is 390 seconds (270-second execution floor plus 120-second pre-commit margin); candidates have a 60-second ready deadline.
+
+### Fixed
+
+- Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
+- AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
+
 ## [18.2.3] - 2026-09-17
 
 ### Breaking Changes

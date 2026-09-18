@@ -346,5 +346,9 @@ The script handles version bump, CHANGELOG finalization, commit, tag, publish, a
 
 ## Recent Updates
 
+- 2026-09-16: Forward-ported custom collaboration recovery to source-built 18.2.3. Put repository-pinned Bun 1.4.0 first in `PATH` (and set `BUN_COMPILE_EXECUTABLE_PATH` to that compiler if specified), then run root `bun run build:native` for the matching addon and `packages/coding-agent` `bun run build`; the maintained build sets Bun/ESM bytecode and preserves embeds. Reinstall and fully restart existing CLIs.
+- 2026-09-16: Stage/deploy fresh collab assets to the coordinator before loading fresh browser pages. A same-session restart produced a replacement host and full browser reload/reconnection; a stalled browser fetch recovered after the 10-second fetch/body deadline with diagnostics excluding tokens, room URLs, capabilities, and message text.
+- 2026-09-16: A standard upstream `omp update` can overwrite fork customizations. Updater behavior and settings were left unchanged; rebuild the maintained custom runtime from this checkout after an update.
+- 2026-09-16: Verification limitation: on Windows, Bun 1.4.0 crashed running the multi-file collab suite, including with `--parallel=1`; individual/small batches passed. The complete 241-test, 3-skip suite passed under Bun 1.3.14 with the rebuilt addon, while the compiled 1.4.0 binary version/smoke and a 16-minute live host, same-session restart, and browser-restart scenario passed. Root cause remains unisolated; do not change test commands/settings or treat this as a build failure.
 - 2026-09-07: Added collaboration lifecycle support and protocol-v4 browser live-audio contracts.
 - 2026-09-10: Collaboration pending-input hooks expose only the input surface type, never prompt content.

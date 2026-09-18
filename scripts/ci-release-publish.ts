@@ -132,6 +132,31 @@ function nativeLeafTagFromArgs(argv: readonly string[]): string | null {
 }
 
 const nativeLeafTag = nativeLeafTagFromArgs(process.argv.slice(2));
+const prepareOnly = process.argv.includes("--prepare-only");
+const prepareOnlyTsgoEnvironment = "OMP_RELEASE_PREPARE_TSGO";
+if (prepareOnly && nativeLeafTag) {
+	throw new Error("--prepare-only cannot be combined with --native-leaf");
+}
+if (prepareOnly && isDryRun) {
+	throw new Error("--prepare-only requires a writable isolated staging checkout");
+}
+
+function prepareOnlyTsgo(): string {
+	const executable = process.env[prepareOnlyTsgoEnvironment];
+	if (!executable || !path.isAbsolute(executable)) {
+		throw new Error(`--prepare-only requires ${prepareOnlyTsgoEnvironment} to name an absolute preinstalled tsgo executable`);
+	}
+	return executable;
+}
+
+async function emitPublishTypes(pkgDir: string, config: string): Promise<void> {
+	if (prepareOnly) {
+		await $`${prepareOnlyTsgo()} -p ${config}`.cwd(pkgDir);
+		return;
+	}
+	await $`bun x tsgo -p ${config}`.cwd(pkgDir);
+}
+
 /**
  * Choose npm's dist-tag from a package manifest version. Unknown prereleases
  * are rejected rather than accidentally publishing them on the stable channel.
@@ -245,12 +270,12 @@ async function preparePackage(pkg: PublishPackage): Promise<PackageManifest> {
 	for (const argv of pkg.preBuild ?? []) {
 		await $`${argv}`.cwd(pkgDir);
 	}
-	await $`bun x tsgo -p tsconfig.publish.json`.cwd(pkgDir);
+	await emitPublishTypes(pkgDir, "tsconfig.publish.json");
 	for (const cfg of pkg.extraTypeConfigs ?? []) {
-		await $`bun x tsgo -p ${cfg}`.cwd(pkgDir);
+		await emitPublishTypes(pkgDir, cfg);
 	}
 	if (pkg.publishJs) {
-		await $`bun x tsgo -p tsconfig.publish.js.json`.cwd(pkgDir);
+		await emitPublishTypes(pkgDir, "tsconfig.publish.js.json");
 	}
 	const sourceManifest = (await Bun.file(path.join(pkgDir, "package.json")).json()) as PackageManifest;
 	await stageLegalPayloads(pkgDir, sourceManifest.license, !isDryRun);
@@ -462,8 +487,26 @@ async function publishPackage(pkg: PublishPackage): Promise<void> {
 	await packAndPublish(pkgDir, name, version);
 }
 
+/**
+ * Build the exact declaration/runtime manifest topology used for publication,
+ * without packing or publishing anything. Callers must run this only from an
+ * isolated writable staging checkout and provide the already-installed type
+ * emitter through `OMP_RELEASE_PREPARE_TSGO`.
+ */
+async function preparePublishedTopology(): Promise<void> {
+	for (const pkg of packages) {
+		if (pkg.kind === "native") {
+			await prepareNativeCorePackage(path.join(repoRoot, pkg.dir), true);
+			continue;
+		}
+		await preparePackage(pkg);
+	}
+}
+
 if (import.meta.main) {
-	if (nativeLeafTag) {
+	if (prepareOnly) {
+		await preparePublishedTopology();
+	} else if (nativeLeafTag) {
 		await publishNativeLeafPackage(nativeLeafTag);
 	} else {
 		for (const pkg of packages) {

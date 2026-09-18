@@ -7,8 +7,10 @@
  * argv[3]  URL marker; falls back to OMP_SMOKE_MARKER, then "smoke".
  * argv[4]  instance ID; falls back to OMP_SMOKE_INSTANCE_ID, then "smoke-host".
  *
- * Emits `READY\n` once published. SIGTERM closes the publication and exits 0.
+ * Emits `READY\n` once published. SIGTERM closes the publication where signal
+ * delivery is supported; OMP_SMOKE_SHUTDOWN_FILE provides portable clean exit.
  */
+import * as fs from "node:fs/promises";
 import { type CollabHostRegistrySource, publishCollabHost } from "../../../src/collab/registry";
 
 const dirArg = process.argv[2];
@@ -16,6 +18,7 @@ const marker = process.argv[3] ?? process.env.OMP_SMOKE_MARKER ?? "smoke";
 const instanceId = process.argv[4] ?? process.env.OMP_SMOKE_INSTANCE_ID ?? "smoke-host";
 const dir = dirArg && dirArg.length > 0 ? dirArg : undefined;
 const startedAt = Date.now();
+const shutdownFile = process.env.OMP_SMOKE_SHUTDOWN_FILE;
 
 const source: CollabHostRegistrySource = {
 	snapshot: () => ({
@@ -36,14 +39,24 @@ const source: CollabHostRegistrySource = {
 };
 const publication = await publishCollabHost(source, { dir, instanceId });
 
+let shuttingDown = false;
+let shutdownPoll: Timer | undefined;
 const shutdown = (): void => {
-	publication.close().then(
+	if (shuttingDown) return;
+	shuttingDown = true;
+	clearInterval(shutdownPoll);
+	void publication.close().then(
 		() => process.exit(0),
-		() => process.exit(0),
+		() => process.exit(1),
 	);
 };
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
+if (shutdownFile) {
+	shutdownPoll = setInterval(() => {
+		void fs.access(shutdownFile).then(shutdown, () => {});
+	}, 25);
+}
 process.stdout.write("READY\n");
 
 // Stay alive until a signal arrives (or the parent SIGKILLs us).

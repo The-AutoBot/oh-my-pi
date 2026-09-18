@@ -84,6 +84,14 @@ interface ParkInFlight {
 	detached: boolean;
 }
 
+/** Exclusive, reversible barrier preventing new agent revival during a safe runtime handoff. */
+export interface AutoBotUpdateLifecycleBarrier {
+	/** True only while this holder owns the barrier and no prior lifecycle transition remains in flight. */
+	isQuiescent(): boolean;
+	/** Release the barrier; safe to call more than once. */
+	release(): void;
+}
+
 interface RevivingAgent {
 	ref: AgentRef;
 	promise: Promise<AgentSession>;
@@ -128,6 +136,7 @@ export class AgentLifecycleManager {
 		this.#adopted.clear();
 		this.#revivals.clear();
 		this.#parks.clear();
+		this.#autoBotUpdateBarrier = undefined;
 		this.#persistedReviverFactory = undefined;
 	}
 
@@ -145,6 +154,8 @@ export class AgentLifecycleManager {
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** TTL applied when a cold-revived ref is adopted on demand. */
 	#persistedReviveTtlMs = 0;
+	/** A short exclusive handoff barrier; prevents a parked agent from reviving after idle admission. */
+	#autoBotUpdateBarrier: symbol | undefined;
 	/** Set once {@link dispose} runs; blocks late revivals from adopting into a torn-down manager. */
 	#disposed = false;
 
@@ -162,6 +173,37 @@ export class AgentLifecycleManager {
 	setPersistedSubagentReviverFactory(factory: PersistedSubagentReviverFactory, idleTtlMs: number): void {
 		this.#persistedReviverFactory = factory;
 		this.#persistedReviveTtlMs = idleTtlMs;
+	}
+
+	/**
+	 * Atomically rejects future revivals while an AutoBot update checks the
+	 * remaining session. It refuses to acquire over an existing park/revival so
+	 * the caller can defer rather than racing an in-flight agent attachment.
+	 */
+	beginAutoBotUpdateBarrier(): AutoBotUpdateLifecycleBarrier | undefined {
+		if (this.#disposed || this.#autoBotUpdateBarrier !== undefined || this.#parks.size > 0 || this.#revivals.size > 0) {
+			return undefined;
+		}
+		const token = Symbol("autobot-update");
+		this.#autoBotUpdateBarrier = token;
+		return {
+			isQuiescent: () => this.#autoBotUpdateBarrier === token && this.#parks.size === 0 && this.#revivals.size === 0,
+			release: () => {
+				if (this.#autoBotUpdateBarrier !== token) return;
+				this.#autoBotUpdateBarrier = undefined;
+				for (const [id, adopted] of this.#adopted) {
+					const ref = this.#registry.get(id);
+					if (ref === adopted.ref && ref.status === "idle" && ref.session !== null) {
+						this.#armTimer(id, adopted);
+					}
+				}
+			},
+		};
+	}
+
+	/** Whether a park or revival can still attach/detach a session asynchronously. */
+	hasPendingAgentTransition(): boolean {
+		return this.#parks.size > 0 || this.#revivals.size > 0;
 	}
 
 	/**
@@ -264,6 +306,7 @@ export class AgentLifecycleManager {
 	 * arrives before detach cancels the park and keeps the live session.
 	 */
 	async park(id: string): Promise<void> {
+		if (this.#autoBotUpdateBarrier !== undefined) return;
 		const existing = this.#parks.get(id);
 		if (existing) return existing.promise;
 
@@ -338,6 +381,9 @@ export class AgentLifecycleManager {
 	 * cancelled (session still live) or awaited to completion before revive.
 	 */
 	async ensureLive(id: string): Promise<AgentSession> {
+		if (this.#autoBotUpdateBarrier !== undefined) {
+			throw new Error("Agent revival is unavailable while an AutoBot update is preparing");
+		}
 		const park = this.#parks.get(id);
 		if (park) {
 			const parked = this.#registry.get(id);

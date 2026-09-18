@@ -5,9 +5,12 @@ import type { GuestSnapshot } from "../src/lib/client";
 import { GuestClient } from "../src/lib/client";
 import { Composer, shouldSubmitOnEnter } from "../src/components/shell/Composer";
 import { encodeBase64Url } from "../src/lib/link";
+import { RestartDraftRegistry } from "../src/lib/restart-drafts";
 
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
 const client = new GuestClient(LINK, "tester");
+const drafts = new RestartDraftRegistry(null);
+const EDITOR_CAPABILITY_FINGERPRINT = "a".repeat(64);
 
 function snapshot(uiRequest: GuestSnapshot["uiRequest"]): GuestSnapshot {
 	return {
@@ -25,6 +28,7 @@ function snapshot(uiRequest: GuestSnapshot["uiRequest"]): GuestSnapshot {
 		working: true,
 		liveActive: false,
 		liveInput: "none",
+		restartPreparing: false,
 		liveInputLease: {
 			status: "idle",
 			requestId: null,
@@ -50,6 +54,10 @@ describe("Composer host UI requests", () => {
 					options: ["Yes", { label: "No", description: "Stop here" }],
 					selectionMarker: "radio",
 				})}
+				drafts={drafts}
+				draftsReady
+				draftRecoveryVersion={0}
+				editorDraftCapabilityFingerprint={EDITOR_CAPABILITY_FINGERPRINT}
 			/>,
 		);
 
@@ -63,6 +71,10 @@ describe("Composer host UI requests", () => {
 			<Composer
 				client={client}
 				snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })}
+				drafts={drafts}
+				draftsReady
+				draftRecoveryVersion={0}
+				editorDraftCapabilityFingerprint={EDITOR_CAPABILITY_FINGERPRINT}
 			/>,
 		);
 
@@ -73,7 +85,14 @@ describe("Composer host UI requests", () => {
 
 	it("keeps the editor submit enabled for whitespace-only drafts", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />,
+			<Composer
+				client={client}
+				snapshot={snapshot({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })}
+				drafts={drafts}
+				draftsReady
+				draftRecoveryVersion={0}
+				editorDraftCapabilityFingerprint={EDITOR_CAPABILITY_FINGERPRINT}
+			/>,
 		);
 
 		const submit = { found: false, disabled: false };

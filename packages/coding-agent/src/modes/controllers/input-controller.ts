@@ -213,6 +213,14 @@ export class InputController {
 	#expandToolsListenerInstalled = false;
 	#inlineMouseListenerInstalled = false;
 
+
+	/** True while the terminal is released to an external editor process. */
+	#externalEditorActive = false;
+
+	/** Whether an external editor currently owns the user's composer draft. */
+	get isExternalEditorActive(): boolean {
+		return this.#externalEditorActive;
+	}
 	/** Click-candidate id the hover band currently tracks; repaint only on change. */
 	#lastHoverClickId: string | undefined;
 
@@ -2433,6 +2441,7 @@ export class InputController {
 		const currentText = this.ctx.editor.getExpandedText?.() ?? this.ctx.editor.getText();
 
 		try {
+			this.#externalEditorActive = true;
 			this.ctx.ui.stop();
 			const result = await openInEditor(editorCmd, currentText, { extension: ".omp.md" });
 			if (result !== null) {
@@ -2444,6 +2453,7 @@ export class InputController {
 			);
 		} finally {
 			this.ctx.ui.start();
+			this.#externalEditorActive = false;
 			this.ctx.ui.requestRender();
 		}
 	}

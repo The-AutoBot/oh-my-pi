@@ -31,7 +31,10 @@ export interface PhoneMicSnapshot {
 	playbackMessage: string | null;
 }
 
-type LiveInputSnapshot = Pick<GuestSnapshot, "phase" | "readOnly" | "liveActive" | "liveInput" | "liveInputLease">;
+type LiveInputSnapshot = Pick<
+	GuestSnapshot,
+	"phase" | "readOnly" | "restartPreparing" | "liveActive" | "liveInput" | "liveInputLease"
+>;
 
 export interface LiveInputClient {
 	subscribe(listener: () => void): () => void;
@@ -194,6 +197,7 @@ export class PhoneMicController {
 
 	start(): void {
 		const clientSnapshot = this.#client.getSnapshot();
+		if (clientSnapshot.restartPreparing) return;
 		if (clientSnapshot.readOnly || clientSnapshot.phase !== "live") {
 			this.#setSnapshot("unavailable", "Live microphone input is unavailable while disconnected or read-only.");
 			return;

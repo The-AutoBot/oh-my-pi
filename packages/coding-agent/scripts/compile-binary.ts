@@ -1,11 +1,27 @@
 // Deep import: the pi-utils barrel loads the host native addon, which is
 // absent on cross-compiling release runners.
 import { USER_AGENT } from "@oh-my-pi/pi-utils/dirs";
+import type { AutoBotBuildIdentity } from "../src/autobot-update/build-metadata";
 import { buildDocsIndexPayload } from "./generate-docs-index";
 import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
 
 /** Native runtime dependencies always resolved from the on-demand install instead of embedded into compiled binaries. */
 export const COMPILED_EXTERNAL_DEPENDENCIES: readonly string[] = Object.freeze(["fastembed", "onnxruntime-node"]);
+
+/** Decode the explicit release-only identity before embedding it in a compiled runtime. */
+export function parseAutoBotBuildIdentity(text: string | undefined): AutoBotBuildIdentity | undefined {
+	if (text === undefined) return undefined;
+	let value: unknown;
+	try {
+		value = JSON.parse(text);
+	} catch {
+		throw new Error("OMP_AUTOBOT_BUILD_IDENTITY must be valid JSON");
+	}
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("OMP_AUTOBOT_BUILD_IDENTITY must be a JSON object");
+	}
+	return value as AutoBotBuildIdentity;
+}
 
 /** Inputs shared by local and release coding-agent binary builds. */
 export interface CodingAgentCompileOptions {
@@ -17,6 +33,8 @@ export interface CodingAgentCompileOptions {
 	readonly outfile: string;
 	/** Concrete Transformers.js version baked into the tiny-model worker. */
 	readonly transformersVersion: string;
+	/** Optional immutable identity embedded only in signed AutoBot runtime builds. */
+	readonly autoBotBuildIdentity?: AutoBotBuildIdentity;
 	/** Optional cross-compilation runtime target. */
 	readonly target?: Bun.Build.CompileTarget;
 	/** Optional unmodified Bun executable used as the standalone runtime template. */
@@ -36,15 +54,23 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 	if (options.skipBuiltinCodesign) {
 		Bun.env.BUN_NO_CODESIGN_MACHO_BINARY = "1";
 	}
+	const autoBotBuildIdentityDefine: string =
+		options.autoBotBuildIdentity === undefined ? "undefined" : JSON.stringify(JSON.stringify(options.autoBotBuildIdentity)!)!;
 	try {
 		const output = await Bun.build({
 			entrypoints: [options.entrypoint],
 			root: options.repoRoot,
+			// Bytecode defaults to CommonJS, where `import.meta` in the CLI graph
+			// is a syntax error at executable startup. ESM bytecode is supported
+			// only for standalone compile builds, which this API invocation is.
+			target: "bun",
+			format: "esm",
 			external: [...COMPILED_EXTERNAL_DEPENDENCIES],
 			define: {
 				"process.env.PI_COMPILED": JSON.stringify("true"),
 				"process.env.PI_TINY_TRANSFORMERS_VERSION": JSON.stringify(options.transformersVersion),
 				"process.env.PI_DOCS_EMBED": JSON.stringify((await buildDocsIndexPayload()).payload),
+				OMP_AUTOBOT_BUILD_IDENTITY: autoBotBuildIdentityDefine,
 			},
 			// Precompiled bytecode skips parsing the ~20 MB bundle at boot:
 			// `omp --version` 256 ms -> 30 ms on M4 Max (+52 MB binary).
@@ -65,10 +91,17 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 						? { target: options.target }
 						: {}),
 				outfile: options.outfile,
-				autoloadBunfig: false,
-				autoloadDotenv: false,
-				autoloadTsconfig: false,
-				autoloadPackageJson: false,
+				// Managed release binaries validate their authority before loading
+				// controlled state. Ordinary upstream/dev binaries retain Bun's
+				// normal project configuration autoload behavior.
+				...(options.autoBotBuildIdentity === undefined
+					? {}
+					: {
+							autoloadBunfig: false,
+							autoloadDotenv: false,
+							autoloadTsconfig: false,
+							autoloadPackageJson: false,
+						}),
 			},
 			throw: false,
 		});

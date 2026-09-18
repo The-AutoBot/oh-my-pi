@@ -443,8 +443,27 @@ export class AsyncJobManager {
 	}
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
-		const deliveries = this.#filterDeliveries(filter);
-		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
+		return this.#getDeliveryState(filter, false);
+	}
+
+	/**
+	 * Returns queued and in-flight delivery state without excluding deliveries
+	 * suppressed for normal wake-up handling. Lifecycle admission uses this
+	 * stricter view so an acknowledged or watched result cannot be lost by a
+	 * process handoff.
+	 */
+	getDeliveryStateIncludingSuppressed(filter?: AsyncJobFilter): AsyncJobDeliveryState {
+		return this.#getDeliveryState(filter, true);
+	}
+
+	#getDeliveryState(filter: AsyncJobFilter | undefined, includeSuppressed: boolean): AsyncJobDeliveryState {
+		const ownerId = filter?.ownerId;
+		const deliveries = includeSuppressed
+			? this.#deliveries.filter(delivery => !ownerId || delivery.ownerId === ownerId)
+			: this.#filterDeliveries(filter);
+		const inFlightDeliveries = includeSuppressed
+			? this.#inFlightDeliveries.filter(delivery => !ownerId || delivery.ownerId === ownerId)
+			: this.#filterInFlightDeliveries(filter);
 		const nextRetryAt = deliveries.reduce<number | undefined>((next, delivery) => {
 			if (next === undefined) return delivery.nextAttemptAt;
 			return Math.min(next, delivery.nextAttemptAt);

@@ -5,12 +5,15 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 import * as fsSync from "node:fs";
+import * as path from "node:path";
 import * as os from "node:os";
+import { loadManagedSessionEnvironment } from "./autobot-update/session-bus-environment";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
 	directoryIsMissing,
+	getActiveProfile,
 	getLogPath,
 	getProjectDir,
 	normalizePathForComparison,
@@ -22,6 +25,27 @@ import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
+import {
+	AutoBotRuntime,
+	createAutoBotCandidateArgs,
+	getVerifiedAutoBotCoordinatorPaths,
+	parseAutoBotRestartLaunchContext,
+	type AutoBotRestartLaunchContext,
+} from "./autobot-runtime";
+import { getAutoBotBuildIdentity, isAutoBotCustomBuild } from "./autobot-update/build-metadata";
+import {
+	AUTO_BOT_COMPATIBILITY_EPOCH,
+	type AutoBotPredecessorFallback,
+	type AutoBotRestartCandidate,
+	type AutoBotRestartRequest,
+} from "./autobot-update/contract";
+import { requestAutoBotNormalExit } from "./autobot-update/handoff";
+import {
+	AutoBotManagedRuntimeRequiredError,
+	getAutoBotStartupHandoff,
+	isVerifiedAutoBotManagedRuntime,
+	startAutoBotUpdates,
+} from "./autobot-update/supervisor";
 import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
@@ -142,6 +166,29 @@ async function loadReadlineInterface() {
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
+}
+
+function shouldCheckUpstreamVersion(): boolean {
+	return !isVerifiedAutoBotManagedRuntime() && !isAutoBotCustomBuild();
+}
+
+function requestMatchesEmbeddedRelease(request: AutoBotRestartRequest): boolean {
+	const target = request.target;
+	if (target.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH) return false;
+	const identity = getAutoBotBuildIdentity();
+	return (
+		identity !== undefined &&
+		identity.releaseSequence === target.releaseSequence &&
+		identity.upstreamVersion === target.upstreamVersion &&
+		identity.forkCommit === target.forkCommit &&
+		identity.sessionFormatVersion === target.sessionFormatVersion &&
+		identity.collabProtocolVersion === target.collabProtocolVersion
+	);
+}
+
+async function rejectAutoBotCandidate(candidate: AutoBotRestartCandidate | undefined): Promise<void> {
+	if (!candidate) return;
+	await candidate.reject("candidate startup validation failed").catch(() => undefined);
 }
 
 async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
@@ -563,6 +610,8 @@ async function runInteractiveMode(
 	joinLink?: string,
 	startBackgroundModelDiscovery?: () => Promise<void>,
 	startupLease?: ComposerLease,
+	activationGate?: (mode: InteractiveMode) => Promise<void>,
+	afterStartup?: (mode: InteractiveMode) => Promise<void> | void,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -583,19 +632,19 @@ async function runInteractiveMode(
 		startupLease?.dispose();
 		throw error;
 	}
-
 	let setupWizard: typeof SetupWizardModule | undefined;
 	let setupScenes: SetupScene[] = [];
 	let playStartupSplash = false;
 	try {
-		// Cold-launch gate: the full setup wizard (every scene + the overlay and
-		// their TUI/OAuth/search/theme deps) is heavy, yet the common case only needs
-		// to know whether the stored setup version is current. Lazy-load the wizard
-		// barrel only when setup is stale, forced, or the explicit startup splash
-		// setting needs the shared setup splash renderer.
+		// A candidate/fallback must restore exactly the authenticated session before
+		// it can signal readiness or accept work. Never insert setup/OAuth dialogs
+		// into that protected handoff, even when this machine's setup version is old.
+		const protectedAutoBotStartup = activationGate !== undefined;
 		const storedSetupVersion = settings.get("setupVersion");
+		// Dynamic import keeps the heavy wizard/TUI dependency graph out of normal
+		// and protected startup unless setup UI is actually required.
 		setupWizard =
-			forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
+			!protectedAutoBotStartup && (forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash)
 				? await import("./modes/setup-wizard")
 				: undefined;
 		setupScenes = setupWizard
@@ -612,7 +661,9 @@ async function runInteractiveMode(
 			mode.init({
 				suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 				clearInitialTerminalHistory: true,
-				autoStartCollab: joinLink === undefined,
+				autoStartCollab: activationGate === undefined && joinLink === undefined,
+				holdSubmit: activationGate !== undefined,
+				holdControls: activationGate !== undefined,
 				recentSessions: startupLease?.recentSessions,
 			}),
 		);
@@ -675,9 +726,19 @@ async function runInteractiveMode(
 			// controller observing its eventual restoration without hosting replicas.
 			mode.collabController.autoStart();
 		}
-		// Keep guest mutations gated through setup dialogs and transcript replay,
-		// not just init. Only a successful outer startup opens the room for input.
-		mode.collabController.startupComplete();
+		if (activationGate) {
+			await activationGate(mode);
+			// A user exit completes ordinary teardown while the control fence is
+			// still held. Do not revive Browser or local input in that path.
+			if (!mode.releaseAutoBotProtectedStartupControls()) return;
+			// Keep guest mutations and local submits gated through setup/transcript
+			// replay until the browser controller has completed protected startup.
+			mode.collabController.startupComplete();
+			mode.editor.disableSubmit = false;
+		} else {
+			mode.collabController.startupComplete();
+		}
+		await afterStartup?.(mode);
 	} catch (error) {
 		// Init publishes before startup dialogs, so any later startup failure
 		// must withdraw the room before restoring the terminal.
@@ -1581,6 +1642,31 @@ export async function buildSessionOptions(
 
 		if (parsed.noExtensions) {
 			options.disableExtensionDiscovery = true;
+		} else {
+			// The bootstrap-authenticated slot chooses this fixed module path; it
+			// is never accepted from caller argv, settings, or ambient env. Keep
+			// normal extension discovery intact and let an explicit
+			// --no-extensions defer managed restart support instead.
+			const coordinatorClientPath = getVerifiedAutoBotCoordinatorPaths()?.coordinatorClientPath;
+			if (coordinatorClientPath) {
+				const canonicalCoordinatorClientPath = normalizePathForComparison(coordinatorClientPath);
+				const configuredExtensionPaths = [
+					...(options.additionalExtensionPaths ?? []),
+					...(activeSettings.get("extensions") ?? []),
+				];
+				const alreadyConfigured = configuredExtensionPaths.some(extensionPath => {
+					try {
+						return (
+							normalizePathForComparison(path.resolve(options.cwd, extensionPath)) === canonicalCoordinatorClientPath
+						);
+					} catch {
+						return false;
+					}
+				});
+				if (!alreadyConfigured) {
+					options.additionalExtensionPaths = [...(options.additionalExtensionPaths ?? []), coordinatorClientPath];
+				}
+			}
 		}
 	}
 
@@ -1613,14 +1699,51 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	let autoBotCandidate: AutoBotRestartCandidate | undefined;
+	let autoBotFallback: AutoBotPredecessorFallback | undefined;
+	let autoBotRequest: AutoBotRestartRequest | undefined;
+	let autoBotContext: AutoBotRestartLaunchContext | undefined;
+	let candidateActivated = false;
+	let protectedAutoBotExitSignalled = false;
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
+		const startupHandoff = getAutoBotStartupHandoff();
+		autoBotCandidate = startupHandoff?.role === "candidate" ? startupHandoff.candidate : undefined;
+		autoBotFallback = startupHandoff?.role === "fallback" ? startupHandoff.fallback : undefined;
+		autoBotRequest = autoBotCandidate?.request ?? autoBotFallback?.request;
+		if (autoBotRequest) {
+			if (
+				autoBotRequest.profile !== getActiveProfile() ||
+				!requestMatchesEmbeddedRelease(autoBotRequest)
+			) {
+				if (autoBotCandidate) {
+					await rejectAutoBotCandidate(autoBotCandidate);
+					return;
+				}
+				throw new Error("AutoBot predecessor fallback does not match the active profile or embedded release");
+			}
+			autoBotContext = parseAutoBotRestartLaunchContext(autoBotRequest.context, autoBotRequest.target, {
+				target: autoBotFallback?.attemptedTarget ?? autoBotRequest.target,
+				predecessorTarget: autoBotRequest.predecessorTarget,
+			});
+			if (
+				!autoBotContext ||
+				!autoBotContext.coordinator ||
+				autoBotRequest.fallbackInstanceId !== autoBotContext.coordinator.fallbackInstanceId
+			) {
+				if (autoBotCandidate) {
+					await rejectAutoBotCandidate(autoBotCandidate);
+					return;
+				}
+				throw new Error("AutoBot predecessor fallback has an invalid protected launch context");
+			}
+		}
 		// Non-prepaint commands still need a default theme; an existing Composer
 		// already initialized its cached theme synchronously for the first frame.
 		await logger.time("initTheme:initial", ensureTheme);
 
-		const parsedArgs = parsed;
+		const parsedArgs = autoBotRequest ? createAutoBotCandidateArgs(autoBotRequest, autoBotContext!) : parsed;
 		try {
 			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 		} catch (error: unknown) {
@@ -1691,7 +1814,7 @@ export async function runRootCommand(
 		// See getDbBusyTimeoutMs().
 		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
 		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-		const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+		const pipedInput = autoBotRequest || isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 		const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 		const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 		// Only the interactive host renders a focusable Agent Hub / subagent session
@@ -1830,14 +1953,31 @@ export async function runRootCommand(
 		// Resolve an explicit `--continue <id>` before extension flags are loaded.
 		// Reading the token immediately after `--continue` distinguishes the session
 		// id from UUID-shaped values owned by later extension flags.
-		normalizeContinueSessionArgs(parsedArgs, rawArgs);
+		if (!autoBotRequest) normalizeContinueSessionArgs(parsedArgs, rawArgs);
 
 		// Resolve native resume/fork flags or import one foreign transcript into a
 		// fresh persisted OMP session before constructing the AgentSession.
 		let sessionManager: SessionManager | undefined;
 		let foreignSource: ForeignSessionSource | undefined;
 		try {
-			foreignSource = resolveForeignSessionSource(parsedArgs);
+			if (autoBotRequest) {
+				sessionManager = await SessionManager.open(autoBotRequest.sessionFile, undefined, undefined, {
+					initialCwd: autoBotRequest.cwd,
+					suppressBreadcrumb: true,
+					throwIfMissing: true,
+				});
+				const sessionFile = sessionManager.getSessionFile();
+				if (
+					!sessionFile ||
+					normalizePathForComparison(sessionFile) !== normalizePathForComparison(autoBotRequest.sessionFile) ||
+					sessionManager.getSessionId() !== autoBotRequest.sessionId ||
+					normalizePathForComparison(sessionManager.getCwd()) !== normalizePathForComparison(autoBotRequest.cwd)
+				) {
+					throw new Error("AutoBot protected session does not match its authenticated handoff");
+				}
+				cwd = autoBotRequest.cwd;
+			} else {
+				foreignSource = resolveForeignSessionSource(parsedArgs);
 			if (foreignSource) {
 				if (isProtocolMode) {
 					throw new SessionResolutionError(`--from-${foreignSource} is not supported in ${mode} mode`);
@@ -1906,6 +2046,7 @@ export async function runRootCommand(
 					{ nativeFlagOwnership: "preliminary" },
 				);
 			}
+			}
 		} catch (error: unknown) {
 			if (error instanceof SessionResolutionError) {
 				exitForSessionResolutionError(error);
@@ -1913,7 +2054,7 @@ export async function runRootCommand(
 			throw error;
 		}
 
-		if ((typeof parsedArgs.resume === "string" || foreignSource) && sessionManager && !parsedArgs.noSession) {
+		if (!autoBotRequest && (typeof parsedArgs.resume === "string" || foreignSource) && sessionManager && !parsedArgs.noSession) {
 			const previousCwd = cwd;
 			const recordedCwd = sessionManager.getRecordedCwd() ?? sessionManager.getCwd();
 			const resumedProject = await switchToResumedProject(
@@ -2017,16 +2158,26 @@ export async function runRootCommand(
 				}
 			}
 		}
+		// Apply machine-scoped bus credentials only after the final project cwd is
+		// known, before any extension can create a coordinator client. The loader
+		// preserves authenticated AutoBot claims and project role/name precedence.
+		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES && isVerifiedAutoBotManagedRuntime()) {
+			loadManagedSessionEnvironment();
+		}
 		await pluginPreloadPromise;
-		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+		if (!autoBotRequest && deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
 			await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
 		}
 
-		scheduleMarketplaceAutoUpdate({
-			autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
-			resolveActiveProjectRegistryPath,
-			clearPluginRootsCache: clearPluginRootsAndCaches,
-		});
+		// A protected candidate/fallback must not mutate marketplace or daemon
+		// state before its broker/browser activation fence has completed.
+		if (!autoBotRequest) {
+			scheduleMarketplaceAutoUpdate({
+				autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
+				resolveActiveProjectRegistryPath,
+				clearPluginRootsCache: clearPluginRootsAndCaches,
+			});
+		}
 
 		const sessionOptions = await logger.time(
 			"buildSessionOptions",
@@ -2037,6 +2188,7 @@ export async function runRootCommand(
 			modelRegistry,
 			settingsInstance,
 		);
+		if (autoBotRequest) sessionOptions.additionalDirectories = [];
 		sessionOptions.authStorage = authStorage;
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
@@ -2067,10 +2219,9 @@ export async function runRootCommand(
 		const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 		const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
 			const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
-			// Kick off background model discovery only after createAgentSession finishes its parallel
-			// discovery arms; running these concurrently contends for the event loop and stretches
-			// every parallel arm by ~30ms.
-			modelRegistry.refreshInBackground();
+			// Protected runtimes do not begin provider discovery until broker/browser
+			// activation has completed; discovery can open stateful remote sessions.
+			if (!autoBotRequest) modelRegistry.refreshInBackground();
 			return result;
 		};
 
@@ -2112,8 +2263,8 @@ export async function runRootCommand(
 					extensionsResult.runtime.flagValues.set(name, value);
 				},
 			};
-			const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
-			normalizeContinueSessionArgs(initialArgs, rawArgs);
+			const initialArgs = autoBotRequest ? parsedArgs : (applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs);
+			if (!autoBotRequest) normalizeContinueSessionArgs(initialArgs, rawArgs);
 			try {
 				validateSessionPersistenceArgs(initialArgs);
 			} catch (error: unknown) {
@@ -2161,9 +2312,9 @@ export async function runRootCommand(
 			const showStartupSplash = shouldShowStartupSplash({
 				configured: settingsInstance.get("startup.showSplash"),
 				isInteractive,
-				resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+				resuming: autoBotRequest ? true : Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
 				quiet: settingsInstance.get("startup.quiet"),
-				timing: Boolean($env.PI_TIMING),
+				timing: !autoBotRequest && Boolean($env.PI_TIMING),
 				stdinIsTTY: process.stdin.isTTY,
 				stdoutIsTTY: process.stdout.isTTY,
 			});
@@ -2171,7 +2322,7 @@ export async function runRootCommand(
 			// Startup changelog is only consumed by interactive mode below; kick the
 			// CHANGELOG.md parse off now so it overlaps session creation instead of
 			// serializing after it.
-			const startupChangelogPromise = isInteractive
+			const startupChangelogPromise = isInteractive && !autoBotRequest
 				? logger.time(
 						"main:getChangelogForDisplay",
 						getChangelogForDisplay,
@@ -2231,7 +2382,7 @@ export async function runRootCommand(
 			// empty (issue #9220). Fire-and-forget: the prompt must never block on the
 			// background pass.
 			const configuredScope = parsedArgs.models ?? settingsInstance.get("enabledModels");
-			if (isInteractive && configuredScope.length > 0) {
+			if (!autoBotRequest && isInteractive && configuredScope.length > 0) {
 				void rebuildScopedModelsAfterDiscovery(session, parsedArgs, modelRegistry, settingsInstance).catch(error =>
 					logger.warn("Scoped model rebuild after discovery failed", { error: String(error) }),
 				);
@@ -2267,8 +2418,10 @@ export async function runRootCommand(
 				stopStartupWatchdog();
 				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
 			} else if (isInteractive) {
-				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
-				const startupChangelog = await startupChangelogPromise;
+				const versionCheckPromise = shouldCheckUpstreamVersion()
+					? checkForNewVersion(VERSION).catch(() => undefined)
+					: Promise.resolve(undefined);
+				const startupChangelog = autoBotRequest ? undefined : await startupChangelogPromise;
 
 				const modelScopeNotification = buildModelScopeNotification(
 					scopedModels,
@@ -2280,13 +2433,141 @@ export async function runRootCommand(
 					// would wipe a pre-TUI line anyway.
 					notifs.push(modelScopeNotification);
 				}
-
-				if ($env.PI_TIMING) {
+				if ($env.PI_TIMING && !autoBotRequest) {
 					logger.printTimings();
 					if (logger.shouldExitAfterTimings()) {
 						process.exit(0);
 					}
 				}
+				const candidate = autoBotCandidate;
+				const fallback = autoBotFallback;
+				const abandonProtectedCoordinatorReservation = async (): Promise<void> => {
+					const coordinator = autoBotContext?.coordinator;
+					const service = session.autoBotUpdateCoordinator;
+					if (!coordinator || !service) {
+						throw new Error("AutoBot protected exit could not abandon its coordinator reservation");
+					}
+					let firstError: unknown;
+					for (let attempt = 0; attempt < 2; attempt++) {
+						try {
+							await service.abandon({ reservationId: coordinator.reservationId });
+							return;
+						} catch (error) {
+							firstError ??= error;
+						}
+					}
+					throw new AggregateError(
+						[firstError],
+						"AutoBot protected exit could not abandon its coordinator reservation",
+					);
+				};
+				const completeProtectedAutoBotExit = async (
+					interactiveMode: InteractiveMode,
+					abandonCoordinatorReservation = false,
+				): Promise<boolean> => {
+					if (!interactiveMode.isAutoBotProtectedStartupExitRequested()) return false;
+					if (abandonCoordinatorReservation) {
+						await abandonProtectedCoordinatorReservation();
+					}
+					if (!(await requestAutoBotNormalExit())) {
+						throw new Error("AutoBot could not authenticate the requested normal exit");
+					}
+					protectedAutoBotExitSignalled = true;
+					await interactiveMode.completeAutoBotProtectedStartupExit();
+					return true;
+				};
+				const activationGate = candidate
+					? async (interactiveMode: InteractiveMode): Promise<void> => {
+							if (await completeProtectedAutoBotExit(interactiveMode, true)) return;
+							const runtime = new AutoBotRuntime(session, parsedArgs, interactiveMode, getActiveProfile());
+							const updateHandle = startAutoBotUpdates(runtime.hooks);
+							const managedCandidate = updateHandle.candidate;
+							if (!managedCandidate || managedCandidate.request.nonce !== candidate.request.nonce) {
+								throw new Error("AutoBot candidate scheduler did not return the authenticated handoff");
+							}
+							if (await completeProtectedAutoBotExit(interactiveMode, true)) return;
+							const coordinator = autoBotContext?.coordinator;
+							if (!coordinator) throw new Error("AutoBot candidate has no protected coordinator reservation");
+							const service = session.autoBotUpdateCoordinator;
+							if (!service) throw new Error("AutoBot coordinator service is unavailable in the candidate");
+							let candidateCoordinatorActivationStarted = false;
+							const completeCandidateAutoBotExit = async (): Promise<boolean> =>
+								completeProtectedAutoBotExit(interactiveMode, !candidateCoordinatorActivationStarted);
+							await service.provisionalReady(coordinator);
+							if (await completeCandidateAutoBotExit()) return;
+							await managedCandidate.signalReady();
+							if (await completeCandidateAutoBotExit()) return;
+							try {
+								const activation = await Promise.race([
+									managedCandidate.waitForActivation().then(() => "activated" as const),
+									interactiveMode.waitForAutoBotProtectedStartupExit().then(() => "exit" as const),
+								]);
+								if (activation === "exit") {
+									if (await completeCandidateAutoBotExit()) return;
+									throw new Error("AutoBot candidate lost its protected exit fence");
+								}
+							} catch (error) {
+								if (await completeCandidateAutoBotExit()) return;
+								throw error;
+							}
+							if (await completeCandidateAutoBotExit()) return;
+							// The supervisor has crossed its durable activation boundary.
+							// A later local failure is indeterminate and MUST NOT reject
+							// this candidate or initiate a fallback.
+							candidateActivated = true;
+							candidateCoordinatorActivationStarted = true;
+							await service.activate(coordinator);
+							if (await completeCandidateAutoBotExit()) return;
+							await managedCandidate.acknowledgeActivation();
+							if (await completeCandidateAutoBotExit()) return;
+							modelRegistry.refreshInBackground();
+						}
+					: fallback
+						? async (interactiveMode: InteractiveMode): Promise<void> => {
+								if (await completeProtectedAutoBotExit(interactiveMode, true)) return;
+								const runtime = new AutoBotRuntime(session, parsedArgs, interactiveMode, getActiveProfile());
+								const updateHandle = startAutoBotUpdates(runtime.hooks);
+								if (!updateHandle.startup) {
+									throw new Error("AutoBot predecessor fallback did not expose its protected startup gate");
+								}
+								let fallbackActivationCompleted = false;
+								const completeFallbackAutoBotExit = async (): Promise<boolean> =>
+									completeProtectedAutoBotExit(
+										interactiveMode,
+										!fallbackActivationCompleted && !runtime.hasAutoBotFallbackCoordinatorActivationStarted(),
+									);
+								try {
+									const restoration = await Promise.race([
+										updateHandle.startup.then(() => "restored" as const),
+										interactiveMode.waitForAutoBotProtectedStartupExit().then(() => "exit" as const),
+									]);
+									if (restoration === "exit") {
+										if (await completeFallbackAutoBotExit()) return;
+										throw new Error("AutoBot predecessor fallback lost its protected exit fence");
+									}
+									fallbackActivationCompleted = true;
+								} catch (error) {
+									if (await completeFallbackAutoBotExit()) return;
+									throw error;
+								}
+								if (await completeFallbackAutoBotExit()) return;
+								modelRegistry.refreshInBackground();
+							}
+						: undefined;
+				const afterStartup = autoBotRequest
+					? undefined
+					: async (interactiveMode: InteractiveMode): Promise<void> => {
+							const runtime = new AutoBotRuntime(session, parsedArgs, interactiveMode, getActiveProfile());
+							try {
+								startAutoBotUpdates(runtime.hooks);
+							} catch (error) {
+								if (error instanceof AutoBotManagedRuntimeRequiredError) {
+									logger.warn(error.message);
+									return;
+								}
+								throw error;
+							}
+						};
 				const startupLease = takeStartupComposerLease();
 				try {
 					stopStartupWatchdog();
@@ -2301,16 +2582,18 @@ export async function runRootCommand(
 						setToolUIContext,
 						lspServers,
 						mcpManager,
-						Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
-						deps.forceSetupWizard === true,
-						showStartupSplash,
+						autoBotRequest ? true : Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+						autoBotRequest ? false : deps.forceSetupWizard === true,
+						autoBotRequest ? false : showStartupSplash,
 						eventBus,
 						subagentEventBus,
 						initialMessage,
 						initialImages,
-						parsedArgs.join,
-						startBackgroundModelDiscovery,
+						autoBotRequest ? undefined : parsedArgs.join,
+						autoBotRequest ? undefined : startBackgroundModelDiscovery,
 						startupLease,
+						activationGate,
+						afterStartup,
 					);
 				} finally {
 					startupLease?.dispose();
@@ -2338,6 +2621,9 @@ export async function runRootCommand(
 	} catch (error) {
 		stopPendingStartupComposer();
 		stopStartupWatchdog();
+		if (autoBotCandidate && !candidateActivated && !protectedAutoBotExitSignalled) {
+			await rejectAutoBotCandidate(autoBotCandidate);
+		}
 		throw error;
 	}
 }

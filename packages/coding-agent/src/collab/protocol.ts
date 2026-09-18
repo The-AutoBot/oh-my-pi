@@ -11,6 +11,8 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import type {
 	BusChannel,
 	CollabUiRequest,
+	CollabHostCapability,
+	CollabRestartCancelReason,
 	GuestFrame,
 	LiveInput,
 	ParsedCollabLink,
@@ -86,6 +88,7 @@ export type CollabFrame =
 			liveInput: LiveInput;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			capabilities?: CollabHostCapability[];
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -100,6 +103,8 @@ export type CollabFrame =
 	| { t: "event"; event: AgentSessionEvent }
 	| { t: "state"; state: CollabSessionState }
 	| { t: "live-state"; active: boolean; input: LiveInput }
+	| { t: "restart-prepare"; requestId: string; leaseMs: number }
+	| { t: "restart-cancel"; requestId: string; reason: CollabRestartCancelReason }
 	| {
 			t: "live-output-chunk";
 			leaseId: string;

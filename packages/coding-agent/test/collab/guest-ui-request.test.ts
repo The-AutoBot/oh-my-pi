@@ -525,14 +525,26 @@ describe("collab input-state hook", () => {
 			if (!pending) throw new Error("expected active host UI request");
 
 			const event = await opened;
-			expect(event).toEqual({ type: "collab_input_state", needsInput: true, inputType: "select" });
-			expect(Object.keys(event).sort()).toEqual(["inputType", "needsInput", "type"]);
+			expect(event).toEqual({
+				type: "collab_input_state",
+				hostId: host.hostId,
+				sessionId: host.sessionId,
+				needsInput: true,
+				inputType: "select",
+			});
+			expect(Object.keys(event).sort()).toEqual(["hostId", "inputType", "needsInput", "sessionId", "type"]);
 			expect(JSON.stringify(event)).not.toContain("private");
 
 			const cleared = events.next();
 			controller.abort();
 			expect(await pending).toEqual({ kind: "unavailable" });
-			expect(await cleared).toEqual({ type: "collab_input_state", needsInput: false, inputType: null });
+			expect(await cleared).toEqual({
+				type: "collab_input_state",
+				hostId: host.hostId,
+				sessionId: host.sessionId,
+				needsInput: false,
+				inputType: null,
+			});
 		} finally {
 			await host.stop("test done");
 		}
@@ -553,14 +565,26 @@ describe("collab input-state hook", () => {
 			if (!pending) throw new Error("expected active host UI request");
 
 			const event = await opened;
-			expect(event).toEqual({ type: "collab_input_state", needsInput: true, inputType: "editor" });
-			expect(Object.keys(event).sort()).toEqual(["inputType", "needsInput", "type"]);
+			expect(event).toEqual({
+				type: "collab_input_state",
+				hostId: host.hostId,
+				sessionId: host.sessionId,
+				needsInput: true,
+				inputType: "editor",
+			});
+			expect(Object.keys(event).sort()).toEqual(["hostId", "inputType", "needsInput", "sessionId", "type"]);
 			expect(JSON.stringify(event)).not.toContain("private");
 
 			const cleared = events.next();
 			controller.abort();
 			expect(await pending).toEqual({ kind: "unavailable" });
-			expect(await cleared).toEqual({ type: "collab_input_state", needsInput: false, inputType: null });
+			expect(await cleared).toEqual({
+				type: "collab_input_state",
+				hostId: host.hostId,
+				sessionId: host.sessionId,
+				needsInput: false,
+				inputType: null,
+			});
 		} finally {
 			await host.stop("test done");
 		}

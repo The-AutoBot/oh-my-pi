@@ -8,9 +8,14 @@
  * applied frame, so React change detection is reference equality all the way.
  */
 
+import {
+	COLLAB_RESTART_CAPABILITY_UPDATE,
+	COLLAB_RESTART_PREPARATION_CAPABILITY,
+} from "@oh-my-pi/pi-wire";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
+	CollabRestartBlockReason,
 	CollabUiRequest,
 	CollabUiResponseValue,
 	GuestFrame,
@@ -24,6 +29,11 @@ import type {
 } from "@oh-my-pi/pi-wire";
 import { importRoomKey } from "./codec";
 import { COLLAB_PROTO, encodeBase64Url, parseCollabLink } from "./link";
+import {
+	createEditorDraftCapabilityFingerprint,
+	createManualDraftScope,
+	type RestartDraftScope,
+} from "./restart-drafts";
 import { CollabSocket } from "./socket";
 
 export type ConnectionPhase = "connecting" | "waiting" | "live" | "reconnecting" | "ended";
@@ -84,8 +94,37 @@ export interface GuestSnapshot {
 	readOnly: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
 	uiRequest: CollabUiRequest | null;
+	/** Host-confirmed restart preparation freezes guest mutations until resolved. */
+	restartPreparing: boolean;
 	/** Capped at 50, newest last. */
 	notices: readonly Notice[];
+}
+
+export interface GuestRestartPreparation {
+	readonly requestId: string;
+	readonly sessionId: string;
+	readonly leaseMs: number;
+}
+
+export type GuestRestartPreparationResult =
+	| { readonly status: "ready" }
+	| { readonly status: "blocked"; readonly reason: CollabRestartBlockReason };
+
+export interface GuestRestartPreparationHandler {
+	prepare(request: GuestRestartPreparation): GuestRestartPreparationResult | Promise<GuestRestartPreparationResult>;
+	/**
+	 * `preserve` retains an already-written local backup after a disconnected
+	 * old host; `discard` is used for a normal abort, expiry, or manual leave.
+	 */
+	cancel(requestId: string, disposition: "discard" | "preserve"): void;
+}
+
+interface ActiveRestartPreparation {
+	readonly request: GuestRestartPreparation;
+	cancelDisposition: "discard" | "preserve" | undefined;
+	readonly deadline: number;
+	readonly handler: GuestRestartPreparationHandler;
+	timer: Timer;
 }
 
 const MAX_NOTICES = 50;
@@ -93,6 +132,8 @@ const TRANSCRIPT_TIMEOUT_MS = 10_000;
 /** Mirrors the TUI guest's WELCOME_TIMEOUT_MS: a host that never answers hello ends the join. */
 const WELCOME_TIMEOUT_MS = 30_000;
 /** Mirrors the TUI guest's SNAPSHOT_PROGRESS_TIMEOUT_MS: every snapshot chunk must make progress. */
+const MAX_RESTART_PREPARATION_LEASE_MS = 15_000;
+const RESTART_REQUEST_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/u;
 const SNAPSHOT_PROGRESS_TIMEOUT_MS = 30_000;
 const PCM_FRAME_BASE64URL_LENGTH = 854;
 const IDLE_LIVE_INPUT_LEASE: LiveInputLeaseState = {
@@ -118,15 +159,23 @@ interface PendingTranscript {
 }
 
 export class GuestClient {
+	readonly #draftScopeLink: string;
 	readonly #socket: CollabSocket;
 	readonly #name: string;
 	/** base64url write token from a full link; absent when joined via a view link. */
 	readonly #writeToken: string | undefined;
 	readonly #listeners = new Set<() => void>();
 	readonly #liveOutputListeners = new Set<(frame: LiveOutputChunkFrame) => void>();
+	#hostCapabilityUpdateSupported = false;
 	readonly #pendingTranscripts = new Map<number, PendingTranscript>();
 	#reqSeq = 0;
 	#liveRequestSeq = 0;
+	#hostRestartCapable = false;
+	#restartPreparationEnabled = false;
+	#restartDirty = false;
+	#restartHandler: GuestRestartPreparationHandler | undefined;
+	#restartPreparation: ActiveRestartPreparation | undefined;
+	#uiRequestEndedHandler: ((reqId: number) => void) | undefined;
 	#noticeSeq = 0;
 	#everConnected = false;
 	#welcomed = false;
@@ -159,6 +208,7 @@ export class GuestClient {
 	constructor(link: string, displayName: string) {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
+		this.#draftScopeLink = link;
 		this.#name = displayName;
 		this.#writeToken = parsed.writeToken ? encodeBase64Url(parsed.writeToken) : undefined;
 		this.#socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: importRoomKey(parsed.key) });
@@ -186,6 +236,8 @@ export class GuestClient {
 	close(): void {
 		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();
+		this.#clearRestartPreparation("discard");
+		this.#commit();
 		this.#socket.close();
 	}
 
@@ -212,20 +264,95 @@ export class GuestClient {
 		return this.#snapshot;
 	}
 
-	sendPrompt(text: string): void {
-		this.#socket.send({ t: "prompt", text });
+	/** Derives a non-reversible local draft scope from this exact manual capability and session. */
+	manualDraftScope(sessionId: string): Promise<RestartDraftScope | null> {
+		return createManualDraftScope(this.#draftScopeLink, sessionId);
 	}
 
-	sendUiResponse(reqId: number, value?: CollabUiResponseValue): void {
+	/** Hashes this exact room capability in memory for editor request-generation isolation. */
+	editorDraftCapabilityFingerprint(): Promise<string | null> {
+		return createEditorDraftCapabilityFingerprint(this.#draftScopeLink);
+	}
+
+	/** Called only for a definitive host `ui-request-end`, never for a re-hello welcome reset. */
+	setUiRequestEndedHandler(handler: ((reqId: number) => void) | undefined): () => void {
+		this.#uiRequestEndedHandler = handler;
+		return () => {
+			if (this.#uiRequestEndedHandler === handler) this.#uiRequestEndedHandler = undefined;
+		};
+	}
+
+	/**
+	 * Registers the local-only draft barrier. A capability is never advertised
+	 * as ready until this handler has durably preserved every current draft.
+	 */
+	setRestartPreparationHandler(handler: GuestRestartPreparationHandler | undefined): () => void {
+		if (this.#restartHandler && this.#restartHandler !== handler) {
+			this.#clearRestartPreparation("discard");
+			this.#commit();
+		}
+		this.#restartHandler = handler;
+		return () => {
+			if (this.#restartHandler !== handler) return;
+			this.#clearRestartPreparation("discard");
+			this.#restartHandler = undefined;
+			this.#commit();
+		};
+	}
+
+	/**
+	 * Managed discovery is the only authority allowed to enable update ACKs.
+	 * Manual capability links retain local drafts but stay restart-incompatible.
+	 */
+	setRestartPreparationAvailability(enabled: boolean): void {
+		if (this.#restartPreparationEnabled === enabled) return;
+		this.#restartPreparationEnabled = enabled;
+		if (!enabled) {
+			this.#clearRestartPreparation("discard");
+			this.#commit();
+		}
+		if (
+			this.#welcomed &&
+			this.#hostCapabilityUpdateSupported &&
+			(this.#phase === "live" || this.#phase === "waiting")
+		) {
+			this.#socket.send({
+				t: "capabilities-update",
+				capabilities: enabled ? [COLLAB_RESTART_PREPARATION_CAPABILITY] : [],
+			});
+		}
+	}
+
+	/** Inform a capable host that a local draft changed during its idle admission check. */
+	setRestartDirty(dirty: boolean): void {
+		const mustInvalidatePreparedAck = dirty && this.#restartPreparation !== undefined;
+		if (this.#restartDirty === dirty && !mustInvalidatePreparedAck) return;
+		this.#restartDirty = dirty;
+		if (this.#restartPreparationEnabled && this.#hostRestartCapable && this.#welcomed && this.#phase !== "ended") {
+			this.#socket.send({ t: "restart-dirty", dirty });
+		}
+	}
+
+	sendPrompt(text: string): boolean {
+		if (this.#restartPreparation) return false;
+		this.#socket.send({ t: "prompt", text });
+		return true;
+	}
+
+	sendUiResponse(reqId: number, value?: CollabUiResponseValue): boolean {
+		if (this.#restartPreparation) return false;
 		this.#socket.send({ t: "ui-response", reqId, value });
 		if (this.#uiRequest?.reqId === reqId) {
 			this.#showNextUiRequest();
 			this.#commit();
 		}
+		return true;
 	}
 
-	sendAbort(): void {
+	sendAbort(): boolean {
+		if (this.#restartPreparation) return false;
 		this.#socket.send({ t: "abort" });
+		return true;
 	}
 
 	/**
@@ -234,6 +361,7 @@ export class GuestClient {
 	 */
 	claimLiveInput(): string | null {
 		if (
+			this.#restartPreparation ||
 			this.#readOnly ||
 			this.#phase !== "live" ||
 			this.#liveInputLease.status === "claiming" ||
@@ -280,6 +408,7 @@ export class GuestClient {
 	async startLiveInput(leaseId: string): Promise<boolean> {
 		const lease = this.#liveInputLease;
 		if (
+			this.#restartPreparation ||
 			this.#readOnly ||
 			this.#phase !== "live" ||
 			lease.status !== "granted" ||
@@ -312,6 +441,7 @@ export class GuestClient {
 	sendLiveInputChunk(leaseId: string, seq: number, data: string): Promise<boolean> {
 		const lease = this.#liveInputLease;
 		if (
+			this.#restartPreparation ||
 			this.#readOnly ||
 			this.#phase !== "live" ||
 			lease.status !== "granted" ||
@@ -330,14 +460,17 @@ export class GuestClient {
 
 	stopLiveInput(leaseId: string, reason: LiveInputStopReason): Promise<boolean> {
 		const lease = this.#liveInputLease;
-		if (lease.status !== "granted" || lease.leaseId !== leaseId) return Promise.resolve(false);
+		if (this.#restartPreparation || lease.status !== "granted" || lease.leaseId !== leaseId)
+			return Promise.resolve(false);
 		this.#liveInputLease = IDLE_LIVE_INPUT_LEASE;
 		this.#commit();
 		return this.#socket.sendRealtime({ t: "live-input-stop", leaseId, reason });
 	}
 
-	sendAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text?: string): void {
+	sendAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text?: string): boolean {
+		if (this.#restartPreparation) return false;
 		this.#socket.send({ t: "agent-cmd", cmd, agentId, text });
+		return true;
 	}
 
 	/**
@@ -363,14 +496,30 @@ export class GuestClient {
 	}
 
 	#handleOpen(): void {
-		this.#socket.send({ t: "hello", proto: COLLAB_PROTO, name: this.#name, writeToken: this.#writeToken });
+		this.#sendHello();
 		this.#phase = this.#everConnected ? "reconnecting" : "waiting";
 		this.#everConnected = true;
 		this.#commit();
 	}
 
+	#sendHello(): void {
+		const hello = {
+			t: "hello" as const,
+			proto: COLLAB_PROTO,
+			name: this.#name,
+			writeToken: this.#writeToken,
+		};
+		if (this.#restartPreparationEnabled) {
+			this.#socket.send({ ...hello, capabilities: [COLLAB_RESTART_PREPARATION_CAPABILITY] });
+		} else {
+			this.#socket.send(hello);
+		}
+	}
+
 	#handleClose(reason: string, willReconnect: boolean): void {
 		this.#clearSnapshotProgressTimer();
+		this.#hostRestartCapable = false;
+		this.#hostCapabilityUpdateSupported = false;
 		if (this.#phase === "ended") return;
 		if (willReconnect) {
 			this.#phase = "reconnecting";
@@ -393,6 +542,9 @@ export class GuestClient {
 		if (this.#phase === "ended") return;
 		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();
+		// A terminal old-host close may be the successful update cutover. Keep
+		// the session-scoped local backup until the bounded recovery TTL expires.
+		this.#clearRestartPreparation("preserve");
 		this.#phase = "ended";
 		this.#endedReason = reason;
 		for (const [, pending] of this.#pendingTranscripts) {
@@ -400,7 +552,6 @@ export class GuestClient {
 			pending.resolve(null);
 		}
 		this.#pendingTranscripts.clear();
-		this.#clearUiRequests();
 		this.#commit();
 		this.#socket.close();
 	}
@@ -434,6 +585,7 @@ export class GuestClient {
 				try {
 					listener(frame);
 				} catch {
+
 					// One playback consumer must not break ordered socket delivery.
 				}
 			}
@@ -451,12 +603,130 @@ export class GuestClient {
 			this.#commit();
 		}
 	}
+	#handleRestartPrepare(frame: Extract<HostFrame, { t: "restart-prepare" }>): void {
+		if (
+			!this.#restartPreparationEnabled ||
+			!this.#hostRestartCapable ||
+			!RESTART_REQUEST_ID_PATTERN.test(frame.requestId) ||
+			!Number.isSafeInteger(frame.leaseMs) ||
+			frame.leaseMs <= 0 ||
+			frame.leaseMs > MAX_RESTART_PREPARATION_LEASE_MS
+		) {
+			return;
+		}
+		const header = this.#header;
+		if (!header || this.#phase !== "live") {
+			this.#sendRestartReady(frame.requestId, "blocked", "unavailable");
+			return;
+		}
+		if (this.#restartPreparation) {
+			if (this.#restartPreparation.request.requestId !== frame.requestId) {
+				this.#sendRestartReady(frame.requestId, "blocked", "reservation-conflict");
+			}
+			return;
+		}
+		if (
+			this.#liveActive ||
+			this.#liveInput !== "none" ||
+			this.#liveInputLease.status === "claiming" ||
+			this.#liveInputLease.status === "granted"
+		) {
+			this.#sendRestartReady(frame.requestId, "blocked", "microphone-active");
+			return;
+		}
+		const handler = this.#restartHandler;
+		if (!handler) {
+			this.#sendRestartReady(frame.requestId, "blocked", "unavailable");
+			return;
+		}
+		const request: GuestRestartPreparation = {
+			requestId: frame.requestId,
+			sessionId: header.id,
+			leaseMs: frame.leaseMs,
+		};
+		const preparation: ActiveRestartPreparation = {
+			request,
+			handler,
+			deadline: performance.now() + frame.leaseMs,
+			timer: undefined as unknown as Timer,
+			cancelDisposition: undefined,
+		};
+		this.#restartPreparation = preparation;
+		preparation.timer = setTimeout(() => this.#expireRestartPreparation(preparation), frame.leaseMs);
+		void this.#finishRestartPreparation(preparation);
+	}
+
+	#handleRestartCancel(frame: Extract<HostFrame, { t: "restart-cancel" }>): void {
+		if (!RESTART_REQUEST_ID_PATTERN.test(frame.requestId)) return;
+		const preparation = this.#restartPreparation;
+		if (!preparation || preparation.request.requestId !== frame.requestId) return;
+		this.#clearRestartPreparation("discard");
+		this.#commit();
+	}
+
+	async #finishRestartPreparation(preparation: ActiveRestartPreparation): Promise<void> {
+		let result: GuestRestartPreparationResult;
+		try {
+			result = await preparation.handler.prepare(preparation.request);
+		} catch {
+			result = { status: "blocked", reason: "draft-storage-unavailable" };
+		}
+		if (this.#restartPreparation !== preparation) {
+			preparation.handler.cancel(preparation.request.requestId, preparation.cancelDisposition ?? "discard");
+			return;
+		}
+		if (performance.now() >= preparation.deadline) {
+			this.#expireRestartPreparation(preparation);
+			return;
+		}
+		if (result.status === "ready") {
+			this.#sendRestartReady(preparation.request.requestId, "ready");
+			return;
+		}
+		this.#clearRestartPreparation("discard");
+		this.#sendRestartReady(preparation.request.requestId, "blocked", result.reason);
+		this.#commit();
+	}
+
+	#expireRestartPreparation(preparation: ActiveRestartPreparation): void {
+		if (this.#restartPreparation !== preparation) return;
+		this.#clearRestartPreparation("discard");
+		this.#sendRestartReady(preparation.request.requestId, "blocked", "expired");
+		this.#commit();
+	}
+
+	#clearRestartPreparation(disposition: "discard" | "preserve"): void {
+		const preparation = this.#restartPreparation;
+		if (!preparation) return;
+		clearTimeout(preparation.timer);
+		this.#restartPreparation = undefined;
+		preparation.cancelDisposition = disposition;
+		try {
+			preparation.handler.cancel(preparation.request.requestId, disposition);
+		} catch {
+			// Draft cleanup is best-effort only; a failure must not retain a UI freeze.
+		}
+	}
+
+	#sendRestartReady(
+		requestId: string,
+		status: "ready" | "blocked",
+		reason?: CollabRestartBlockReason,
+	): void {
+		if (!this.#restartPreparationEnabled || !this.#hostRestartCapable || this.#phase === "ended") return;
+		if (status === "ready" || reason === undefined) {
+			this.#socket.send({ t: "restart-ready", requestId, status });
+		} else {
+			this.#socket.send({ t: "restart-ready", requestId, status, reason });
+		}
+	}
 
 	#applyFrame(frame: HostFrame): void {
 		switch (frame.t) {
 			case "welcome":
 				// Reset accumulator: a fresh welcome arriving mid-load (reconnect)
 				// supersedes any partially-streamed snapshot from the prior session.
+				this.#clearRestartPreparation("discard");
 				this.#header = frame.header;
 				this.#entries = [];
 				this.#state = frame.state;
@@ -474,6 +744,10 @@ export class GuestClient {
 				this.#canceledLiveClaims.clear();
 				this.#clearUiRequests();
 				this.#welcomed = true;
+				this.#hostRestartCapable =
+					frame.capabilities?.includes(COLLAB_RESTART_PREPARATION_CAPABILITY) === true;
+				this.#hostCapabilityUpdateSupported =
+					frame.capabilities?.includes(COLLAB_RESTART_CAPABILITY_UPDATE) === true;
 				this.#clearWelcomeTimer();
 				if (frame.entryCount === 0) {
 					this.#clearSnapshotProgressTimer();
@@ -482,6 +756,15 @@ export class GuestClient {
 					this.#armSnapshotProgressTimer();
 				}
 				this.#endedReason = null;
+				if (this.#restartPreparationEnabled && this.#hostRestartCapable && this.#restartDirty) {
+					this.#socket.send({ t: "restart-dirty", dirty: true });
+				}
+				break;
+			case "restart-prepare":
+				this.#handleRestartPrepare(frame);
+				break;
+			case "restart-cancel":
+				this.#handleRestartCancel(frame);
 				break;
 			case "snapshot-chunk": {
 				// Stream transcript fragments into the live snapshot. The host
@@ -577,6 +860,7 @@ export class GuestClient {
 				else this.#uiRequest = frame.request;
 				break;
 			case "ui-request-end":
+				this.#uiRequestEndedHandler?.(frame.reqId);
 				if (this.#uiRequest?.reqId === frame.reqId) this.#showNextUiRequest();
 				else this.#uiRequestQueue = this.#uiRequestQueue.filter(request => request.reqId !== frame.reqId);
 				break;
@@ -730,6 +1014,7 @@ export class GuestClient {
 			working: this.#working,
 			liveActive: this.#liveActive,
 			liveInput: this.#liveInput,
+			restartPreparing: this.#restartPreparation !== undefined,
 			liveInputLease: this.#liveInputLease,
 			readOnly: this.#readOnly,
 			uiRequest: this.#uiRequest,

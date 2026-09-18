@@ -420,7 +420,7 @@ describe("interactive collaboration startup", () => {
 		spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		await mode.init({ suppressWelcomeIntro: true, autoStartCollab: true });
 		await mode.collabController.idle();
-		await executeBuiltinSlashCommand("/collab stop", { ctx: mode });
+		await mode.collabController.stop("preparing guest mode", "session-switch");
 		const remote = new CollabHost(makeControllerContext().ctx);
 		remoteHosts.push(remote);
 		await remote.start(RELAY_URL);
@@ -836,6 +836,77 @@ describe("CollabController", () => {
 		});
 		socket.send({ t: "ui-response", reqId: await replayed.promise, value: "Yes" });
 		expect(await pending).toEqual({ kind: "answered", value: "Yes" });
+	});
+
+	it("fences protected startup host creation and resumes auto-start only after authorization", async () => {
+		const { ctx } = makeControllerContext({ autoStart: "control" });
+		controller = new CollabController(ctx);
+		controller.deferHostCreationUntilStartupComplete();
+
+		await expect(controller.start({ access: "control" })).rejects.toMatchObject({ code: "collab-startup-fenced" });
+		await expect(controller.ensure({ access: "control" })).rejects.toMatchObject({ code: "collab-startup-fenced" });
+		controller.autoStart();
+		await controller.idle();
+
+		expect(ctx.collabHost).toBeUndefined();
+		expect(publishSpy).toHaveBeenCalledTimes(0);
+
+		controller.startupComplete();
+		await settled(publishSpy, 1);
+		expect(ctx.collabHost?.access).toBe("control");
+	});
+
+	it("keeps an explicit protected-startup stop authoritative until a manual start", async () => {
+		const { ctx } = makeControllerContext({ autoStart: "control" });
+		controller = new CollabController(ctx);
+		controller.deferHostCreationUntilStartupComplete();
+		controller.autoStart();
+
+		await controller.stop("explicit protected-startup stop");
+		controller.startupComplete();
+		await controller.idle();
+
+		expect(ctx.collabHost).toBeUndefined();
+		expect(publishSpy).toHaveBeenCalledTimes(0);
+		await expect(controller.ensure({ access: "control" })).rejects.toMatchObject({ code: "collab-stopped" });
+
+		const manuallyStarted = await controller.start({ access: "control" });
+		await settled(publishSpy, 1);
+		expect(manuallyStarted.access).toBe("control");
+	});
+
+	it("resets a no-host user stop on a later session transition", async () => {
+		const { ctx, state } = makeControllerContext({ autoStart: "control" });
+		controller = new CollabController(ctx);
+
+		await controller.stop("no-host user stop");
+		await expect(controller.ensure({ access: "control" })).rejects.toMatchObject({ code: "collab-stopped" });
+		expect(publishSpy).toHaveBeenCalledTimes(0);
+
+		switchSession(state, `sess-next-${crypto.randomUUID()}`);
+		await settled(publishSpy, 1);
+		expect(ctx.collabHost?.sessionId).toBe(state.sessionId);
+	});
+
+	it("keeps a user stop authoritative against an in-flight extension ensure", async () => {
+		const { ctx, state } = makeControllerContext({ autoStart: "control" });
+		controller = new CollabController(ctx);
+		const gate = Promise.withResolvers<void>();
+		const waiting = Promise.withResolvers<void>();
+		state.transition = gate.promise;
+		state.transitionWaited = waiting.resolve;
+
+		const ensuring = controller.ensure({ access: "control" });
+		await waiting.promise;
+		await controller.stop("user stop while ensure waited");
+		state.transition = undefined;
+		gate.resolve();
+
+		await expect(ensuring).rejects.toBeInstanceOf(CollabHostStoppedError);
+		await controller.idle();
+		expect(ctx.collabHost).toBeUndefined();
+		expect(publishSpy).toHaveBeenCalledTimes(0);
+		await expect(controller.ensure({ access: "control" })).rejects.toMatchObject({ code: "collab-stopped" });
 	});
 
 	it("auto-start off leaves the session unhosted and reports nothing", async () => {

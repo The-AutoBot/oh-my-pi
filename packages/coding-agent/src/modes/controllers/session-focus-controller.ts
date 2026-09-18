@@ -61,6 +61,11 @@ export class SessionFocusController {
 	get target(): AgentSession | undefined {
 		return this.#attachedSession;
 	}
+
+	/** Whether a focus attach or detach is still rebuilding the visible session. */
+	get isTransitioning(): boolean {
+		return this.#focusAttachment !== undefined;
+	}
 	/** Focus the main view on an agent's live session. Throws an Error with a user-displayable message. */
 	async focusAgent(id: string): Promise<void> {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");

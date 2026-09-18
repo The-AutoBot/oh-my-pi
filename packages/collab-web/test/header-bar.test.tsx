@@ -9,11 +9,13 @@ function snapshot({
 	readOnly = false,
 	liveActive = false,
 	liveInput = "none",
+	restartPreparing = false,
 }: {
 	phase?: ConnectionPhase;
 	readOnly?: boolean;
 	liveActive?: boolean;
 	liveInput?: GuestSnapshot["liveInput"];
+	restartPreparing?: boolean;
 } = {}): GuestSnapshot {
 	return {
 		phase,
@@ -30,6 +32,7 @@ function snapshot({
 		working: false,
 		liveActive,
 		liveInput,
+		restartPreparing,
 		liveInputLease: { status: "idle", requestId: null, leaseId: null, message: null, started: false },
 		readOnly,
 		uiRequest: null,
@@ -139,6 +142,13 @@ describe("HeaderBar phone microphone control", () => {
 
 	it("disables the control until the connection is live", () => {
 		expect(liveControl(renderHeader(snapshot({ phase: "reconnecting" })))).toMatchObject({
+			label: "Use this device microphone",
+			disabled: true,
+		});
+	});
+
+	it("disables device microphone mutation while restart preparation is active", () => {
+		expect(liveControl(renderHeader(snapshot({ restartPreparing: true })))).toMatchObject({
 			label: "Use this device microphone",
 			disabled: true,
 		});

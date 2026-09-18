@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { managedLeaveHref, managedReplacementHref, managedRoomRoute } from "../src/lib/managed-room";
+import {
+	managedLeaveHref,
+	managedReplacementHref,
+	managedRoomReplacement,
+	managedRoomRoute,
+} from "../src/lib/managed-room";
 
 const route = { pcId: "local", sessionId: "session-a" };
 const current = new URL(
@@ -64,5 +69,64 @@ describe("managed room discovery", () => {
 				route,
 			),
 		).toBeNull();
+	});
+
+	it("accepts canonical versioned bundles and reloads when only the bundle path changes", () => {
+		const currentBundle = new URL(
+			"https://portal.example.test/live/old_bundle/?pcId=local&sessionId=session-a#oldroom0123.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		);
+		const sameCapabilityNewBundle =
+			"https://portal.example.test/live/new_bundle/#oldroom0123.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+		expect(managedRoomReplacement(payload(sameCapabilityNewBundle), currentBundle, route)).toEqual({
+			stage: "ready",
+			code: "replacement-ready",
+			href: "https://portal.example.test/live/new_bundle/?pcId=local&sessionId=session-a#oldroom0123.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		});
+	});
+
+	it("classifies unavailable responses without returning room links", () => {
+		expect(managedRoomReplacement({}, current, route)).toEqual({
+			stage: "payload",
+			code: "invalid-envelope",
+		});
+		expect(
+			managedRoomReplacement(
+				{ pcs: [{ pcId: "local" }], sessions: [] },
+				current,
+				route,
+			),
+		).toEqual({ stage: "session", code: "session-missing" });
+		expect(
+			managedRoomReplacement(
+				{ pcs: [{ pcId: "local" }], sessions: [{ pcId: "local", sessionId: "session-a" }] },
+				current,
+				route,
+			),
+		).toEqual({ stage: "room", code: "missing" });
+
+		expect(
+			managedRoomReplacement(
+				{
+					pcs: [{ pcId: "local" }],
+					sessions: [
+						{
+							pcId: "local",
+							sessionId: "session-a",
+							room: { webLink: replacement, expiresAt: "not-a-date" },
+						},
+					],
+				},
+				current,
+				route,
+			),
+		).toEqual({ stage: "payload", code: "invalid-room" });
+
+		const rejected = managedRoomReplacement(
+			payload("https://attacker.example.test/live/#capability-do-not-log"),
+			current,
+			route,
+		);
+		expect(rejected).toEqual({ stage: "payload", code: "invalid-replacement" });
+		expect(JSON.stringify(rejected)).not.toContain("capability-do-not-log");
 	});
 });

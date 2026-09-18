@@ -1,7 +1,7 @@
 export * from "@oh-my-pi/pi-catalog/effort";
 export * from "@oh-my-pi/pi-catalog/types";
 
-import type { Type } from "@oh-my-pi/omptype";
+import type { AnyType } from "@oh-my-pi/omptype";
 import type {
 	DeleteArgs,
 	DeleteResult,
@@ -1320,10 +1320,10 @@ export type TJsonSchema = Record<string, unknown>;
  * Canonical authoring uses ArkType. Extension compat may supply a JSON Schema
  * object (including TypeBox static schema objects).
  */
-export type TSchema = Type | TJsonSchema;
+export type TSchema = AnyType | TJsonSchema;
 
 /** Resolve parameter types for tool execution / handlers. */
-export type Static<S> = S extends Type ? S["infer"] : S extends { static: infer T } ? T : unknown;
+export type Static<S> = S extends AnyType ? S["infer"] : S extends { static: infer T } ? T : unknown;
 
 export interface ToolCallExample<TArgs = Record<string, unknown>> {
 	caption?: string;

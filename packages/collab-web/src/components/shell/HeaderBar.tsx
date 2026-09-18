@@ -24,7 +24,7 @@ function presentPhoneMic(snapshot: GuestSnapshot, phoneMic: PhoneMicSnapshot): P
 			active: false,
 		};
 	}
-	const connectionDisabled = snapshot.phase !== "live";
+	const connectionDisabled = snapshot.phase !== "live" || snapshot.restartPreparing;
 	const otherInputActive =
 		snapshot.liveInput !== "none" &&
 		phoneMic.phase !== "active" &&

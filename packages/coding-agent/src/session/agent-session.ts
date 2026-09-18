@@ -99,6 +99,7 @@ import {
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import { type AdvisorConfig, loadAdvisorTranscriptCosts } from "../advisor";
+import type { AutoBotCoordinatorService } from "../autobot-runtime";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -746,6 +747,7 @@ export class AgentSession {
 	#codexResetCoordinator: CodexAutoRedeemCoordinator;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
+	#autoBotUpdateCoordinator: AutoBotCoordinatorService | undefined;
 	#getEvalPreludes: (() => readonly EvalPreludeDefinition[]) | undefined;
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
 	/**
@@ -2353,6 +2355,42 @@ export class AgentSession {
 	 */
 	hasPendingAsyncWork(): boolean {
 		return this.#hasPendingAsyncWake();
+	}
+
+	/**
+	 * Strict handoff-admission view: true whenever this session owns work that
+	 * could mutate the transcript, wake a turn, or leave user-visible work
+	 * behind. Unlike `hasPendingAsyncWork`, watched and suppressed deliveries
+	 * are deliberately included because a process replacement cannot preserve
+	 * their in-memory completion state.
+	 */
+	hasPendingAutoBotUpdateWork(): boolean {
+		const manager = this.#asyncJobManager;
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		const deliveryState = manager?.getDeliveryStateIncludingSuppressed(ownerFilter);
+
+		return (
+			this.isStreaming ||
+			this.hasAdmittedSubmission ||
+			this.isSessionTransitioning ||
+			this.isBashRunning ||
+			this.isEvalRunning ||
+			this.hasPendingBashMessages ||
+			this.hasPendingPythonMessages ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
+			this.isRetrying ||
+			this.agent.hasQueuedMessages() ||
+			this.#irc.hasPending() ||
+			this.#pendingNextTurnMessages.length > 0 ||
+			this.#postPromptTasks.size > 0 ||
+			this.#usagePreflightAbortControllers.size > 0 ||
+			this.#queuedMessageDrainScheduled ||
+			this.#activeAgentContinue !== undefined ||
+			(manager?.getRunningJobs(ownerFilter).length ?? 0) > 0 ||
+			(deliveryState?.queued ?? 0) > 0 ||
+			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE)
+		);
 	}
 
 	/** True while a submission has been admitted but has not yet started a turn, queued, or bailed. */
@@ -7069,6 +7107,7 @@ export class AgentSession {
 			ensureCollab: async () => {
 				throw new CollabNonInteractiveError();
 			},
+			setAutoBotUpdateCoordinator: service => this.setAutoBotUpdateCoordinator(service),
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
 			waitForIdle: () => this.waitForIdle(),
@@ -11411,5 +11450,18 @@ export class AgentSession {
 	 */
 	get extensionRunner(): ExtensionRunner | undefined {
 		return this.#extensionRunner;
+	}
+
+	/**
+	 * Coordinator-owned service for a managed AutoBot handoff. It is scoped to
+	 * this exact session and cleared by the coordinator extension on shutdown.
+	 */
+	setAutoBotUpdateCoordinator(service: AutoBotCoordinatorService | undefined): void {
+		if (this.#isDisposed) return;
+		this.#autoBotUpdateCoordinator = service;
+	}
+
+	get autoBotUpdateCoordinator(): AutoBotCoordinatorService | undefined {
+		return this.#autoBotUpdateCoordinator;
 	}
 }

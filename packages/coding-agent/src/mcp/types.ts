@@ -334,6 +334,12 @@ export interface MCPTransport {
 	/** Whether the transport is connected */
 	readonly connected: boolean;
 
+	/**
+	 * True only when this otherwise-connected transport holds a server session
+	 * whose loss cannot be assumed harmless. Omitted for stateless transports.
+	 */
+	readonly hasStatefulSession?: boolean;
+
 	/** Event handlers */
 	onClose?: () => void;
 	onError?: (error: Error) => void;

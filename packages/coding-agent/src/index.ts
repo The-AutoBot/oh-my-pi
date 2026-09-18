@@ -8,6 +8,7 @@ export { z } from "@oh-my-pi/omptype/zod";
 export { Container, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 // Logging
 export { getAgentDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+export { getAutoBotCoordinatorStartupRegistration, getVerifiedAutoBotCoordinatorPaths } from "./autobot-runtime";
 export * from "./config/keybindings";
 export * from "./config/model-registry";
 // Prompt templates

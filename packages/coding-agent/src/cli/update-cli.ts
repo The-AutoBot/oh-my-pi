@@ -15,6 +15,7 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
 import { settings } from "../config/settings";
+import { isAutoBotMuslLinux, type MuslDetectionOptions } from "../autobot-update/platform";
 import { theme } from "../modes/theme/theme";
 import {
 	isTimeoutError,
@@ -1096,36 +1097,9 @@ async function pruneBunCacheAfterGlobalInstall(): Promise<BunInstallCachePruneRe
 	return await pruneBunInstallCache(cacheDir, packageNames.size === 0 ? undefined : packageNames);
 }
 
-/**
- * Detect a musl-libc Linux host (Alpine, Void-musl) so self-update replaces a
- * musl binary with the musl release asset instead of the glibc build, which
- * would fail to start on the next run. The loader file alone is not sufficient:
- * glibc hosts may have musl installed for cross-compilation.
- */
-interface MuslDetectionOptions {
-	platform?: NodeJS.Platform;
-	alpineRelease?: boolean;
-	lddOutput?: string;
-}
-
-function detectLddOutput(): string | undefined {
-	try {
-		const result = Bun.spawnSync(["ldd", "--version"], { stdout: "pipe", stderr: "pipe" });
-		return `${result.stdout.toString("utf-8")}\n${result.stderr.toString("utf-8")}`;
-	} catch {
-		return undefined;
-	}
-}
-
-function isMuslLinux(options: MuslDetectionOptions = {}): boolean {
-	if ((options.platform ?? process.platform) !== "linux") return false;
-	if (options.alpineRelease ?? fs.existsSync("/etc/alpine-release")) return true;
-	return /\bmusl\b/i.test(options.lddOutput ?? detectLddOutput() ?? "");
-}
-
-/** Test seam for libc detection. */
+/** Test seam for libc detection shared with immutable AutoBot runtime selection. */
 export function isMuslLinuxForTest(options: Required<MuslDetectionOptions>): boolean {
-	return isMuslLinux(options);
+	return isAutoBotMuslLinux(options);
 }
 
 /**
@@ -1138,7 +1112,7 @@ function getBinaryName(): string {
 	let os: string;
 	switch (platform) {
 		case "linux":
-			os = isMuslLinux() ? "linux-musl" : "linux";
+			os = isAutoBotMuslLinux() ? "linux-musl" : "linux";
 			break;
 		case "darwin":
 			os = "darwin";

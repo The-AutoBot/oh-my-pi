@@ -3,7 +3,11 @@
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { COMPILED_EXTERNAL_DEPENDENCIES, compileCodingAgent } from "../packages/coding-agent/scripts/compile-binary";
+import {
+	COMPILED_EXTERNAL_DEPENDENCIES,
+	compileCodingAgent,
+	parseAutoBotBuildIdentity,
+} from "../packages/coding-agent/scripts/compile-binary";
 
 interface BinaryTarget {
 	id: string;
@@ -26,6 +30,7 @@ if (
 	throw new Error("@huggingface/transformers package manifest has no string version");
 }
 const transformersVersion = transformersManifest.version;
+const autoBotBuildIdentity = parseAutoBotBuildIdentity(Bun.env.OMP_AUTOBOT_BUILD_IDENTITY);
 // Worker threads re-enter the binary's single CLI host entry.
 const isDryRun = process.argv.includes("--dry-run");
 const targets: BinaryTarget[] = [
@@ -151,6 +156,7 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 		entrypoint,
 		outfile: path.join(repoRoot, target.outfile),
 		transformersVersion,
+		autoBotBuildIdentity,
 		target: target.target,
 		minifyIdentifiers: true,
 		skipBuiltinCodesign: shouldAdhocSignDarwinBinary(target),

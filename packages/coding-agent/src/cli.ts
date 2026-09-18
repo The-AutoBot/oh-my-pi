@@ -461,8 +461,26 @@ async function runTinyWorker(): Promise<void> {
 	await startTinyWorkerFromEnvironment();
 }
 
+/**
+ * Release staging probes this before profile/session/persistence initialization.
+ * Only binaries compiled with a verified AutoBot release identity may answer.
+ */
+async function runAutoBotBuildIdentityProbe(argv: readonly string[]): Promise<boolean> {
+	if (argv.length !== 1 || argv[0] !== "--autobot-build-identity") return false;
+	const { getAutoBotBuildIdentity } = await import("./autobot-update/build-metadata");
+	const identity = getAutoBotBuildIdentity();
+	if (!identity) {
+		process.stderr.write("AutoBot build identity is unavailable.\n");
+		process.exitCode = 1;
+		return true;
+	}
+	process.stdout.write(`${JSON.stringify(identity)}\n`);
+	return true;
+}
+
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	if (await runAutoBotBuildIdentityProbe(argv)) return;
 	let resolvedArgv = argv;
 	try {
 		const extracted = extractProfileFlags(resolvedArgv);

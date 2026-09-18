@@ -98,6 +98,7 @@ interface KernelSessionRegistry<
 	executeOnSession(code: string, cwd: string, options: TOptions): Promise<R>;
 	peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined;
 	getPresentSession(cwd: string, options: TOptions): TSession | undefined;
+	hasSessionForOwner(ownerId: string): boolean;
 }
 
 export function normalizeKernelSessionCwd(cwd: string): string {
@@ -410,6 +411,13 @@ export function createKernelSessionRegistry<
 		}
 	}
 
+	function hasSessionForOwner(ownerId: string): boolean {
+		return (
+			Array.from(sessions.values()).some(session => session.ownerIds.has(ownerId) && session.kernel.isAlive()) ||
+			Array.from(startingSessions.values()).some(session => session.ownerIds.has(ownerId))
+		);
+	}
+
 	function peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined {
 		const sessionId = options.sessionId ?? `session:${cwd}`;
 		const sessionKey = resolveOwnerScopedSessionKey({
@@ -491,5 +499,5 @@ export function createKernelSessionRegistry<
 		return result;
 	}
 
-	return { disposeAll, disposeByOwner, executeOnSession, peekLiveKernel, getPresentSession };
+	return { disposeAll, disposeByOwner, executeOnSession, peekLiveKernel, getPresentSession, hasSessionForOwner };
 }

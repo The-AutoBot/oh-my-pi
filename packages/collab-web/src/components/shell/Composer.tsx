@@ -1,17 +1,22 @@
 import { SendHorizontal, Square } from "lucide-react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
+import type { RestartDraftRegistry, RestartDraftSurface } from "../../lib/restart-drafts";
 
 export interface ComposerProps {
 	client: GuestClient;
 	snapshot: GuestSnapshot;
+	drafts: RestartDraftRegistry;
+	draftsReady: boolean;
+	draftRecoveryVersion: number;
+	editorDraftCapabilityFingerprint: string | null;
 }
 
-/** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
 const LINE_PX = 20;
 const PAD_Y = 16;
 const MAX_ROWS = 8;
+const COMPOSER_SURFACE: RestartDraftSurface = { kind: "composer" };
 
 function autosize(el: HTMLTextAreaElement | null): void {
 	if (!el) return;
@@ -21,22 +26,11 @@ function autosize(el: HTMLTextAreaElement | null): void {
 	el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
 }
 
-/**
- * Decides whether an Enter keydown should commit the composer. Returns `false` while an IME
- * composition is active so the keystroke confirms the composition instead of submitting.
- * `nativeEvent.isComposing` covers most browsers; `composing` bridges WebKit, which fires the
- * confirming Enter keydown *after* `compositionend`.
- */
 export function shouldSubmitOnEnter(e: KeyboardEvent<HTMLTextAreaElement>, composing: boolean): boolean {
 	if (e.key !== "Enter" || e.shiftKey) return false;
 	return !(e.nativeEvent.isComposing || composing);
 }
 
-/**
- * Tracks IME composition state via a ref the keydown handler reads synchronously. The
- * `compositionend` reset is deferred a tick because WebKit dispatches the confirming Enter
- * keydown after `compositionend`, when `nativeEvent.isComposing` is already `false`.
- */
 function useCompositionGuard(): {
 	composingRef: RefObject<boolean>;
 	onCompositionStart(): void;
@@ -55,29 +49,51 @@ function useCompositionGuard(): {
 }
 
 interface AskEditorProps {
+	reqId: number;
+	capabilityFingerprint: string;
 	prefill: string | undefined;
-	onSubmit(value: string): void;
+	drafts: RestartDraftRegistry;
+	draftsReady: boolean;
+	draftRecoveryVersion: number;
+	live: boolean;
+	restartPreparing: boolean;
+	onSubmit(value: string): boolean;
 }
 
-/**
- * Editor ask input. Rendered with `key={reqId}` so a new request remounts it with a fresh
- * draft seeded from `prefill`, while re-sends of the same request never clobber a half-typed
- * draft. Submits verbatim — whitespace-only responses are intentional.
- */
-function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
+/** A prepared update fences submissions, not typing; accepted edits are locally durable first. */
+function AskEditor({
+	reqId,
+	capabilityFingerprint,
+	prefill,
+	drafts,
+	draftsReady,
+	draftRecoveryVersion,
+	live,
+	restartPreparing,
+	onSubmit,
+}: AskEditorProps): ReactNode {
 	const [draft, setDraft] = useState(prefill ?? "");
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
+	const initialPrefillRef = useRef(prefill);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const surface: RestartDraftSurface = { kind: "editor", reqId, capabilityFingerprint };
 
+	useEffect(() => {
+		setDraft(drafts.get(surface) ?? initialPrefillRef.current ?? "");
+	}, [capabilityFingerprint, draftRecoveryVersion, drafts, reqId]);
+	useEffect(() => () => drafts.setComposing(surface, false), [capabilityFingerprint, drafts, reqId]);
 	useLayoutEffect(() => {
 		autosize(taRef.current);
 	}, [draft]);
 
+	const submit = (): void => {
+		if (!live || !draftsReady || restartPreparing) return;
+		if (onSubmit(draft)) drafts.clear(surface);
+	};
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
-		if (shouldSubmitOnEnter(e, composingRef.current)) {
-			e.preventDefault();
-			onSubmit(draft);
-		}
+		if (!shouldSubmitOnEnter(e, composingRef.current)) return;
+		e.preventDefault();
+		submit();
 	};
 
 	return (
@@ -86,11 +102,25 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 				ref={taRef}
 				className="sh-composer-input"
 				value={draft}
-				onChange={e => setDraft(e.target.value)}
+				onChange={e => {
+					setDraft(e.target.value);
+					if (draftsReady) {
+						drafts.noteInput(surface);
+						drafts.set(surface, e.target.value);
+					}
+				}}
 				onKeyDown={onKeyDown}
-				onCompositionStart={onCompositionStart}
-				onCompositionEnd={onCompositionEnd}
-				placeholder="type your response…"
+				onCompositionStart={() => {
+					onCompositionStart();
+					drafts.setComposing(surface, true);
+				}}
+				onCompositionEnd={() => {
+					onCompositionEnd();
+					drafts.noteInput(surface);
+					drafts.setComposing(surface, false);
+				}}
+				placeholder={draftsReady ? "type your response…" : "verifying draft storage…"}
+				disabled={!draftsReady}
 				rows={1}
 				spellCheck={false}
 			/>
@@ -98,7 +128,8 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 				<button
 					type="button"
 					className="sh-btn sh-btn-primary"
-					onClick={() => onSubmit(draft)}
+					onClick={submit}
+					disabled={!live || !draftsReady || restartPreparing}
 					title="submit response"
 				>
 					<SendHorizontal size={12} /> <span className="sh-btn-label">Submit</span>
@@ -108,38 +139,50 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 	);
 }
 
-export function Composer({ client, snapshot }: ComposerProps): ReactNode {
+export function Composer({
+	client,
+	snapshot,
+	drafts,
+	draftsReady,
+	draftRecoveryVersion,
+	editorDraftCapabilityFingerprint,
+}: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
-
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
 	const uiRequest = snapshot.uiRequest;
-	const canPrompt = live && !readOnly;
+	const canEdit = !readOnly && draftsReady;
+	const canPrompt = live && canEdit;
 	const busy = snapshot.working;
 	const queued = snapshot.state?.queuedMessageCount ?? 0;
-	const canSend = canPrompt && text.trim().length > 0;
-
+	const canSend = canPrompt && !snapshot.restartPreparing && text.trim().length > 0;
+	useEffect(() => () => drafts.setComposing(COMPOSER_SURFACE, false), [drafts]);
+	useEffect(() => {
+		setText(drafts.get(COMPOSER_SURFACE) ?? "");
+	}, [draftRecoveryVersion, drafts]);
 	useLayoutEffect(() => {
 		autosize(taRef.current);
 	}, [text, uiRequest?.reqId]);
+	useLayoutEffect(() => {
+		if (uiRequest) drafts.setComposing(COMPOSER_SURFACE, false);
+	}, [drafts, uiRequest]);
 
 	const send = useCallback((): void => {
 		const trimmed = text.trim();
-		if (!trimmed || !live || readOnly) return;
-		client.sendPrompt(trimmed);
+		if (!trimmed || !canPrompt || snapshot.restartPreparing) return;
+		if (!client.sendPrompt(trimmed)) return;
+		drafts.clear(COMPOSER_SURFACE);
 		setText("");
-	}, [client, live, readOnly, text]);
-
+	}, [canPrompt, client, drafts, snapshot.restartPreparing, text]);
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
-		if (shouldSubmitOnEnter(e, composingRef.current)) {
-			e.preventDefault();
-			send();
-		}
+		if (!shouldSubmitOnEnter(e, composingRef.current)) return;
+		e.preventDefault();
+		send();
 	};
 
-	if (uiRequest && canPrompt) {
+	if (uiRequest && canEdit && (uiRequest.kind === "select" || editorDraftCapabilityFingerprint)) {
 		return (
 			<div className="sh-composer sh-composer-ask">
 				<div className="sh-ask-title">{uiRequest.title}</div>
@@ -154,6 +197,7 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 									type="button"
 									className={`sh-ask-option${checked ? " sh-ask-option-checked" : ""}`}
 									onClick={() => client.sendUiResponse(uiRequest.reqId, label)}
+									disabled={!live || snapshot.restartPreparing}
 								>
 									<span className="sh-ask-option-marker">
 										{uiRequest.selectionMarker === "checkbox" ? (checked ? "☑" : "☐") : checked ? "◉" : "○"}
@@ -171,12 +215,33 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 				) : (
 					<AskEditor
 						key={uiRequest.reqId}
+						reqId={uiRequest.reqId}
 						prefill={uiRequest.prefill}
+						drafts={drafts}
+						capabilityFingerprint={editorDraftCapabilityFingerprint ?? ""}
+						draftsReady={draftsReady}
+						draftRecoveryVersion={draftRecoveryVersion}
+						live={live}
+						restartPreparing={snapshot.restartPreparing}
 						onSubmit={value => client.sendUiResponse(uiRequest.reqId, value)}
 					/>
 				)}
 				<div className="sh-composer-actions sh-ask-actions">
-					<button type="button" className="sh-btn" onClick={() => client.sendUiResponse(uiRequest.reqId)}>
+					<button
+						type="button"
+						className="sh-btn"
+						onClick={() => {
+							if (!client.sendUiResponse(uiRequest.reqId)) return;
+							if (uiRequest.kind === "editor" && editorDraftCapabilityFingerprint) {
+								drafts.clear({
+									kind: "editor",
+									reqId: uiRequest.reqId,
+									capabilityFingerprint: editorDraftCapabilityFingerprint,
+								});
+							}
+						}}
+						disabled={!live || snapshot.restartPreparing}
+					>
 						Cancel
 					</button>
 					{busy && (
@@ -184,7 +249,7 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 							type="button"
 							className="sh-btn sh-btn-stop"
 							onClick={() => client.sendAbort()}
-							disabled={!live}
+							disabled={!live || snapshot.restartPreparing}
 							title="stop the current turn"
 						>
 							<Square size={11} /> <span className="sh-btn-label">Stop</span>
@@ -202,18 +267,33 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 					ref={taRef}
 					className="sh-composer-input"
 					value={text}
-					onChange={e => setText(e.target.value)}
+					onChange={e => {
+						setText(e.target.value);
+						if (draftsReady) {
+							drafts.noteInput(COMPOSER_SURFACE);
+							drafts.set(COMPOSER_SURFACE, e.target.value);
+						}
+					}}
 					onKeyDown={onKeyDown}
-					onCompositionStart={onCompositionStart}
-					onCompositionEnd={onCompositionEnd}
+					onCompositionStart={() => {
+						onCompositionStart();
+						drafts.setComposing(COMPOSER_SURFACE, true);
+					}}
+					onCompositionEnd={() => {
+						onCompositionEnd();
+						drafts.noteInput(COMPOSER_SURFACE);
+						drafts.setComposing(COMPOSER_SURFACE, false);
+					}}
 					placeholder={
-						readOnly
-							? "read-only session — watching only"
-							: live
-								? "prompt the host agent…"
-								: "waiting for session…"
+						!draftsReady
+							? "verifying draft storage…"
+							: readOnly
+								? "read-only session — watching only"
+								: live
+									? "prompt the host agent…"
+									: "offline — draft saved locally"
 					}
-					disabled={!canPrompt}
+					disabled={!canEdit}
 					rows={1}
 					spellCheck={false}
 				/>
@@ -228,7 +308,7 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 							type="button"
 							className="sh-btn sh-btn-stop"
 							onClick={() => client.sendAbort()}
-							disabled={!live}
+							disabled={!live || snapshot.restartPreparing}
 							title="stop the current turn"
 						>
 							<Square size={11} /> <span className="sh-btn-label">Stop</span>

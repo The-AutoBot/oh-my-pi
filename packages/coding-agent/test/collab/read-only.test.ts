@@ -285,16 +285,18 @@ async function nextLiveOutputChunk(guest: TestGuest): Promise<Extract<CollabFram
 const guestCleanups: (() => void)[] = [];
 let harness: HostHarness;
 let host: CollabHost;
+let guestActionsReady = true;
 
 beforeAll(async () => {
 	installInMemoryRelay();
 	harness = makeHostContext();
-	host = new CollabHost(harness.ctx);
+	host = new CollabHost(harness.ctx, { guestActionsReady: () => guestActionsReady });
 	// Port is irrelevant: the fake transport routes by the `role` query param.
 	await host.start("ws://localhost:8787");
 });
 
 afterEach(() => {
+	guestActionsReady = true;
 	for (const cleanup of guestCleanups.splice(0).reverse()) cleanup();
 	harness.prompts.length = 0;
 	harness.aborts.count = 0;
@@ -511,6 +513,60 @@ describe("collab read-only links", () => {
 		expect(await prompted).toEqual({ from: "writer" });
 		expect(prompts).toHaveLength(1);
 		expect(host.participants.find(p => p.name === "writer")?.readOnly).toBeUndefined();
+	});
+
+	it("fences browser microphone ingress until startup activation but lets a claimed lease stop", async () => {
+		guestActionsReady = false;
+		const guest = await joinAsGuest(host.link, "startup-gated-mic");
+		guestCleanups.push(() => guest.socket.close());
+		try {
+			const welcome = await guest.nextFrame();
+			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+
+			guest.socket.send({ t: "live-input-claim", requestId: "startup-blocked-claim" });
+			const blockedClaim = await guest.nextFrame();
+			if (blockedClaim.t !== "live-input-lease") throw new Error(`expected live-input-lease, got ${blockedClaim.t}`);
+			expect(blockedClaim).toMatchObject({ requestId: "startup-blocked-claim", status: "unavailable" });
+			expect(harness.live.remoteStartCount).toBe(0);
+
+			guestActionsReady = true;
+			const lease = await claimLiveInput(guest, "startup-gated-claim");
+			if (lease.status !== "granted" || !lease.leaseId) throw new Error(`expected granted lease, got ${lease.status}`);
+
+			guestActionsReady = false;
+			guest.socket.send({
+				t: "live-input-start",
+				leaseId: lease.leaseId,
+				format: "pcm_s16le",
+				sampleRate: 16_000,
+				channels: 1,
+				frameSamples: 320,
+			});
+			const blockedStart = await guest.nextFrame();
+			if (blockedStart.t !== "error") throw new Error(`expected error, got ${blockedStart.t}`);
+			expect(blockedStart.message).toContain("starting up");
+			expect(harness.live.remoteStartCount).toBe(0);
+
+			guest.socket.send({ t: "live-input-chunk", leaseId: lease.leaseId, seq: 0, data: "" });
+			const blockedChunk = await guest.nextFrame();
+			if (blockedChunk.t !== "error") throw new Error(`expected error, got ${blockedChunk.t}`);
+			expect(blockedChunk.message).toContain("starting up");
+			expect(harness.live.remoteFrames).toHaveLength(0);
+
+			guest.socket.send({ t: "live-input-stop", leaseId: lease.leaseId, reason: "user" });
+			const stopBarrier = await claimLiveInput(guest, "startup-stop-barrier");
+			expect(stopBarrier.status).toBe("unavailable");
+			guestActionsReady = true;
+			const replacementLease = await claimLiveInput(guest, "startup-stop-allowed");
+			expect(replacementLease.status).toBe("granted");
+
+			guestActionsReady = false;
+			guest.socket.send({ t: "live-input-stop", leaseId: replacementLease.leaseId!, reason: "user" });
+			const finalStopBarrier = await claimLiveInput(guest, "startup-final-stop-barrier");
+			expect(finalStopBarrier.status).toBe("unavailable");
+		} finally {
+			guestActionsReady = true;
+		}
 	});
 
 	it("routes a leased browser microphone through remote live input and broadcasts its source", async () => {

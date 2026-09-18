@@ -100,6 +100,10 @@ export interface InteractiveModeInitOptions {
 	clearInitialTerminalHistory?: boolean;
 	/** Opt into hosting when the caller owns outer startup readiness and shutdown. */
 	autoStartCollab?: boolean;
+	/** Keep user submission fenced until an external activation boundary completes. */
+	holdSubmit?: boolean;
+	/** Fence unsafe local control actions while preserving editor text until protected startup completes. */
+	holdControls?: boolean;
 	/** Recent-session rows loaded by the prepaint composer while runtime modules initialized. */
 	recentSessions?: Promise<RecentSession[] | undefined>;
 }

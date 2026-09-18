@@ -255,6 +255,10 @@ export default function(pi) {
 		process.once(startedEnteredEvent, () => enteredStartedHandler.resolve());
 		fs.writeFileSync(startedGatePath, "");
 		const starting = context.ensureCollab({ relayUrl: relay.url });
+		const startingOutcome = starting.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
 		await enteredStartedHandler.promise;
 
 		const host = mode.collabHost;
@@ -262,7 +266,10 @@ export default function(pi) {
 		const stopping = host.stop("extension stopped host", "user");
 		process.emit(startedReleaseEvent);
 		await stopping;
-		await expect(starting).rejects.toMatchObject({ code: "collab-stopped" });
+		expect(await startingOutcome).toMatchObject({
+			status: "rejected",
+			error: { code: "collab-stopped" },
+		});
 		expect(mode.collabHost).toBeUndefined();
 	});
 

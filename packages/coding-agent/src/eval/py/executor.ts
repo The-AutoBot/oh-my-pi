@@ -528,6 +528,11 @@ export async function disposeKernelSessionsByOwner(ownerId: string): Promise<voi
 	await sessionRegistry.disposeByOwner(ownerId);
 }
 
+/** True while an owner has a live or starting retained Python kernel. */
+export function hasPythonKernelSessionForOwner(ownerId: string | undefined): boolean {
+	return ownerId !== undefined && sessionRegistry.hasSessionForOwner(ownerId);
+}
+
 /** Projects against an already-retained, idle Python session without starting a kernel. */
 export async function shadowPlanPythonIfPresent(options: {
 	cwd: string;

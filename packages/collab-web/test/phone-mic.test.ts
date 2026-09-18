@@ -23,9 +23,13 @@ class FakeClient implements LiveInputClient {
 	claimCount = 0;
 	startCount = 0;
 	readonly requestId = "request-1";
-	snapshot: Pick<GuestSnapshot, "phase" | "readOnly" | "liveActive" | "liveInput" | "liveInputLease"> = {
+	snapshot: Pick<
+		GuestSnapshot,
+		"phase" | "readOnly" | "restartPreparing" | "liveActive" | "liveInput" | "liveInputLease"
+	> = {
 		phase: "live",
 		readOnly: false,
+		restartPreparing: false,
 		liveActive: false,
 		liveInput: "none",
 		liveInputLease: IDLE_LEASE,
@@ -261,6 +265,19 @@ describe("PhoneMicController", () => {
 		expect(environment.getUserMediaCount).toBe(0);
 		expect(client.claimCount).toBe(0);
 		expect(controller.getSnapshot().phase).toBe("unavailable");
+		controller.dispose();
+	});
+
+	it("does not acquire microphone permission while a restart is preparing", () => {
+		const client = new FakeClient();
+		client.snapshot = { ...client.snapshot, restartPreparing: true };
+		const environment = new FakeEnvironment();
+		const controller = new PhoneMicController(client, environment);
+		controller.mount();
+		controller.toggle();
+		expect(environment.getUserMediaCount).toBe(0);
+		expect(client.claimCount).toBe(0);
+		expect(controller.getSnapshot().phase).toBe("idle");
 		controller.dispose();
 	});
 });

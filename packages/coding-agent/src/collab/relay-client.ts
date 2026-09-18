@@ -63,7 +63,7 @@ export class CollabSocket {
 	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
 	onControl?: (msg: RelayControlMessage) => void;
 	/** Fires on each close; `willReconnect` distinguishes retries from terminal shutdown. */
-	onClose?: (reason: string, willReconnect: boolean) => void;
+	onClose?: (reason: string, willReconnect: boolean, closeCode?: number) => void;
 
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
@@ -619,19 +619,19 @@ export class CollabSocket {
 		if (retryRoom) {
 			this.#retryMissingRoom = true;
 			this.#rejoining = true;
-			this.onClose?.(closeReason, true);
+			this.onClose?.(closeReason, true, code);
 			this.#scheduleRetry();
 			return;
 		}
 		if (fatalReason !== undefined) {
 			this.#closed = true;
 			this.#discardPendingSends();
-			this.onClose?.(fatalReason, false);
+			this.onClose?.(fatalReason, false, code);
 			return;
 		}
 		this.#clearBackpressureDrain();
 		this.#rejoining = true;
-		this.onClose?.(closeReason, true);
+		this.onClose?.(closeReason, true, code);
 		this.#scheduleRetry();
 	}
 

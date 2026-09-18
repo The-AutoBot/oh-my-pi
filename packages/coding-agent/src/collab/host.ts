@@ -13,10 +13,15 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import {
+	COLLAB_RESTART_CAPABILITY_UPDATE,
+	COLLAB_RESTART_PREPARATION_CAPABILITY,
+} from "@oh-my-pi/pi-wire";
 import type {
 	BusChannel,
 	CollabUiRequest,
 	CollabUiRequestDraft,
+	CollabRestartBlockReason,
 	CollabUiResponseValue,
 	LiveInput,
 	AgentEvent as WireAgentEvent,
@@ -150,6 +155,10 @@ const LIVE_INPUT_LEASE_CLAIM_TIMEOUT_MS = 30_000;
 /** Audio worklets normally produce a frame every 20 ms; allow network jitter
  * without keeping a silent connected owner active forever. */
 const LIVE_INPUT_LEASE_IDLE_TIMEOUT_MS = 10_000;
+/** A guest must finish local draft reservation promptly, or the room keeps serving it normally. */
+const RESTART_PREPARATION_TIMEOUT_MS = 15_000;
+const RESTART_REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const RESTART_CAPABILITIES_MAX = 8;
 const MAX_PENDING_UI_REQUESTS = 64;
 /**
  * Outcome of {@link CollabHost.requestGuestUi}. `answered` carries the guest's
@@ -178,6 +187,26 @@ interface PendingCollabUiRequest {
 	settle(result: CollabGuestUiResult): void;
 	responsePending?: boolean;
 }
+interface CollabPeer {
+	name: string;
+	canWrite: boolean;
+	deliveredUiRequests: Set<number>;
+	/** Optional capability advertized in `hello`; absent means an older guest. */
+	restartCapable: boolean;
+	/** Metadata only — draft contents never leave the browser. */
+	restartDirty: boolean;
+	restartDirtyVersion: number;
+}
+
+interface PendingRestartRequest extends CollabPreparedRestart {
+	pendingPeers: Set<number>;
+	acknowledgedDirtyVersions: Map<number, number>;
+	timer: Timer;
+	deadline: number;
+	resolve(result: CollabRestartPreparationResult): void;
+	settled: boolean;
+	committed: boolean;
+}
 
 /**
  * Identity a host publishes to the local registry. The controller that owns
@@ -200,6 +229,8 @@ export interface CollabHostOptions {
 	/** Optional timing overrides for deterministic remote-input lifecycle tests. */
 	liveInputClaimTimeoutMs?: number;
 	liveInputIdleTimeoutMs?: number;
+	/** Bounded restart negotiation deadline for deterministic lifecycle tests. */
+	restartPreparationTimeoutMs?: number;
 	/** Controller lifecycle callback, invoked after registry withdrawal. */
 	onStopped?: (host: CollabHost, reason: CollabStopReason) => void | Promise<void>;
 	/** Controller callback for non-terminal relay connectivity transitions. */
@@ -220,7 +251,35 @@ export class CollabHostStoppedError extends Error {
 
 export type CollabConnectionState = "connected" | "reconnecting";
 export type CollabStopReason = "user" | "session-switch" | "shutdown" | "connection-failed";
-export type CollabUnavailableCode = "connection-unavailable" | "session-changed" | "stopped";
+export type CollabUnavailableCode = "connection-unavailable" | "session-changed" | "startup-fenced" | "stopped";
+/**
+ * Reasons the host can safely expose without disclosing names, draft text, or
+ * other session content to the update path.
+ */
+export type CollabRestartDeferReason =
+	| "active-microphone"
+	| "guest-blocked"
+	| "guest-disconnected"
+	| "guest-incompatible"
+	| "host-unavailable"
+	| "pending-input"
+	| "preparation-active"
+	| "preparation-expired"
+	| "session-busy"
+	| "session-transition";
+
+export type CollabRestartSafety = { safe: true } | { safe: false; reason: CollabRestartDeferReason };
+
+/** Opaque browser reservation bound to one host session and relative lease. */
+export interface CollabPreparedRestart {
+	requestId: string;
+	sessionId: string;
+	leaseMs: number;
+}
+
+export type CollabRestartPreparationResult =
+	| { kind: "prepared"; preparation: CollabPreparedRestart }
+	| { kind: "deferred"; reason: CollabRestartDeferReason };
 
 /** Safe machine-readable relay/session availability failure for extension recovery. */
 export class CollabUnavailableError extends Error {
@@ -233,6 +292,14 @@ export class CollabUnavailableError extends Error {
 	}
 }
 
+type CollabDiagnosticCode = `collab-${CollabUnavailableCode}` | "collab-host-stopped" | "unknown";
+
+function collabDiagnosticCode(error: unknown): CollabDiagnosticCode {
+	if (error instanceof CollabUnavailableError) return error.code;
+	if (error instanceof CollabHostStoppedError) return "collab-host-stopped";
+	return "unknown";
+}
+
 function collabUnavailableError(code: CollabUnavailableCode): CollabUnavailableError {
 	return new CollabUnavailableError(code);
 }
@@ -242,6 +309,28 @@ function isLiveInputId(value: unknown): value is string {
 
 function isLiveInputStopReason(value: unknown): value is "user" | "track-ended" | "transport" {
 	return value === "user" || value === "track-ended" || value === "transport";
+}
+
+function hasRestartPreparationCapability(value: unknown): boolean {
+	return (
+		Array.isArray(value) &&
+		value.length <= RESTART_CAPABILITIES_MAX &&
+		value.includes(COLLAB_RESTART_PREPARATION_CAPABILITY)
+	);
+}
+
+function isRestartRequestId(value: unknown): value is string {
+	return typeof value === "string" && RESTART_REQUEST_ID_RE.test(value);
+}
+
+function isRestartBlockReason(value: unknown): value is CollabRestartBlockReason {
+	return (
+		value === "draft-storage-unavailable" ||
+		value === "expired" ||
+		value === "microphone-active" ||
+		value === "reservation-conflict" ||
+		value === "unavailable"
+	);
 }
 
 function decodeLiveInputChunk(data: unknown): Float32Array | null {
@@ -301,6 +390,8 @@ export class CollabHost {
 	readonly #hostId = randomUUID();
 	#connectionState: CollabConnectionState = "reconnecting";
 	#readyWaiters = new Set<{ resolve(): void; reject(error: Error): void; timer: Timer }>();
+	#sessionInvalidationLogged = false;
+	#readyTimeoutLogged = false;
 	#entryAppendHandler?: (entry: StoredSessionEntry) => void;
 	#unsubscribe?: () => void;
 	/**
@@ -311,7 +402,11 @@ export class CollabHost {
 	 * yet, and after a shed, when the peer leaves the participant list but is
 	 * still owed a resync error.
 	 */
-	#peers = new Map<number, { name: string; canWrite: boolean; deliveredUiRequests: Set<number> }>();
+	/** Authenticated relay peers that have not yet completed a compatible hello. */
+	#unnegotiatedPeers = new Set<number>();
+	/** Peer identities cannot be reconciled after relay recreation; disable automatic takeover for this host lifetime. */
+	#restartIncompatibleAfterRoomRecreation = false;
+	#peers = new Map<number, CollabPeer>();
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -319,6 +414,12 @@ export class CollabHost {
 	 */
 	#uiReqSeq = 0;
 	#pendingUi = new Map<number, PendingCollabUiRequest>();
+	/** One all-or-nothing guest reservation; no new guest activity may race it. */
+	#restartRequest: PendingRestartRequest | undefined;
+	/** Guest agent commands stay admission-visible until their lifecycle work settles. */
+	#guestAgentOperations = 0;
+	/** Set only after the final guest recheck succeeds; no later mutation may enter before stop. */
+	#restartCommitBarrier = false;
 	#needsInput = false;
 	#inputStateEmissions: Promise<void> = Promise.resolve();
 	#lastInputType: CollabUiRequest["kind"] | null = null;
@@ -339,6 +440,7 @@ export class CollabHost {
 	#remoteLiveInputStopping?: Promise<void>;
 	#liveInputClaimTimeoutMs: number;
 	#liveInputIdleTimeoutMs: number;
+	#restartPreparationTimeoutMs: number;
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -358,6 +460,11 @@ export class CollabHost {
 		this.#guestActionsReady = options.guestActionsReady ?? (() => true);
 		this.#liveInputClaimTimeoutMs = options.liveInputClaimTimeoutMs ?? LIVE_INPUT_LEASE_CLAIM_TIMEOUT_MS;
 		this.#liveInputIdleTimeoutMs = options.liveInputIdleTimeoutMs ?? LIVE_INPUT_LEASE_IDLE_TIMEOUT_MS;
+		const restartPreparationTimeoutMs = options.restartPreparationTimeoutMs ?? RESTART_PREPARATION_TIMEOUT_MS;
+		this.#restartPreparationTimeoutMs =
+			Number.isSafeInteger(restartPreparationTimeoutMs) && restartPreparationTimeoutMs > 0
+				? Math.min(restartPreparationTimeoutMs, RESTART_PREPARATION_TIMEOUT_MS)
+				: RESTART_PREPARATION_TIMEOUT_MS;
 		// The room mirrors the session that is active when it is created; the
 		// frame guard and the registry snapshot compare against this from then on.
 		this.#sessionId = ctx.sessionManager.getSessionId();
@@ -447,6 +554,7 @@ export class CollabHost {
 	 */
 	async waitForReady(timeoutMs = CONNECT_TIMEOUT_MS): Promise<void> {
 		if (!this.#sessionStillCurrent()) {
+			this.#logSessionInvalidated();
 			void this.stop("session switched", "session-switch");
 			throw collabUnavailableError("session-changed");
 		}
@@ -467,24 +575,301 @@ export class CollabHost {
 			},
 			timer: undefined as unknown as Timer,
 		};
-		waiter.timer = setTimeout(() => waiter.reject(collabUnavailableError("connection-unavailable")), timeoutMs);
+		waiter.timer = setTimeout(() => {
+			this.#logReadyTimeout();
+			waiter.reject(collabUnavailableError("connection-unavailable"));
+		}, timeoutMs);
 		this.#readyWaiters.add(waiter);
 		if (this.isReady) waiter.resolve();
 		await deferred.promise;
 
 		if (!this.#sessionStillCurrent()) {
+			this.#logSessionInvalidated();
 			void this.stop("session switched", "session-switch");
 			throw collabUnavailableError("session-changed");
 		}
 		if (!this.isReady) throw collabUnavailableError("connection-unavailable");
 	}
 
+	/**
+	 * A restart may proceed only while this exact room is idle and every
+	 * connected browser can participate in the bounded draft reservation.
+	 * No browser data is inspected or returned from this check.
+	 */
+	canPrepareRestart(): CollabRestartSafety {
+		if (!this.isReady) return { safe: false, reason: "host-unavailable" };
+		if (this.#ctx.session.isSessionTransitioning) return { safe: false, reason: "session-transition" };
+		if (this.#restartCommitBarrier) return { safe: false, reason: "host-unavailable" };
+		if (this.#restartRequest) return { safe: false, reason: "preparation-active" };
+		if (this.#pendingUi.size > 0) return { safe: false, reason: "pending-input" };
+		if (
+			this.#ctx.session.isStreaming ||
+			this.#ctx.session.isAborting ||
+			this.#ctx.session.queuedMessageCount > 0 ||
+			this.#guestAgentOperations > 0 ||
+			AgentRegistry.global().list().some(ref => ref.kind === "sub" && ref.status === "running")
+		) {
+			return { safe: false, reason: "session-busy" };
+		}
+		if (
+			this.#ctx.liveActive ||
+			this.#currentLiveInput() !== "none" ||
+			this.#remoteLiveInputLease !== undefined ||
+			this.#remoteLiveInputStopping !== undefined
+		) {
+			return { safe: false, reason: "active-microphone" };
+		}
+		if (this.#unnegotiatedPeers.size > 0) return { safe: false, reason: "guest-incompatible" };
+		if (this.#restartIncompatibleAfterRoomRecreation) return { safe: false, reason: "guest-incompatible" };
+		for (const peer of this.#peers.values()) {
+			if (!peer.restartCapable) return { safe: false, reason: "guest-incompatible" };
+		}
+		return { safe: true };
+	}
+
+	/**
+	 * Freezes only capability-negotiated guests after each confirms that its
+	 * own browser-local drafts are recoverable. The caller must either commit
+	 * this reservation or cancel it; expiry also restores every guest.
+	 */
+	async prepareRestart(deadlineMonotonicMs?: number): Promise<CollabRestartPreparationResult> {
+		const safety = this.canPrepareRestart();
+		if (!safety.safe) return { kind: "deferred", reason: safety.reason };
+		const now = performance.now();
+		const remainingMs =
+			deadlineMonotonicMs === undefined
+				? this.#restartPreparationTimeoutMs
+				: Math.min(this.#restartPreparationTimeoutMs, Math.floor(deadlineMonotonicMs - now));
+		if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
+			return { kind: "deferred", reason: "preparation-expired" };
+		}
+
+		const { promise, resolve } = Promise.withResolvers<CollabRestartPreparationResult>();
+		const request: PendingRestartRequest = {
+			requestId: randomUUID(),
+			sessionId: this.#sessionId,
+			leaseMs: remainingMs,
+			deadline: now + remainingMs,
+			pendingPeers: new Set(this.#peers.keys()),
+			acknowledgedDirtyVersions: new Map(),
+			timer: undefined as unknown as Timer,
+			resolve,
+			settled: false,
+			committed: false,
+		};
+		this.#restartRequest = request;
+		request.timer = setTimeout(() => {
+			this.#cancelRestartRequest(request, "expired", "preparation-expired");
+		}, remainingMs);
+
+		for (const peerId of request.pendingPeers) {
+			const peer = this.#peers.get(peerId);
+			if (!peer?.restartCapable) {
+				this.#cancelRestartRequest(request, "unsafe", "guest-incompatible");
+				return promise;
+			}
+			this.#send({ t: "restart-prepare", requestId: request.requestId, leaseMs: request.leaseMs }, peerId);
+		}
+		if (request.pendingPeers.size === 0) this.#completeRestartRequest(request);
+		return promise;
+	}
+
+	/** Releases a successful reservation without closing the existing room. */
+	cancelPreparedRestart(
+		preparation: CollabPreparedRestart,
+		cancelReason: "aborted" | "expired" | "unsafe" = "aborted",
+	): boolean {
+		const request = this.#restartRequest;
+		if (
+			!request ||
+			request.committed ||
+			request.requestId !== preparation.requestId ||
+			request.sessionId !== preparation.sessionId ||
+			request.leaseMs !== preparation.leaseMs
+		) {
+			return false;
+		}
+		return this.#cancelRestartRequest(request, cancelReason, "preparation-active");
+	}
+
+	/**
+	 * Consumes a fully acknowledged reservation immediately before its owner
+	 * stops this host. It never stops anything itself.
+	 */
+	commitPreparedRestart(preparation: CollabPreparedRestart): boolean {
+		const request = this.#restartRequest;
+		if (
+			!request ||
+			!request.settled ||
+			request.committed ||
+			request.requestId !== preparation.requestId ||
+			request.sessionId !== preparation.sessionId ||
+			request.leaseMs !== preparation.leaseMs
+		) {
+			return false;
+		}
+		if (performance.now() >= request.deadline) {
+			this.#cancelRestartRequest(request, "expired", "preparation-expired");
+			return false;
+		}
+		// Runtime calls this immediately before teardown, after its own broker and
+		// session-flush awaits. Recheck every mutable safety fact so an expired
+		// lease or newly active operation never authorizes a stale ACK.
+		if (!this.isReady) {
+			this.#cancelRestartRequest(request, "unsafe", "host-unavailable");
+			return false;
+		}
+		if (this.#ctx.session.isSessionTransitioning) {
+			this.#cancelRestartRequest(request, "unsafe", "session-transition");
+			return false;
+		}
+		if (this.#pendingUi.size > 0) {
+			this.#cancelRestartRequest(request, "unsafe", "pending-input");
+			return false;
+		}
+		if (
+			this.#ctx.session.isStreaming ||
+			this.#ctx.session.isAborting ||
+			this.#ctx.session.queuedMessageCount > 0 ||
+			this.#guestAgentOperations > 0 ||
+			AgentRegistry.global().list().some(ref => ref.kind === "sub" && ref.status === "running")
+		) {
+			this.#cancelRestartRequest(request, "unsafe", "session-busy");
+			return false;
+		}
+		if (
+			this.#ctx.liveActive ||
+			this.#currentLiveInput() !== "none" ||
+			this.#remoteLiveInputLease !== undefined ||
+			this.#remoteLiveInputStopping !== undefined
+		) {
+			this.#cancelRestartRequest(request, "unsafe", "active-microphone");
+			return false;
+		}
+		if (
+			this.#restartIncompatibleAfterRoomRecreation ||
+			this.#unnegotiatedPeers.size > 0 ||
+			request.acknowledgedDirtyVersions.size !== this.#peers.size
+		) {
+			this.#cancelRestartRequest(request, "unsafe", "guest-disconnected");
+			return false;
+		}
+		for (const [peerId, peer] of this.#peers) {
+			if (!peer.restartCapable || request.acknowledgedDirtyVersions.get(peerId) !== peer.restartDirtyVersion) {
+				this.#cancelRestartRequest(request, "unsafe", "guest-disconnected");
+				return false;
+			}
+		}
+		clearTimeout(request.timer);
+		request.committed = true;
+		this.#restartCommitBarrier = true;
+		this.#restartRequest = undefined;
+		return true;
+	}
+
+	#completeRestartRequest(request: PendingRestartRequest): void {
+		if (this.#restartRequest !== request || request.settled || request.pendingPeers.size > 0) return;
+		request.settled = true;
+		request.resolve({
+			kind: "prepared",
+			preparation: {
+				requestId: request.requestId,
+				sessionId: request.sessionId,
+				leaseMs: request.leaseMs,
+			},
+		});
+	}
+
+	#cancelRestartRequest(
+		request: PendingRestartRequest,
+		cancelReason: "aborted" | "expired" | "unsafe",
+		deferReason: CollabRestartDeferReason,
+	): boolean {
+		if (this.#restartRequest !== request || request.committed) return false;
+		clearTimeout(request.timer);
+		this.#restartRequest = undefined;
+		for (const peerId of request.acknowledgedDirtyVersions.keys()) {
+			if (this.#peers.get(peerId)?.restartCapable) {
+				this.#send({ t: "restart-cancel", requestId: request.requestId, reason: cancelReason }, peerId);
+			}
+		}
+		for (const peerId of request.pendingPeers) {
+			if (this.#peers.get(peerId)?.restartCapable) {
+				this.#send({ t: "restart-cancel", requestId: request.requestId, reason: cancelReason }, peerId);
+			}
+		}
+		if (!request.settled) {
+			request.settled = true;
+			request.resolve({ kind: "deferred", reason: deferReason });
+		}
+		return true;
+	}
+
 	#notifyConnectionState(state: CollabConnectionState): void {
 		void Promise.resolve()
 			.then(() => this.#onConnectionState?.(this, state))
-			.catch(error => {
-				logger.warn("Collab connection-state handler failed", { error: String(error) });
+			.catch(() => {
+				this.#logLifecycle("recovery", { state: "connection-handler-failed" });
 			});
+	}
+
+	#logLifecycle(
+		stage: "initial-open" | "reconnect" | "ready-timeout" | "session-invalidated" | "stop" | "recovery",
+		details: {
+			state?: "connected" | "closed" | "terminal" | "room-recreated" | "connection-handler-failed";
+			willReconnect?: boolean;
+			closeCode?: number;
+			code?: CollabUnavailableCode;
+			stopReason?: CollabStopReason;
+		} = {},
+	): void {
+		const fields = {
+			stage,
+			hostId: this.#hostId,
+			sessionId: this.#sessionId,
+			generation: this.#generation,
+			...details,
+		};
+		if (
+			stage === "ready-timeout" ||
+			details.state === "terminal" ||
+			details.state === "connection-handler-failed"
+		) {
+			logger.warn("Collab host lifecycle", fields);
+		} else {
+			logger.info("Collab host lifecycle", fields);
+		}
+	}
+
+	#logFailure(
+		stage:
+			| "input-state-handler"
+			| "registry-publication"
+			| "registry-withdrawal"
+			| "remote-live-input-start"
+			| "remote-live-input-stop"
+			| "ui-response-transition",
+		error: unknown,
+	): void {
+		logger.warn("Collab host operation failed", {
+			stage,
+			hostId: this.#hostId,
+			sessionId: this.#sessionId,
+			generation: this.#generation,
+			code: collabDiagnosticCode(error),
+		});
+	}
+
+	#logSessionInvalidated(): void {
+		if (this.#sessionInvalidationLogged) return;
+		this.#sessionInvalidationLogged = true;
+		this.#logLifecycle("session-invalidated", { code: "session-changed" });
+	}
+
+	#logReadyTimeout(): void {
+		if (this.#readyTimeoutLogged) return;
+		this.#readyTimeoutLogged = true;
+		this.#logLifecycle("ready-timeout", { code: "connection-unavailable" });
 	}
 
 	get participants(): CollabParticipant[] {
@@ -512,6 +897,8 @@ export class CollabHost {
 	 * must stay local rather than reach the previous session's guests.
 	 */
 	requestGuestUi(request: CollabUiRequestDraft, signal?: AbortSignal): Promise<CollabGuestUiResult> | null {
+		const restartRequest = this.#restartRequest;
+		if (restartRequest) this.#cancelRestartRequest(restartRequest, "unsafe", "pending-input");
 		if (!this.#guestTrafficAllowed() || signal?.aborted || this.#pendingUi.size >= MAX_PENDING_UI_REQUESTS)
 			return null;
 		const reqId = ++this.#uiReqSeq;
@@ -544,10 +931,16 @@ export class CollabHost {
 		this.#lastInputType = inputType;
 		const runner = this.#ctx.session.extensionRunner;
 		if (!runner?.hasHandlers("collab_input_state")) return;
-		const event: CollabInputStateEvent = Object.freeze({ type: "collab_input_state", needsInput, inputType });
+		const event: CollabInputStateEvent = Object.freeze({
+			type: "collab_input_state",
+			hostId: this.#hostId,
+			sessionId: this.#sessionId,
+			needsInput,
+			inputType,
+		});
 		this.#inputStateEmissions = this.#inputStateEmissions
 			.then(() => runner.emit(event))
-			.catch(error => logger.warn("collab_input_state handler failed", { error: String(error) }));
+			.catch(error => this.#logFailure("input-state-handler", error));
 	}
 
 	#sendUiRequestToWritablePeers(request: CollabUiRequest): void {
@@ -573,9 +966,7 @@ export class CollabHost {
 	}
 
 	#sendRegisteredPeers(frame: CollabFrame): void {
-		const socket = this.#socket;
-		if (!socket) return;
-		for (const peerId of this.#peers.keys()) socket.send(frame, peerId);
+		for (const peerId of this.#peers.keys()) this.#send(frame, peerId);
 	}
 
 	async start(relayUrl: string, webUrl = ""): Promise<void> {
@@ -612,19 +1003,33 @@ export class CollabHost {
 			this.#connectionState = "connected";
 			for (const waiter of this.#readyWaiters) waiter.resolve();
 			if (!reconnected) {
+				this.#logLifecycle("initial-open", { state: "connected" });
 				firstOpen.resolve();
 				return;
 			}
+			this.#logLifecycle("reconnect", { state: "connected" });
 			this.#notifyConnectionState("connected");
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
+			if (msg.t === "peer-joined" && !this.#peers.has(msg.peer)) {
+				this.#unnegotiatedPeers.add(msg.peer);
+				if (this.#restartRequest) this.#cancelRestartRequest(this.#restartRequest, "unsafe", "guest-disconnected");
+			}
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
 		};
-		socket.onClose = (_reason, willReconnect) => {
+		socket.onClose = (_reason, willReconnect, closeCode) => {
 			this.#relayConnected = false;
 			if (this.#stopped) return;
+			this.#logLifecycle(
+				opened ? (willReconnect ? "reconnect" : "recovery") : "initial-open",
+				{
+					state: willReconnect ? "closed" : "terminal",
+					willReconnect,
+					...(closeCode === undefined ? {} : { closeCode }),
+				},
+			);
 			if (!opened) {
 				firstOpen.reject(collabUnavailableError("connection-unavailable"));
 				return;
@@ -642,10 +1047,10 @@ export class CollabHost {
 		};
 		socket.connect();
 
-		const timeout = setTimeout(
-			() => firstOpen.reject(collabUnavailableError("connection-unavailable")),
-			CONNECT_TIMEOUT_MS,
-		);
+		const timeout = setTimeout(() => {
+			this.#logReadyTimeout();
+			firstOpen.reject(collabUnavailableError("connection-unavailable"));
+		}, CONNECT_TIMEOUT_MS);
 		try {
 			await firstOpen.promise;
 		} catch (err) {
@@ -706,7 +1111,7 @@ export class CollabHost {
 		const publishing = publishCollabHost(this.#registrySource(), { instanceId: this.#instanceId }).then(
 			publication => publication,
 			err => {
-				logger.warn("Collab host registry publication failed", { error: String(err) });
+				this.#logFailure("registry-publication", err);
 				this.#ctx.showStatus("Collab host discovery unavailable (omp collab list will not show this session)", {
 					dim: true,
 				});
@@ -723,7 +1128,7 @@ export class CollabHost {
 			if (publication) {
 				await publication
 					.close()
-					.catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
+					.catch(err => this.#logFailure("registry-withdrawal", err));
 			}
 			if (this.#stopping) throw new CollabHostStoppedError("collab host stopped during startup");
 			throw new Error("relay connection closed during startup");
@@ -745,7 +1150,14 @@ export class CollabHost {
 	}
 
 	async #runStop(reason: string, stopReason: CollabStopReason): Promise<void> {
+		const restartRequest = this.#restartRequest;
+		if (restartRequest) {
+			this.#cancelRestartRequest(restartRequest, "aborted", "host-unavailable");
+			await this.#socket?.flush();
+		}
 		this.#stopping = true;
+		if (stopReason === "session-switch") this.#logSessionInvalidated();
+		this.#logLifecycle("stop", { stopReason });
 		// Leave the public slot at once: `/collab` must not re-print, and `/join`
 		// must not see as hosting, a room that already refuses frames.
 		if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
@@ -768,6 +1180,8 @@ export class CollabHost {
 	}
 
 	async #runTeardown(reason: CollabStopReason): Promise<void> {
+		const restartRequest = this.#restartRequest;
+		if (restartRequest) this.#cancelRestartRequest(restartRequest, "unsafe", "host-unavailable");
 		if (this.#stopped) return;
 		const unavailableCode: CollabUnavailableCode =
 			reason === "session-switch"
@@ -793,7 +1207,7 @@ export class CollabHost {
 			// awaiting it lets a successor room reuse the same instance endpoint.
 			await publication
 				.close()
-				.catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
+				.catch(err => this.#logFailure("registry-withdrawal", err));
 		}
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
@@ -833,7 +1247,7 @@ export class CollabHost {
 		this.#pendingPublication = null;
 		const late = pending ? await pending : null;
 		if (late) {
-			await late.close().catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
+			await late.close().catch(err => this.#logFailure("registry-withdrawal", err));
 		}
 		await this.#onStopped?.(this, reason);
 	}
@@ -915,6 +1329,7 @@ export class CollabHost {
 		// An old-room answer may wait for rollback, but cannot settle against
 		// another session. The response handler owns that bounded deferral.
 		if (frame.t === "ui-response") {
+			if (this.#rejectWhileRestartPreparing("responding to ask", fromPeer)) return;
 			this.#handleUiResponse(frame.reqId, frame.value, fromPeer);
 			return;
 		}
@@ -924,20 +1339,35 @@ export class CollabHost {
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
+				this.#handleHello(frame.name, frame.proto, frame.writeToken, frame.capabilities, fromPeer);
+				break;
+			case "capabilities-update":
+				this.#handleGuestCapabilityUpdate(frame.capabilities, fromPeer);
+				break;
+			case "restart-dirty":
+				this.#handleRestartDirty(frame.dirty, fromPeer);
+				break;
+			case "restart-ready":
+				this.#handleRestartReady(frame.requestId, frame.status, frame.reason, fromPeer);
 				break;
 			case "prompt":
+				if (this.#rejectWhileRestartPreparing("prompting", fromPeer)) break;
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
 				this.#handlePrompt(frame.text, frame.images, fromPeer);
 				break;
 			case "abort":
+				if (this.#rejectWhileRestartPreparing("interrupting", fromPeer)) break;
 				if (this.#rejectWhileStarting("interrupting", fromPeer)) break;
 				this.#handleAbort(fromPeer);
 				break;
 			case "live-input-claim":
+				if (this.#rejectWhileRestartPreparing("claiming live input", fromPeer)) break;
+				if (this.#rejectLiveInputClaimWhileStarting(frame.requestId, fromPeer)) break;
 				this.#handleLiveInputClaim(frame.requestId, fromPeer);
 				break;
 			case "live-input-start":
+				if (this.#rejectWhileRestartPreparing("starting live input", fromPeer)) break;
+				if (this.#rejectWhileStarting("starting live input", fromPeer)) break;
 				this.#handleLiveInputStart(
 					frame.leaseId,
 					frame.format,
@@ -948,12 +1378,16 @@ export class CollabHost {
 				);
 				break;
 			case "live-input-chunk":
+				if (this.#rejectWhileRestartPreparing("sending live input", fromPeer)) break;
+				if (this.#rejectWhileStarting("sending live input", fromPeer)) break;
 				this.#handleLiveInputChunk(frame.leaseId, frame.seq, frame.data, fromPeer);
 				break;
 			case "live-input-stop":
+				if (this.#rejectWhileRestartPreparing("stopping live input", fromPeer)) break;
 				this.#handleLiveInputStop(frame.leaseId, frame.reason, fromPeer);
 				break;
 			case "agent-cmd":
+				if (this.#rejectWhileRestartPreparing("agent control", fromPeer)) break;
 				if (this.#rejectWhileStarting("agent control", fromPeer)) break;
 				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer);
 				break;
@@ -990,6 +1424,40 @@ export class CollabHost {
 			: "the host finishes starting up";
 		this.#send({ t: "error", message: `${action} is unavailable until ${ready}` }, fromPeer);
 		return true;
+	}
+
+	/**
+	 * A microphone claim has already made the browser acquire capture devices,
+	 * so unlike ordinary startup-gated actions it needs a lease response that
+	 * lets the guest release them immediately.
+	 */
+	#rejectLiveInputClaimWhileStarting(requestId: unknown, fromPeer: number): boolean {
+		if (this.#guestActionsReady()) return false;
+		if (!isLiveInputId(requestId)) {
+			this.#rejectLiveInput("claim", fromPeer);
+			return true;
+		}
+		const ready = this.#ctx.session.isSessionTransitioning
+			? "the session transition completes"
+			: "the host finishes starting up";
+		this.#sendLiveInputLease(fromPeer, requestId, "unavailable", undefined, `live input is unavailable until ${ready}`);
+		return true;
+	}
+
+	/**
+	 * Before final commit, an already-admitted guest action wins over an update:
+	 * cancel the reversible reservation first, then process the action normally.
+	 * After commit, keep the barrier closed until host teardown completes.
+	 */
+	#rejectWhileRestartPreparing(action: string, fromPeer: number): boolean {
+		if (this.#restartCommitBarrier) {
+			this.#send({ t: "error", message: `${action} is unavailable while the host is restarting` }, fromPeer);
+			return true;
+		}
+		const request = this.#restartRequest;
+		if (!request) return false;
+		this.#cancelRestartRequest(request, "unsafe", "session-busy");
+		return false;
 	}
 
 	#sendLiveInputLease(
@@ -1047,7 +1515,7 @@ export class CollabHost {
 			try {
 				await this.#ctx.stopRemoteLiveInput();
 			} catch (error) {
-				logger.warn("collab remote live input stop failed", { error: String(error) });
+				this.#logFailure("remote-live-input-stop", error);
 			}
 		})();
 		this.#remoteLiveInputStopping = stopping;
@@ -1127,7 +1595,7 @@ export class CollabHost {
 		try {
 			return await this.#ctx.startRemoteLiveInput();
 		} catch (error) {
-			logger.warn("collab remote live input start failed", { error: String(error) });
+			this.#logFailure("remote-live-input-start", error);
 			return false;
 		}
 	}
@@ -1230,6 +1698,10 @@ export class CollabHost {
 
 	#handleLiveStateChange(active: boolean, input: LiveInput): void {
 		const lease = this.#remoteLiveInputLease;
+		const restartRequest = this.#restartRequest;
+		if (restartRequest && (active || input !== "none")) {
+			this.#cancelRestartRequest(restartRequest, "unsafe", "active-microphone");
+		}
 		// Do not advertise a remote input until the live transport has finished
 		// connecting; browser clients use this broadcast as their send gate.
 		if (lease?.phase === "starting" && input === "remote") return;
@@ -1248,7 +1720,72 @@ export class CollabHost {
 		}
 	}
 
-	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+	#handleRestartDirty(dirty: unknown, fromPeer: number): void {
+		if (typeof dirty !== "boolean") return;
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.restartCapable) return;
+		const request = this.#restartRequest;
+		const alreadyAcknowledged = request?.acknowledgedDirtyVersions.has(fromPeer) === true;
+		if (peer.restartDirty === dirty && !alreadyAcknowledged) return;
+		if (peer.restartDirty !== dirty) {
+			peer.restartDirty = dirty;
+			peer.restartDirtyVersion++;
+		}
+		// A post-ACK edit can retain the same non-empty dirty bit, so its fresh
+		// frame is itself the invalidation signal. The browser persisted it first.
+		if (alreadyAcknowledged && request) {
+			this.#cancelRestartRequest(request, "unsafe", "guest-blocked");
+		}
+	}
+
+	#handleGuestCapabilityUpdate(capabilities: unknown, fromPeer: number): void {
+		const peer = this.#peers.get(fromPeer);
+		if (!peer) return;
+		const restartCapable = hasRestartPreparationCapability(capabilities);
+		if (peer.restartCapable === restartCapable) return;
+		const request = this.#restartRequest;
+		if (request) this.#cancelRestartRequest(request, "unsafe", "guest-blocked");
+		peer.restartCapable = restartCapable;
+		peer.restartDirty = false;
+		peer.restartDirtyVersion++;
+	}
+
+	#handleRestartReady(
+		requestId: unknown,
+		status: unknown,
+		reason: unknown,
+		fromPeer: number,
+	): void {
+		if (!isRestartRequestId(requestId)) return;
+		const request = this.#restartRequest;
+		const peer = this.#peers.get(fromPeer);
+		if (!request || !peer?.restartCapable || request.requestId !== requestId || !request.pendingPeers.has(fromPeer)) {
+			return;
+		}
+		if (performance.now() >= request.deadline) {
+			this.#cancelRestartRequest(request, "expired", "preparation-expired");
+			return;
+		}
+		if (status === "blocked") {
+			// Validate only to keep the untrusted wire shape bounded; neither this
+			// status nor a draft ever reaches logs or the update supervisor.
+			if (reason !== undefined && !isRestartBlockReason(reason)) return;
+			this.#cancelRestartRequest(request, "unsafe", "guest-blocked");
+			return;
+		}
+		if (status !== "ready") return;
+		request.pendingPeers.delete(fromPeer);
+		request.acknowledgedDirtyVersions.set(fromPeer, peer.restartDirtyVersion);
+		this.#completeRestartRequest(request);
+	}
+
+	#handleHello(
+		name: string,
+		proto: number,
+		writeToken: string | undefined,
+		capabilities: unknown,
+		fromPeer: number,
+	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
 			this.#send({ t: "error", message: "Session transition in progress; join again when it completes" }, fromPeer);
 			return;
@@ -1260,13 +1797,23 @@ export class CollabHost {
 			);
 			return;
 		}
+		const activeRestartRequest = this.#restartRequest;
+		if (activeRestartRequest) this.#cancelRestartRequest(activeRestartRequest, "unsafe", "guest-disconnected");
+		this.#unnegotiatedPeers.delete(fromPeer);
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
+		const restartCapable = hasRestartPreparationCapability(capabilities);
 		const previousPeer = this.#peers.get(fromPeer);
+		const retainsRestartState = restartCapable && previousPeer?.restartCapable === true;
 		this.#peers.set(fromPeer, {
 			name: cleanName,
 			canWrite,
-			deliveredUiRequests: canWrite && previousPeer?.canWrite ? previousPeer.deliveredUiRequests : new Set(),
+			// A repeated hello always precedes a fresh guest welcome, which clears
+			// its local UI queue. Re-deliver every pending ask after that snapshot.
+			deliveredUiRequests: new Set(),
+			restartCapable,
+			restartDirty: retainsRestartState ? previousPeer.restartDirty : false,
+			restartDirtyVersion: retainsRestartState ? previousPeer.restartDirtyVersion : 0,
 		});
 		const remoteLease = this.#remoteLiveInputLease;
 		if (!canWrite && remoteLease?.peerId === fromPeer) {
@@ -1307,6 +1854,7 @@ export class CollabHost {
 				liveActive: this.#ctx.liveActive,
 				liveInput: this.#currentLiveInput(),
 				readOnly: canWrite ? undefined : true,
+				capabilities: [COLLAB_RESTART_PREPARATION_CAPABILITY, COLLAB_RESTART_CAPABILITY_UPDATE],
 			},
 			fromPeer,
 		);
@@ -1405,7 +1953,7 @@ export class CollabHost {
 			if (this.#peers.get(fromPeer)?.canWrite) pending.settle({ kind: "answered", value });
 			else this.#sendWritablePeers({ t: "ui-request", request: pending.request });
 		} catch (error) {
-			logger.warn("Collab UI response could not await session transition", { error: String(error) });
+			this.#logFailure("ui-response-transition", error);
 			pending.settle({ kind: "unavailable" });
 		} finally {
 			pending.responsePending = false;
@@ -1492,12 +2040,20 @@ export class CollabHost {
 	 */
 	#handleRoomRecreated(): void {
 		if (this.#stopped) return;
+		this.#logLifecycle("recovery", { state: "room-recreated" });
 		const remoteLease = this.#remoteLiveInputLease;
 		if (remoteLease) void this.#stopRemoteLiveInput(remoteLease, "revoked", "relay room was recreated");
-		if (this.#peers.size === 0 && this.#pendingUi.size === 0) return;
-		// Identities first: settle() fans `ui-request-end` out over #peers, and those
-		// ids belong to the room that just went away.
+		const restartRequest = this.#restartRequest;
+		if (this.#peers.size === 0 && this.#unnegotiatedPeers.size === 0 && this.#pendingUi.size === 0 && !restartRequest) return;
+		// Identities first: relay peer IDs may be reissued before any queued
+		if (this.#peers.size > 0 || this.#unnegotiatedPeers.size > 0) {
+			this.#restartIncompatibleAfterRoomRecreation = true;
+		}
+		// cancellation can drain. Clearing them ensures a reservation is only
+		// released locally rather than sent to a new occupant.
 		this.#peers.clear();
+		this.#unnegotiatedPeers.clear();
+		if (restartRequest) this.#cancelRestartRequest(restartRequest, "unsafe", "guest-disconnected");
 		// The relay closed everyone who could answer, so an outstanding ask has no
 		// recipient. Leaving it pending hangs callers that await it without racing a
 		// local dialog, and #handleHello re-poses every pending request to the next
@@ -1515,7 +2071,10 @@ export class CollabHost {
 		const name = this.#peers.get(peer)?.name;
 		const remoteLease = this.#remoteLiveInputLease;
 		if (remoteLease?.peerId === peer) void this.#stopRemoteLiveInput(remoteLease);
+		this.#unnegotiatedPeers.delete(peer);
 		this.#peers.delete(peer);
+		const restartRequest = this.#restartRequest;
+		if (restartRequest) this.#cancelRestartRequest(restartRequest, "unsafe", "guest-disconnected");
 		// Relay controls arrive outside the normal frame handler.
 		if (!this.#guestTrafficAllowed()) return;
 		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");
@@ -1548,6 +2107,10 @@ export class CollabHost {
 	}
 
 	#onEventForState(event: AgentSessionEvent): void {
+		if (event.type === "agent_start") {
+			const restartRequest = this.#restartRequest;
+			if (restartRequest) this.#cancelRestartRequest(restartRequest, "unsafe", "session-busy");
+		}
 		if (!STATE_TRIGGER_EVENTS[event.type]) return;
 		this.#scheduleStateBroadcast();
 		if (event.type === "agent_start" && !this.#streamingInterval) {
@@ -1610,34 +2173,57 @@ export class CollabHost {
 					return;
 				}
 				// Mirrors the hub's #submitChatMessage: revive if parked, steer if mid-turn.
-				AgentLifecycleManager.global()
-					.ensureLive(agentId)
-					.then(session => {
-						if (!this.#guestTrafficAllowed() || !this.#guestActionsReady()) return;
-						return session.prompt(trimmed, { streamingBehavior: "steer" });
-					})
-					.catch(fail);
+				this.#trackGuestAgentOperation(
+					AgentLifecycleManager.global()
+						.ensureLive(agentId)
+						.then(session => {
+							if (
+								!this.#guestTrafficAllowed() ||
+								!this.#guestActionsReady() ||
+								this.#restartRequest ||
+								this.#restartCommitBarrier
+							)
+								return;
+							return session.prompt(trimmed, { streamingBehavior: "steer" });
+						}),
+					fail,
+				);
 				break;
 			}
 			case "kill": {
 				const kill = async () => {
 					const ref = AgentRegistry.global().get(agentId);
-					if (!ref || !this.#guestTrafficAllowed()) return;
+					if (!ref || !this.#guestTrafficAllowed() || this.#restartRequest || this.#restartCommitBarrier) return;
 					if (ref.status === "running" && ref.session) {
 						await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 					}
-					if (!this.#guestTrafficAllowed() || !this.#guestActionsReady()) return;
+					if (
+						!this.#guestTrafficAllowed() ||
+						!this.#guestActionsReady() ||
+						this.#restartRequest ||
+						this.#restartCommitBarrier
+					)
+						return;
 					await AgentLifecycleManager.global().release(agentId, ref, { tombstone: true });
 				};
-				kill().catch(fail);
+				this.#trackGuestAgentOperation(kill(), fail);
 				break;
 			}
 			case "revive":
-				AgentLifecycleManager.global().ensureLive(agentId).catch(fail);
+				this.#trackGuestAgentOperation(AgentLifecycleManager.global().ensureLive(agentId), fail);
 				break;
 		}
 	}
 
+
+	#trackGuestAgentOperation(operation: Promise<unknown>, fail: (error: unknown) => void): void {
+		this.#guestAgentOperations++;
+		void operation
+			.catch(fail)
+			.finally(() => {
+				this.#guestAgentOperations--;
+			});
+	}
 	/** Incremental transcript read mirroring the hub's readFileIncremental contract. */
 	async #handleFetchTranscript(reqId: number, agentId: string, fromByte: number, fromPeer: number): Promise<void> {
 		const reply = (text: string, newSize: number, error?: string) =>

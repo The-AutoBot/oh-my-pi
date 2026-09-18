@@ -212,6 +212,7 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			ensureCollab: options => this.ctx.ensureCollab(options),
+			setAutoBotUpdateCoordinator: service => this.ctx.session.setAutoBotUpdateCoordinator(service),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -444,6 +445,7 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			ensureCollab: options => this.ctx.ensureCollab(options),
+			setAutoBotUpdateCoordinator: service => this.ctx.session.setAutoBotUpdateCoordinator(service),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

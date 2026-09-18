@@ -703,6 +703,12 @@ export class SessionManager {
 	#writer: SessionStorageWriter | undefined;
 	/** Sealed by {@link releaseRetainedEntries}: every later append/title/rewrite is a dropped no-op. */
 	#released = false;
+	/**
+	 * Candidate processes retain a restored journal in memory but must not
+	 * append, rewrite, consume drafts, or otherwise mutate its durable state
+	 * until the predecessor has committed activation.
+	 */
+	#autoBotStandby = false;
 	/** Serializes async disk work (flush/close/atomic rewrite). Appends are synchronous and bypass it. */
 	#diskTail: Promise<void> = Promise.resolve();
 	#diskFailure: Error | undefined;
@@ -759,6 +765,30 @@ export class SessionManager {
 		this.#blobs = new BlobStore(getBlobsDir());
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
+	}
+
+	/**
+	 * Raises the candidate write barrier after opening an existing session and
+	 * before reconstructing its runtime. A standby manager has no active writer,
+	 * so it cannot race the predecessor for the JSONL append handle.
+	 */
+	enterAutoBotStandby(): void {
+		if (this.#released) throw new Error("Cannot stage a released session manager.");
+		if (this.#writer?.isOpen()) throw new Error("Cannot stage a session manager with an open writer.");
+		this.#autoBotStandby = true;
+		this.#diskEpoch++;
+	}
+
+	/** Releases a previously staged candidate manager after activation commits. */
+	activateAutoBotWrites(): void {
+		if (!this.#autoBotStandby) throw new Error("Session manager is not in AutoBot standby.");
+		if (this.#released) throw new Error("Cannot activate a released session manager.");
+		this.#autoBotStandby = false;
+	}
+
+	/** Whether persistence is currently blocked pending AutoBot activation. */
+	get isAutoBotStandby(): boolean {
+		return this.#autoBotStandby;
 	}
 
 	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
@@ -1104,7 +1134,7 @@ export class SessionManager {
 	 * concurrent completed entries are durable without recreating a vacated source.
 	 */
 	#rewriteSynchronously(): void {
-		if (this.#released) return;
+		if (this.#autoBotStandby || this.#released) return;
 		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
 		const targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
 		if (!targetPath) return;
@@ -1185,7 +1215,7 @@ export class SessionManager {
 	 * before it ran.
 	 */
 	async #rewriteAtomically(): Promise<void> {
-		if (!this.#persist || !this.#sessionFile) return;
+		if (this.#autoBotStandby || !this.#persist || !this.#sessionFile) return;
 		if (this.#released) return;
 
 		const startEpoch = this.#diskEpoch;
@@ -1212,7 +1242,7 @@ export class SessionManager {
 	 * their post-publish state updates.
 	 */
 	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
-		if (this.#released) return false;
+		if (this.#autoBotStandby || this.#released) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
 		try {
 			do {
@@ -1225,7 +1255,7 @@ export class SessionManager {
 				try {
 					await this.#storage.writeTextAtomic(sessionFile, body, {
 						expectedSize: this.#expectedDiskSize,
-						commitGuard: () => !this.#released && this.#diskEpoch === epoch,
+						commitGuard: () => !this.#autoBotStandby && !this.#released && this.#diskEpoch === epoch,
 					});
 				} catch (error) {
 					try {
@@ -1251,7 +1281,7 @@ export class SessionManager {
 	}
 
 	#appendToSessionFile(entry: SessionEntry): void {
-		if (this.#released || !this.#persist || !this.#sessionFile) return;
+		if (this.#autoBotStandby || this.#released || !this.#persist || !this.#sessionFile) return;
 		if (this.#atomicEntryBatch) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
@@ -1359,7 +1389,7 @@ export class SessionManager {
 	}
 
 	async #persistTitleChangeEntry(entry: TitleChangeEntry, update: SessionTitleUpdate): Promise<void> {
-		if (!this.#persist || !this.#sessionFile) return;
+		if (this.#autoBotStandby || !this.#persist || !this.#sessionFile) return;
 		if (this.#diskFailure) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
@@ -1514,6 +1544,7 @@ export class SessionManager {
 	}
 
 	#recordEntry(entry: SessionEntry): void {
+		if (this.#autoBotStandby) return;
 		if (this.#released) {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
 			return;
@@ -2043,7 +2074,7 @@ export class SessionManager {
 	 * session/new must create a discoverable file immediately).
 	 */
 	async ensureOnDisk(): Promise<void> {
-		if (!this.#persist || !this.#sessionFile) return;
+		if (this.#autoBotStandby || !this.#persist || !this.#sessionFile) return;
 		this.#forceFileCreation = true;
 		if (this.#fileIsCurrent && !this.#rewriteRequired) return;
 		await this.#rewriteAtomically();
@@ -2161,7 +2192,7 @@ export class SessionManager {
 
 	/** Flush pending writes. Call before switching sessions or on shutdown. */
 	async flush(): Promise<void> {
-		if (!this.#persist || !this.#sessionFile) return;
+		if (this.#autoBotStandby || !this.#persist || !this.#sessionFile) return;
 		await this.#scheduleDiskWork(async () => {
 			if (this.#writer?.isOpen()) await this.#writer.flush();
 		});
@@ -2180,7 +2211,7 @@ export class SessionManager {
 	 * history, and Ctrl+C must not rebuild the whole JSONL string just to flush.
 	 */
 	flushSync(): void {
-		if (!this.#persist || !this.#sessionFile) return;
+		if (this.#autoBotStandby || !this.#persist || !this.#sessionFile) return;
 		if (this.#atomicEntryBatch) throw new Error("Cannot synchronously flush during an atomic session batch.");
 		if (this.#diskFailure) throw this.#diskFailure;
 		if (this.#fileIsCurrent && !this.#rewriteRequired) {
@@ -2244,7 +2275,7 @@ export class SessionManager {
 
 	/** Flush, then close the append writer. */
 	async close(): Promise<void> {
-		if (!this.#persist) return;
+		if (this.#autoBotStandby || !this.#persist) return;
 		await this.#scheduleDiskWork(async () => {
 			const hadWriter = this.#writer !== undefined;
 			await this.#closeWriterHandle();
@@ -2519,6 +2550,7 @@ export class SessionManager {
 	}
 
 	async saveDraft(text: string): Promise<void> {
+		if (this.#autoBotStandby) return;
 		const draftPath = this.#draftPath();
 		if (!draftPath || !this.#persist) return;
 
@@ -2546,6 +2578,7 @@ export class SessionManager {
 	}
 
 	async consumeDraft(): Promise<string | null> {
+		if (this.#autoBotStandby) return null;
 		const draftPath = this.#draftPath();
 		if (!draftPath) return null;
 

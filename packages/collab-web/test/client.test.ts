@@ -1,14 +1,16 @@
 import { describe, expect, it, vi } from "bun:test";
-import type {
-	AgentSnapshot,
-	AssistantMessage,
-	GuestFrame,
-	HostFrame,
-	SessionEntry,
-	SessionHeader,
-	SessionState,
-	SubagentProgressPayload,
-	WireMessage,
+import {
+	COLLAB_RESTART_CAPABILITY_UPDATE,
+	COLLAB_RESTART_PREPARATION_CAPABILITY,
+	type AgentSnapshot,
+	type AssistantMessage,
+	type GuestFrame,
+	type HostFrame,
+	type SessionEntry,
+	type SessionHeader,
+	type SessionState,
+	type SubagentProgressPayload,
+	type WireMessage,
 } from "@oh-my-pi/pi-wire";
 import { GuestClient } from "../src/lib/client";
 import { importRoomKey, open } from "../src/lib/codec";
@@ -58,6 +60,7 @@ function welcomeFrame(
 	readOnly?: boolean,
 	liveActive?: boolean,
 	liveInput: "none" | "local" | "remote" = "none",
+	capabilities?: Extract<HostFrame, { t: "welcome" }>["capabilities"],
 ): HostFrame {
 	return {
 		t: "welcome",
@@ -69,6 +72,7 @@ function welcomeFrame(
 		readOnly,
 		liveActive,
 		liveInput,
+		capabilities,
 	};
 }
 
@@ -122,6 +126,31 @@ describe("GuestClient frame apply", () => {
 		client.applyFrameForTest({ t: "live-state", active: true, input: "remote" });
 		expect(client.getSnapshot().liveActive).toBe(true);
 		expect(client.getSnapshot().liveInput).toBe("remote");
+	});
+
+	it("refuses a stale rendered submit callback after restart preparation begins", () => {
+		const client = new GuestClient(LINK, "tester");
+		const dispose = client.setRestartPreparationHandler({
+			prepare: () => ({ status: "ready" }),
+			cancel: () => {},
+		});
+		try {
+			client.applyFrameForTest(
+				welcomeFrame(0, undefined, undefined, "none", [
+					COLLAB_RESTART_PREPARATION_CAPABILITY,
+					COLLAB_RESTART_CAPABILITY_UPDATE,
+				]),
+			);
+			client.setRestartPreparationAvailability(true);
+			const renderedSubmit = (): boolean => client.sendPrompt("must remain drafted if fenced");
+			client.applyFrameForTest({ t: "restart-prepare", requestId: "r".repeat(16), leaseMs: 1_000 });
+
+			expect(client.getSnapshot().restartPreparing).toBe(true);
+			expect(renderedSubmit()).toBe(false);
+		} finally {
+			dispose();
+			client.close();
+		}
 	});
 
 	it("times out stalled snapshot chunks and resets the clock on progress", () => {

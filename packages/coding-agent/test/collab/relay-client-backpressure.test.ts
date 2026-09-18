@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { unpackEnvelope } from "../../src/collab/protocol";
 import { generateRoomKey, importRoomKey, open, seal } from "../../src/collab/crypto";
 import { type CollabFrame, packEnvelope, unpackEnvelope } from "../../src/collab/protocol";
 import { CollabSocket } from "../../src/collab/relay-client";

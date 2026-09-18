@@ -904,6 +904,12 @@ export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptio
 	return count;
 }
 
+/** True while an OMP-managed browser tab remains owned by an agent session. */
+export function hasTabsForOwner(ownerId: string | undefined): boolean {
+	if (!ownerId) return false;
+	return Array.from(tabs.values()).some(tab => tab.ownerSessionId === ownerId);
+}
+
 /**
  * Tabs this settle machinery may ever touch: OMP-launched headless puppeteer
  * tabs (`kindTag === "headless"` covers hidden and visible shared-daemon

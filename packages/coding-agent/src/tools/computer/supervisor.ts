@@ -171,6 +171,11 @@ export class ComputerSupervisor implements ComputerController {
 		this.#callSessionTool = callSessionTool;
 	}
 
+	/** True once this lazy controller has created a worker or is still starting one. */
+	get hasLiveWorker(): boolean {
+		return this.#worker !== undefined || this.#startPromise !== undefined;
+	}
+
 	async capabilities(
 		snapshot: ComputerSessionSnapshot,
 		signal?: AbortSignal,
@@ -407,6 +412,14 @@ export async function releaseComputerSessionsForOwner(ownerId: string | undefine
 	if (!controllers) return;
 	ownedSupervisors.delete(ownerId);
 	await Promise.allSettled(Array.from(controllers, controller => controller.close()));
+}
+
+/** True when an agent owns a live desktop worker, not merely a lazy controller. */
+export function hasLiveComputerSessionForOwner(ownerId: string | undefined): boolean {
+	if (!ownerId) return false;
+	return Array.from(ownedSupervisors.get(ownerId) ?? []).some(
+		controller => controller instanceof ComputerSupervisor && controller.hasLiveWorker,
+	);
 }
 
 /** Verifies computer worker startup, messaging, and bounded shutdown. */

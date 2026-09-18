@@ -5,6 +5,15 @@
 ### Added
 
 - Writable collab guests can explicitly share a phone microphone with bounded PCM capture and receive lease-targeted assistant audio playback; read-only guests do not see audio controls.
+
+### Changed
+
+- Maintained coordinator deployments stage fresh collab-web assets before guests load a new page.
+
+### Fixed
+
+- Coordinator-managed guests now fully reload and reconnect after a custom host replacement; stalled room discovery safely recovers after its 10-second fetch/body deadline.
+
 ## [18.2.1] - 2026-09-15
 
 ### Fixed

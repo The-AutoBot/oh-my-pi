@@ -12,6 +12,7 @@ import {
 	DAEMON_PROJECT_DIR_ENV,
 	DAEMON_RUNTIME_DIR_ENV,
 	type DaemonCompletionNotification,
+	type DaemonSnapshot,
 	type DaemonOperation,
 	type DaemonRpcResult,
 	type DaemonWireMessage,
@@ -498,6 +499,20 @@ export async function daemonClientForGlobal(service: string): Promise<DaemonBrok
 			runtimeDir: canonical,
 		}),
 	);
+}
+
+/**
+ * List daemons through an already-open process-shared client without creating a
+ * broker or a runtime directory. `undefined` means this process has no client
+ * for the project, so it has no local evidence of session-owned services.
+ */
+export async function listKnownProjectDaemons(projectDir: string): Promise<DaemonSnapshot[] | undefined> {
+	const canonical = await canonicalProjectDir(projectDir);
+	const pending = sharedClients.get(`project:${canonical}`);
+	if (!pending) return undefined;
+	const client = await pending;
+	const result = await client.request({ op: "list" });
+	return result.op === "list" ? result.daemons : [];
 }
 
 /** Close every project and machine-global broker connection held by this omp process. */

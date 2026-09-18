@@ -1,0 +1,768 @@
+name: AutoBot signed release promotion
+
+on:
+  schedule:
+    - cron: "43 * * * *"
+  # A non-GITHUB_TOKEN canonical push reduces release latency. The independent
+  # schedule is still mandatory because GitHub suppresses downstream runs from
+  # a GITHUB_TOKEN-created candidate merge.
+  push:
+  workflow_dispatch:
+    inputs:
+      allow_initial:
+        description: "Explicitly approve a reviewed first channel promotion when no prior envelope exists"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: autobot-signed-release-promotion
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Derive canonical release plan
+    if: ${{ github.event_name == 'workflow_dispatch' || (vars.AUTOBOT_RELEASE_AUTOMATION == 'enabled' && (github.event_name != 'push' || github.ref_name == vars.AUTOBOT_CANONICAL_BRANCH)) }}
+    runs-on: ubuntu-22.04
+    outputs:
+      should_release: ${{ steps.plan.outputs.should_release }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      release_sequence: ${{ steps.plan.outputs.release_sequence }}
+      fork_commit: ${{ steps.plan.outputs.fork_commit }}
+      upstream_commit: ${{ steps.plan.outputs.upstream_commit }}
+      upstream_version: ${{ steps.plan.outputs.upstream_version }}
+      compatibility_epoch: ${{ steps.plan.outputs.compatibility_epoch }}
+      allow_initial: ${{ steps.plan.outputs.allow_initial }}
+    steps:
+      - name: Require static release policy and complete target configuration
+        shell: bash
+        env:
+          CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+          TARGETS_JSON: ${{ vars.AUTOBOT_RELEASE_TARGETS_JSON }}
+          # The release matrix is repository-owned below; do not accept arbitrary runner labels.
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          for required in CANONICAL_BRANCH COMPILER_BUN_VERSION TARGETS_JSON COORDINATOR_PROVENANCE_SHA256; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::Missing AutoBot static release configuration: $required" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$COMPILER_BUN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._+-][0-9A-Za-z._+-]+)?$ ]]; then
+            echo "::error::AUTOBOT_COMPILER_BUN_VERSION must be an exact Bun version" >&2
+            exit 1
+          fi
+          if ! [[ "$COMPILER_BUN_VERSION" =~ ^1\.4\.[0-9]+([._+-][0-9A-Za-z._+-]+)?$ ]]; then
+            echo "::error::AUTOBOT_COMPILER_BUN_VERSION must be an exact Bun 1.4 release with supported compile targets" >&2
+            exit 1
+          fi
+          if ! [[ "$COORDINATOR_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::AUTOBOT_COORDINATOR_PROVENANCE_SHA256 must be a lowercase SHA-256 pin" >&2
+            exit 1
+          fi
+          if [[ ! "$CANONICAL_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || [[ "$CANONICAL_BRANCH" == *".."* ]] || [[ "$CANONICAL_BRANCH" == */ ]] || [[ "$CANONICAL_BRANCH" == *"//"* ]]; then
+            echo "::error::AUTOBOT_CANONICAL_BRANCH must be a safe explicit branch name" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Derive source, configured target matrix, sequence, and no-op state
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          TARGETS_JSON: ${{ vars.AUTOBOT_RELEASE_TARGETS_JSON }}
+          # Host labels and architectures are deliberately fixed with the existing CI cross-build policy.
+          INPUT_ALLOW_INITIAL: ${{ inputs.allow_initial }}
+          CONFIG_ALLOW_INITIAL: ${{ vars.AUTOBOT_RELEASE_ALLOW_INITIAL }}
+        run: |
+          set -euo pipefail
+          plan="$RUNNER_TEMP/autobot-release-plan.json"
+          bun scripts/autobot-release-plan.ts --source-root "$GITHUB_WORKSPACE" --out "$plan"
+          if [ "$(jq -r '.ready' "$plan")" != "true" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fork_commit="$(jq -er '.forkCommit | strings' "$plan")"
+          upstream_commit="$(jq -er '.upstreamCommit | strings' "$plan")"
+          upstream_version="$(jq -er '.upstreamVersion | strings' "$plan")"
+          compatibility_epoch="$(jq -er '.compatibilityEpoch' "$plan")"
+          if ! [[ "$fork_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ && "$upstream_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ && "$upstream_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+_-]{0,127}$ && "$compatibility_epoch" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Canonical release plan contains malformed source metadata" >&2
+            exit 1
+          fi
+          expected_targets='["darwin-arm64","darwin-x64","linux-arm64","linux-musl-arm64","linux-musl-x64","linux-x64","win32-arm64","win32-x64"]'
+          targets="$(printf '%s' "$TARGETS_JSON" | jq -ce --argjson expected "$expected_targets" 'if type == "array" and length == 8 and all(.[]; type == "string" and test("^(win32|darwin|linux)(-musl)?-(x64|arm64)$")) and (length == (unique | length)) and (sort == $expected) then sort else error("target set must be exactly the supported AutoBot release targets") end')"
+          # Mirrors CI's proven native/cross-build split: win32-x64 compiles on Linux,
+          # while win32-arm64 requires the actual Windows ARM host for its native addon.
+          host_matrix='{
+            "darwin-arm64":{"runner":"macos-14","host_platform":"darwin","host_arch":"arm64"},
+            "darwin-x64":{"runner":"macos-15-intel","host_platform":"darwin","host_arch":"x64"},
+            "linux-arm64":{"runner":"ubuntu-24.04-arm","host_platform":"linux","host_arch":"arm64"},
+            "linux-musl-arm64":{"runner":"ubuntu-24.04-arm","host_platform":"linux","host_arch":"arm64"},
+            "linux-musl-x64":{"runner":"ubuntu-22.04","host_platform":"linux","host_arch":"x64"},
+            "linux-x64":{"runner":"ubuntu-22.04","host_platform":"linux","host_arch":"x64"},
+            "win32-arm64":{"runner":"windows-11-arm","host_platform":"win32","host_arch":"arm64"},
+            "win32-x64":{"runner":"ubuntu-22.04","host_platform":"linux","host_arch":"x64"}
+          }'
+          matrix="$(jq -nce --argjson targets "$targets" --argjson hosts "$host_matrix" '
+            if ($hosts | keys | sort) != ($targets | sort) then error("release host map must cover exactly every signed target") else . end |
+            [ $targets[] as $target | {target: $target} + ($hosts[$target] // error("missing release host")) ] |
+            if all(.[]; ((.runner | type) == "string") and (.runner | test("^[A-Za-z0-9_.-]+$")) and ((.host_platform | type) == "string") and ((.host_arch | type) == "string")) then {include: .} else error("unsafe release host configuration") end
+          ')"
+          releases="$RUNNER_TEMP/autobot-releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases"
+          max_sequence=0
+          existing_release=""
+          while IFS=$'\t' read -r tag target_commitish; do
+            if [[ "$tag" =~ ^autobot-r([1-9][0-9]*)$ ]]; then
+              sequence="${BASH_REMATCH[1]}"
+              if [ "$sequence" -gt "$max_sequence" ]; then max_sequence="$sequence"; fi
+            else
+              continue
+            fi
+            if [ "$target_commitish" != "$fork_commit" ]; then continue; fi
+            candidate_dir="$RUNNER_TEMP/autobot-existing-$tag"
+            rm -rf "$candidate_dir"
+            if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir "$candidate_dir"; then continue; fi
+            if jq -e --arg fork "$fork_commit" --argjson targets "$targets" '
+              .forkCommit == $fork and
+              ([.assets[] | select(.kind == "runtime") | .target] | sort) == ($targets | sort) and
+              ([.assets[] | select(.kind == "bootstrap") | .target] | sort) == ($targets | sort) and
+              ([.assets[] | select(.kind == "coordinator-client")] | length) == 1 and
+              ([.assets[] | select(.kind == "collab-web")] | length) == 1
+            ' "$candidate_dir/manifest.json" >/dev/null; then
+              existing_release="$tag"
+              break
+            fi
+          done < <(jq -r 'flatten[] | select(.draft == false) | [.tag_name, .target_commitish] | @tsv' "$releases")
+          if [ -n "$existing_release" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Existing full-target AutoBot release $existing_release already covers canonical source $fork_commit"
+            exit 0
+          fi
+          if [ "$max_sequence" -ge 9007199254740991 ]; then
+            echo "::error::AutoBot release sequence exceeds JavaScript safe integer range" >&2
+            exit 1
+          fi
+          allow_initial=false
+          if [ "$INPUT_ALLOW_INITIAL" = "true" ] || [ "$CONFIG_ALLOW_INITIAL" = "enabled" ]; then allow_initial=true; fi
+          {
+            echo "should_release=true"
+            echo "matrix=$matrix"
+            echo "release_sequence=$((max_sequence + 1))"
+            echo "fork_commit=$fork_commit"
+            echo "upstream_commit=$upstream_commit"
+            echo "upstream_version=$upstream_version"
+            echo "compatibility_epoch=$compatibility_epoch"
+            echo "allow_initial=$allow_initial"
+          } >> "$GITHUB_OUTPUT"
+
+  build_target:
+    name: Build unsigned ${{ matrix.target }}
+    needs: plan
+    if: ${{ needs.plan.outputs.should_release == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Require exact untrusted target-build configuration
+        shell: bash
+        env:
+          CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+        run: |
+          set -euo pipefail
+          for required in CANONICAL_BRANCH UPSTREAM_REPOSITORY COMPILER_BUN_VERSION; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::Missing AutoBot target-build configuration: $required" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$COMPILER_BUN_VERSION" =~ ^1\.4\.[0-9]+([._+-][0-9A-Za-z._+-]+)?$ ]]; then
+            echo "::error::Target compiler must remain an exact Bun 1.4 release" >&2
+            exit 1
+          fi
+          if [[ ! "$UPSTREAM_REPOSITORY" =~ ^https:// ]] || [[ "$UPSTREAM_REPOSITORY" == *"#"* ]] || [[ "$UPSTREAM_REPOSITORY" == *"@"* ]] || [[ "$UPSTREAM_REPOSITORY" == *"?"* ]]; then
+            echo "::error::Configured upstream repository must be a credential-free HTTPS URL without query or fragment" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact canonical and upstream source ancestry
+        shell: bash
+        env:
+          CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+          UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_REPOSITORY" "$UPSTREAM_COMMIT:refs/remotes/autobot-upstream/release"
+          test "$(git rev-parse HEAD)" = "$FORK_COMMIT"
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$FORK_COMMIT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+      - name: Capture a separately provisioned exact compiler Bun
+        shell: bash
+        env:
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+          EXPECTED_HOST_PLATFORM: ${{ matrix.host_platform }}
+          EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
+        run: |
+          set -euo pipefail
+          source_bun="$(command -v bun)"
+          actual_host="$("$source_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')"
+          test "$actual_host" = "$EXPECTED_HOST_PLATFORM-$EXPECTED_HOST_ARCH"
+          test "$("$source_bun" --version)" = "$COMPILER_BUN_VERSION"
+          compiler_dir="$RUNNER_TEMP/autobot-toolchain"
+          mkdir -p "$compiler_dir"
+          compiler_bun="$compiler_dir/$(basename "$source_bun")"
+          cp "$source_bun" "$compiler_bun"
+          chmod +x "$compiler_bun"
+          test "$("$compiler_bun" --version)" = "$COMPILER_BUN_VERSION"
+          compiler_bun_sha256="$(sha256sum "$compiler_bun" | cut -d ' ' -f1)"
+          {
+            echo "AUTOBOT_COMPILER_BUN=$compiler_bun"
+            echo "AUTOBOT_COMPILER_BUN_SHA256=$compiler_bun_sha256"
+          } >> "$GITHUB_ENV"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Build fresh relay assets and signed target runtime
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXPECTED_HOST_PLATFORM: ${{ matrix.host_platform }}
+          EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
+          RELEASE_SEQUENCE: ${{ needs.plan.outputs.release_sequence }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+          UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ needs.plan.outputs.upstream_version }}
+          COMPATIBILITY_EPOCH: ${{ needs.plan.outputs.compatibility_epoch }}
+        run: |
+          set -euo pipefail
+          runner_bun="$(command -v bun)"
+          test "$("$runner_bun" --version)" = "1.3.14"
+          actual_host="$("$runner_bun" -e 'process.stdout.write(`${process.platform}-${process.arch}`)')"
+          test "$actual_host" = "$EXPECTED_HOST_PLATFORM-$EXPECTED_HOST_ARCH"
+          test -n "${AUTOBOT_COMPILER_BUN:-}"
+          for required in RELEASE_SEQUENCE FORK_COMMIT UPSTREAM_COMMIT UPSTREAM_VERSION COMPATIBILITY_EPOCH; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::Missing planned signed runtime identity field: $required" >&2
+              exit 1
+            fi
+          done
+          contract_identity="$("$runner_bun" -e 'import { AUTO_BOT_COLLAB_PROTOCOL_VERSION, AUTO_BOT_COMPATIBILITY_EPOCH, AUTO_BOT_RELEASE_SCHEMA_VERSION, AUTO_BOT_SESSION_FORMAT_VERSION } from "./packages/coding-agent/src/autobot-update/contract.ts"; process.stdout.write(JSON.stringify({schemaVersion: AUTO_BOT_RELEASE_SCHEMA_VERSION, sessionFormatVersion: AUTO_BOT_SESSION_FORMAT_VERSION, collabProtocolVersion: AUTO_BOT_COLLAB_PROTOCOL_VERSION, compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH}));')"
+          release_identity="$(jq -nce \
+            --argjson contract "$contract_identity" \
+            --argjson releaseSequence "$RELEASE_SEQUENCE" \
+            --arg upstreamVersion "$UPSTREAM_VERSION" \
+            --arg forkCommit "$FORK_COMMIT" \
+            --arg upstreamCommit "$UPSTREAM_COMMIT" \
+            --arg compatibilityEpoch "$COMPATIBILITY_EPOCH" '
+              if
+                (($releaseSequence | type) == "number") and
+                ($releaseSequence == ($releaseSequence | floor)) and
+                ($releaseSequence >= 1) and
+                ($releaseSequence <= 9007199254740991) and
+                ($contract.schemaVersion == 1) and
+                (($contract.sessionFormatVersion | type) == "number") and
+                ($contract.sessionFormatVersion >= 1) and
+                (($contract.collabProtocolVersion | type) == "number") and
+                ($contract.collabProtocolVersion >= 1) and
+                (($contract.compatibilityEpoch | tostring) == $compatibilityEpoch)
+              then
+                {schemaVersion: $contract.schemaVersion, releaseSequence: $releaseSequence, upstreamVersion: $upstreamVersion, forkCommit: $forkCommit, upstreamCommit: $upstreamCommit, sessionFormatVersion: $contract.sessionFormatVersion, collabProtocolVersion: $contract.collabProtocolVersion, compatibilityEpoch: $contract.compatibilityEpoch}
+              else
+                error("planned AutoBot runtime identity is incompatible with the checked-out contract")
+              end
+            ')"
+          test -n "$release_identity"
+          "$runner_bun" install --frozen-lockfile
+          "$runner_bun" --cwd=packages/browser-relay run build
+          test -s packages/browser-relay/dist/omp-browser-relay-extension.zip
+          test -s packages/coding-agent/src/tools/browser/relay/extension-assets/background.js.txt
+          # Target-specific release archives need their exact addon set before
+          # ci-release-build-binaries can embed it: both x64 ISA variants,
+          # musl variants, and the Windows x64 cross addon use Bazel.
+          case "$TARGET" in
+            linux-x64)
+              "$runner_bun" scripts/bazel-natives.ts linux-x64-baseline linux-x64-modern
+              ;;
+            linux-musl-x64)
+              "$runner_bun" scripts/bazel-natives.ts linux-musl-x64-baseline
+              ;;
+            linux-musl-arm64)
+              "$runner_bun" scripts/bazel-natives.ts linux-musl-arm64
+              ;;
+            win32-x64)
+              "$runner_bun" scripts/bazel-natives.ts win32-x64-baseline
+              ;;
+            *)
+              "$runner_bun" run build:native
+              ;;
+          esac
+          # The compiler itself owns Bun.build so bytecode and executable
+          # metadata come from the exact 1.4 compiler. Its generator subprocesses
+          # keep resolving `bun` from PATH to the separately pinned runner.
+          OMP_AUTOBOT_BUILD_IDENTITY="$release_identity" "$AUTOBOT_COMPILER_BUN" scripts/ci-release-build-binaries.ts --targets "$TARGET"
+          case "$TARGET" in
+            win32-x64) runtime="packages/coding-agent/binaries/omp-windows-x64.exe" ;;
+            win32-arm64) runtime="packages/coding-agent/binaries/omp-windows-arm64.exe" ;;
+            *) runtime="packages/coding-agent/binaries/omp-$TARGET" ;;
+          esac
+          test -f "$runtime"
+          smoke_home="$(mktemp -d)"
+          trap 'rm -rf "$smoke_home"' EXIT
+          runtime_identity=""
+          case "$TARGET" in
+            win32-x64)
+              # This exact Windows target is intentionally cross-compiled on Linux.
+              # Bun's target compilation validates it; no host can execute it here.
+              ;;
+            linux-musl-*)
+              binary="$(realpath "$runtime")"
+              # Bun's musl builds need the musl loader plus libstdc++/libgcc.
+              docker run --rm -v "$binary:/usr/local/bin/omp:ro" alpine:3.22 sh -ec '
+                apk add --no-cache libstdc++ libgcc >/dev/null
+                runtime_dir="$(mktemp -d)"
+                HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" omp --version
+                HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" omp --smoke-test
+              '
+              runtime_identity="$(docker run --rm -v "$binary:/usr/local/bin/omp:ro" alpine:3.22 sh -ec '
+                apk add --no-cache libstdc++ libgcc >/dev/null
+                runtime_dir="$(mktemp -d)"
+                HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" exec omp --autobot-build-identity
+              ')"
+              ;;
+            *)
+              HOME="$smoke_home" XDG_DATA_HOME="$smoke_home/xdg" "$runtime" --version
+              HOME="$smoke_home" XDG_DATA_HOME="$smoke_home/xdg" "$runtime" --smoke-test
+              runtime_identity="$(HOME="$smoke_home" XDG_DATA_HOME="$smoke_home/xdg" "$runtime" --autobot-build-identity)"
+              ;;
+          esac
+          if [ -n "$runtime_identity" ]; then
+            printf '%s' "$runtime_identity" | jq -e --argjson expected "$release_identity" '. == $expected' >/dev/null
+          fi
+          "$runner_bun" run ci:test:coding-agent:runtime
+      - name: Stage target-local unsigned release inputs
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+          UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ needs.plan.outputs.upstream_version }}
+          COMPATIBILITY_EPOCH: ${{ needs.plan.outputs.compatibility_epoch }}
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+        run: |
+          set -euo pipefail
+          runner_bun="$(command -v bun)"
+          actual_upstream_version="$(git show "$UPSTREAM_COMMIT:packages/coding-agent/package.json" | jq -er '.version | strings | select(length > 0)')"
+          test "$actual_upstream_version" = "$UPSTREAM_VERSION"
+          compatibility_epoch="$("$runner_bun" -e 'import { AUTO_BOT_COMPATIBILITY_EPOCH } from "./packages/coding-agent/src/autobot-update/contract.ts"; process.stdout.write(String(AUTO_BOT_COMPATIBILITY_EPOCH));')"
+          test "$compatibility_epoch" = "$COMPATIBILITY_EPOCH"
+          test "$("$AUTOBOT_COMPILER_BUN" --version)" = "$COMPILER_BUN_VERSION"
+          test "$(sha256sum "$AUTOBOT_COMPILER_BUN" | cut -d ' ' -f1)" = "$AUTOBOT_COMPILER_BUN_SHA256"
+          stage="$RUNNER_TEMP/autobot-release-target-$TARGET"
+          mkdir -p "$stage/runtime" "$stage/bootstrap"
+          case "$TARGET" in
+            win32-x64) extension=".exe"; runtime="packages/coding-agent/binaries/omp-windows-x64.exe" ;;
+            win32-arm64) extension=".exe"; runtime="packages/coding-agent/binaries/omp-windows-arm64.exe" ;;
+            *) extension=""; runtime="packages/coding-agent/binaries/omp-$TARGET" ;;
+          esac
+          runtime_name="omp-${TARGET}${extension}"
+          bootstrap_name="omp-bootstrap-${TARGET}${extension}"
+          cp "$runtime" "$stage/runtime/$runtime_name"
+          "$runner_bun" scripts/autobot-build-bootstrap.ts --target "$TARGET" --out "$stage/bootstrap/$bootstrap_name"
+          jq -n \
+            --arg target "$TARGET" \
+            --arg fork_commit "$FORK_COMMIT" \
+            --arg upstream_commit "$UPSTREAM_COMMIT" \
+            --arg upstream_version "$UPSTREAM_VERSION" \
+            --arg compiler_bun_version "$COMPILER_BUN_VERSION" \
+            --arg compiler_bun_sha256 "$AUTOBOT_COMPILER_BUN_SHA256" \
+            --argjson compatibility_epoch "$compatibility_epoch" \
+            '{schemaVersion:1,target:$target,forkCommit:$fork_commit,upstreamCommit:$upstream_commit,upstreamVersion:$upstream_version,compilerBunVersion:$compiler_bun_version,compilerBunSha256:$compiler_bun_sha256,compatibilityEpoch:$compatibility_epoch}' \
+            > "$stage/target-provenance.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autobot-release-target-${{ matrix.target }}
+          path: ${{ runner.temp }}/autobot-release-target-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble_unsigned:
+    name: Assemble configured full-target unsigned release
+    needs: [plan, build_target]
+    if: ${{ needs.plan.outputs.should_release == 'true' && needs.build_target.result == 'success' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.plan.outputs.fork_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: autobot-release-target-*
+          path: ${{ runner.temp }}/autobot-release-target-artifacts
+          merge-multiple: false
+      - name: Build universal collab web and combine every configured target
+        shell: bash
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          RELEASE_SEQUENCE: ${{ needs.plan.outputs.release_sequence }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+          UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ needs.plan.outputs.upstream_version }}
+          COMPATIBILITY_EPOCH: ${{ needs.plan.outputs.compatibility_epoch }}
+          COMPILER_BUN_VERSION: ${{ vars.AUTOBOT_COMPILER_BUN_VERSION }}
+          COORDINATOR_ARTIFACT_URL: ${{ vars.AUTOBOT_COORDINATOR_ARTIFACT_URL }}
+          COORDINATOR_PROVENANCE_URL: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_URL }}
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          for required in COORDINATOR_ARTIFACT_URL COORDINATOR_PROVENANCE_URL COORDINATOR_PROVENANCE_SHA256; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::Missing AutoBot universal asset configuration: $required" >&2
+              exit 1
+            fi
+          done
+          for url in "$COORDINATOR_ARTIFACT_URL" "$COORDINATOR_PROVENANCE_URL"; do
+            if [[ ! "$url" =~ ^https:// ]] || [[ "$url" == *"#"* ]] || [[ "$url" == *"@"* ]]; then
+              echo "::error::Configured universal asset URLs must be credential-free HTTPS URLs without fragments" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$COORDINATOR_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::AUTOBOT_COORDINATOR_PROVENANCE_SHA256 must be a lowercase SHA-256 pin" >&2
+            exit 1
+          fi
+          root="$RUNNER_TEMP/autobot-release-target-artifacts"
+          aggregate="$RUNNER_TEMP/autobot-release-aggregate"
+          shared="$aggregate/shared"
+          mkdir -p "$aggregate" "$shared"
+          assets="$aggregate/assets.json"
+          printf '[]\n' > "$assets"
+          bun install --frozen-lockfile
+          bun --cwd=packages/collab-web run build
+          bun --cwd=packages/collab-web test
+          client="$shared/omp-session-coordinator-extension.mjs"
+          coordinator_provenance="$shared/coordinator-source.json"
+          curl --fail --location --max-redirs 3 --proto '=https' --proto-redir '=https' --silent --show-error \
+            --output "$client" "$COORDINATOR_ARTIFACT_URL"
+          curl --fail --location --max-redirs 3 --proto '=https' --proto-redir '=https' --silent --show-error \
+            --output "$coordinator_provenance" "$COORDINATOR_PROVENANCE_URL"
+          test "$(sha256sum "$coordinator_provenance" | cut -d ' ' -f1)" = "$COORDINATOR_PROVENANCE_SHA256"
+          web_bundle_id="$(bun -e 'import { deriveManagedBundleId } from "./scripts/autobot-release-web.ts"; process.stdout.write(await deriveManagedBundleId("packages/collab-web/dist", "packages/collab-web/public"));')"
+          web="$shared/omp-collab-web-${web_bundle_id}.tar.gz"
+          bun scripts/autobot-release-web.ts \
+            --dist packages/collab-web/dist \
+            --public packages/collab-web/public \
+            --out "$web" \
+            --web-bundle-id "$web_bundle_id" \
+            --fork-commit "$FORK_COMMIT" \
+            --upstream-commit "$UPSTREAM_COMMIT" \
+            --upstream-version "$UPSTREAM_VERSION"
+          targets="$(printf '%s' "$MATRIX" | jq -ce '.include | map(.target)')"
+          for target in $(printf '%s' "$targets" | jq -r '.[]'); do
+            artifact="$root/autobot-release-target-$target"
+            provenance="$artifact/target-provenance.json"
+            if [ ! -f "$provenance" ]; then
+              echo "::error::Missing unsigned artifact for configured target $target" >&2
+              exit 1
+            fi
+            jq -e --arg target "$target" --arg fork "$FORK_COMMIT" --arg upstream "$UPSTREAM_COMMIT" --arg version "$UPSTREAM_VERSION" --arg compiler_bun_version "$COMPILER_BUN_VERSION" --argjson epoch "$COMPATIBILITY_EPOCH" '
+              .schemaVersion == 1 and .target == $target and .forkCommit == $fork and .upstreamCommit == $upstream and .upstreamVersion == $version and .compilerBunVersion == $compiler_bun_version and (.compilerBunSha256 | test("^[0-9a-f]{64}$")) and .compatibilityEpoch == $epoch
+            ' "$provenance" >/dev/null
+            if [[ "$target" == win32-* ]]; then extension=".exe"; else extension=""; fi
+            runtime="$artifact/runtime/omp-${target}${extension}"
+            bootstrap="$artifact/bootstrap/omp-bootstrap-${target}${extension}"
+            for required in "$runtime" "$bootstrap"; do test -f "$required"; done
+            jq --arg target "$target" --arg runtime "$runtime" --arg bootstrap "$bootstrap" --arg base "https://github.com/${GITHUB_REPOSITORY}/releases/download/autobot-r${RELEASE_SEQUENCE}" '
+              . + [
+                {kind:"runtime",target:$target,source:$runtime,url:($base + "/" + ($runtime | split("/") | last))},
+                {kind:"bootstrap",target:$target,source:$bootstrap,url:($base + "/" + ($bootstrap | split("/") | last))}
+              ]
+            ' "$assets" > "$assets.next"
+            mv "$assets.next" "$assets"
+          done
+          for required in "$client" "$web" "$coordinator_provenance"; do test -f "$required"; done
+          jq --arg client "$client" --arg web "$web" --arg base "https://github.com/${GITHUB_REPOSITORY}/releases/download/autobot-r${RELEASE_SEQUENCE}" '
+            . + [
+              {kind:"coordinator-client",target:"universal",source:$client,url:($base + "/" + ($client | split("/") | last))},
+              {kind:"collab-web",target:"web",source:$web,url:($base + "/" + ($web | split("/") | last))}
+            ]
+          ' "$assets" > "$assets.next"
+          mv "$assets.next" "$assets"
+          bun scripts/autobot-release-assemble.ts \
+            --out "$aggregate/bundle" \
+            --assets "$assets" \
+            --coordinator-source "$coordinator_provenance" \
+            --coordinator-source-sha256 "$COORDINATOR_PROVENANCE_SHA256" \
+            --release-sequence "$RELEASE_SEQUENCE" \
+            --upstream-version "$UPSTREAM_VERSION" \
+            --fork-commit "$FORK_COMMIT" \
+            --upstream-commit "$UPSTREAM_COMMIT" \
+            --web-bundle-id "$web_bundle_id"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autobot-unsigned-release-inputs
+          path: ${{ runner.temp }}/autobot-release-aggregate/bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  sign_and_promote:
+    name: Sign trusted producer output, publish assets, then advance channel
+    needs: [plan, assemble_unsigned]
+    if: ${{ needs.plan.outputs.should_release == 'true' && needs.assemble_unsigned.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: autobot-release-promotion
+    permissions:
+      contents: write
+    steps:
+      - name: Require protected producer policy and signing configuration
+        shell: bash
+        env:
+          PRODUCER_REF: ${{ vars.AUTOBOT_PRODUCER_REF }}
+          CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          CHANNEL_ENVELOPE_URL: ${{ vars.AUTOBOT_CHANNEL_ENVELOPE_URL }}
+          CHANNEL_REPOSITORY: ${{ vars.AUTOBOT_CHANNEL_REPOSITORY }}
+          CHANNEL_BRANCH: ${{ vars.AUTOBOT_CHANNEL_BRANCH }}
+          CHANNEL_PATH: ${{ vars.AUTOBOT_CHANNEL_PATH }}
+          TRUSTED_KEY_ID: ${{ vars.AUTOBOT_RELEASE_TRUSTED_KEY_ID }}
+          TRUSTED_KEY_BASE64: ${{ vars.AUTOBOT_RELEASE_TRUSTED_KEY_BASE64 }}
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+          SIGNING_KEY_BASE64: ${{ secrets.AUTOBOT_RELEASE_SIGNING_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          for required in PRODUCER_REF CANONICAL_BRANCH UPSTREAM_REPOSITORY CHANNEL_ENVELOPE_URL CHANNEL_REPOSITORY CHANNEL_BRANCH CHANNEL_PATH TRUSTED_KEY_ID TRUSTED_KEY_BASE64 COORDINATOR_PROVENANCE_SHA256 SIGNING_KEY_BASE64; do
+            if [ -z "${!required:-}" ]; then
+              echo "::error::Missing trusted AutoBot promotion configuration: $required" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$PRODUCER_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$CANONICAL_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$CHANNEL_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$CHANNEL_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$CHANNEL_PATH" =~ ^([A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$PRODUCER_REF" == *".."* || "$PRODUCER_REF" == */ || "$PRODUCER_REF" == *"//"* || "$CANONICAL_BRANCH" == *".."* || "$CANONICAL_BRANCH" == */ || "$CANONICAL_BRANCH" == *"//"* || "$CHANNEL_BRANCH" == *".."* || "$CHANNEL_BRANCH" == */ || "$CHANNEL_BRANCH" == *"//"* ]]; then
+            echo "::error::Configured producer or channel location is unsafe" >&2
+            exit 1
+          fi
+          for url in "$UPSTREAM_REPOSITORY" "$CHANNEL_ENVELOPE_URL"; do
+            if [[ ! "$url" =~ ^https:// ]] || [[ "$url" == *"#"* ]] || [[ "$url" == *"@"* ]] || [[ "$url" == *"?"* ]]; then
+              echo "::error::Trusted promotion URLs must be credential-free HTTPS URLs without query or fragment" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$COORDINATOR_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::AUTOBOT_COORDINATOR_PROVENANCE_SHA256 must be a lowercase SHA-256 pin" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require workflow producer revision to remain on configured protected producer ref
+        shell: bash
+        env:
+          PRODUCER_REF: ${{ vars.AUTOBOT_PRODUCER_REF }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$WORKFLOW_SHA...$PRODUCER_REF" --jq '.status')"
+          if [ "$status" != "ahead" ] && [ "$status" != "identical" ]; then
+            echo "::error::Trusted workflow producer revision is no longer reachable from $PRODUCER_REF" >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: autobot-unsigned-release-inputs
+          path: ${{ runner.temp }}/autobot-release-inputs
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.plan.outputs.fork_commit }}
+          path: autobot-release-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify candidate source by git metadata only
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANONICAL_BRANCH: ${{ vars.AUTOBOT_CANONICAL_BRANCH }}
+          UPSTREAM_REPOSITORY: ${{ vars.AUTOBOT_UPSTREAM_REPOSITORY }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+          UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          candidate="$GITHUB_WORKSPACE/autobot-release-source"
+          canonical_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CANONICAL_BRANCH" --jq '.object.sha')"
+          test "$canonical_commit" = "$FORK_COMMIT"
+          test "$(git -C "$candidate" rev-parse HEAD)" = "$FORK_COMMIT"
+          git -C "$candidate" fetch --no-tags "$UPSTREAM_REPOSITORY" "$UPSTREAM_COMMIT"
+          git -C "$candidate" merge-base --is-ancestor "$UPSTREAM_COMMIT" "$FORK_COMMIT"
+      - name: Sign only with trusted producer scripts after a verified predecessor
+        shell: bash
+        env:
+          CHANNEL_ENVELOPE_URL: ${{ vars.AUTOBOT_CHANNEL_ENVELOPE_URL }}
+          TRUSTED_KEY_ID: ${{ vars.AUTOBOT_RELEASE_TRUSTED_KEY_ID }}
+          TRUSTED_KEY_BASE64: ${{ vars.AUTOBOT_RELEASE_TRUSTED_KEY_BASE64 }}
+          SIGNING_KEY_BASE64: ${{ secrets.AUTOBOT_RELEASE_SIGNING_KEY_BASE64 }}
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+          ALLOW_INITIAL: ${{ needs.plan.outputs.allow_initial }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/autobot-release-inputs"
+          keys="$RUNNER_TEMP/autobot-release-keys"
+          mkdir -p "$keys"
+          umask 077
+          printf '%s' "$TRUSTED_KEY_BASE64" | base64 --decode > "$keys/trusted-public.der"
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 --decode > "$keys/signing-private.der"
+          trap 'rm -f "$keys/signing-private.der"' EXIT
+          prior="$RUNNER_TEMP/previous-channel-envelope.json"
+          sign_args=(
+            --manifest "$bundle/manifest.json"
+            --asset-index "$bundle/asset-index.json"
+            --out "$bundle/signed-envelope.json"
+            --key-id "$TRUSTED_KEY_ID"
+            --private-key "$keys/signing-private.der"
+            --trusted-key "$TRUSTED_KEY_ID=$keys/trusted-public.der"
+            --coordinator-source "$bundle/coordinator-source.json"
+            --coordinator-source-sha256 "$COORDINATOR_PROVENANCE_SHA256"
+          )
+          if curl --fail --location --max-redirs 3 --proto '=https' --proto-redir '=https' --silent --show-error --output "$prior" "$CHANNEL_ENVELOPE_URL"; then
+            sign_args+=(--previous-envelope "$prior")
+          elif [ "$ALLOW_INITIAL" = "true" ]; then
+            sign_args+=(--allow-initial)
+          else
+            echo "::error::A prior signed channel envelope is required; initial promotion remains explicitly reviewed" >&2
+            exit 1
+          fi
+          bun scripts/autobot-release-sign.ts "${sign_args[@]}"
+          bun scripts/autobot-release-verify.ts \
+            --envelope "$bundle/signed-envelope.json" \
+            --asset-index "$bundle/asset-index.json" \
+            --provenance "$bundle/provenance.json" \
+            --coordinator-source "$bundle/coordinator-source.json" \
+            --coordinator-source-sha256 "$COORDINATOR_PROVENANCE_SHA256" \
+            --trusted-key "$TRUSTED_KEY_ID=$keys/trusted-public.der" \
+            --source-root "$GITHUB_WORKSPACE/autobot-release-source"
+          rm -f "$keys/signing-private.der"
+      - name: Publish verified release assets before exposing the channel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ needs.plan.outputs.release_sequence }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/autobot-release-inputs"
+          tag="autobot-r${RELEASE_SEQUENCE}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$FORK_COMMIT" --draft --title "AutoBot runtime ${RELEASE_SEQUENCE}" --notes "Signed AutoBot runtime release. Channel promotion is the final separate step."
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$bundle"/assets/* "$bundle/manifest.json" "$bundle/asset-index.json" "$bundle/provenance.json" "$bundle/coordinator-source.json" "$bundle/signed-envelope.json"
+      - name: Verify downloaded published bytes with trusted producer scripts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ needs.plan.outputs.release_sequence }}
+          FORK_COMMIT: ${{ needs.plan.outputs.fork_commit }}
+          TRUSTED_KEY_ID: ${{ vars.AUTOBOT_RELEASE_TRUSTED_KEY_ID }}
+          TRUSTED_KEY_BASE64: ${{ vars.AUTOBOT_RELEASE_TRUSTED_KEY_BASE64 }}
+          COORDINATOR_PROVENANCE_SHA256: ${{ vars.AUTOBOT_COORDINATOR_PROVENANCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          tag="autobot-r${RELEASE_SEQUENCE}"
+          bundle="$RUNNER_TEMP/autobot-release-inputs"
+          published="$RUNNER_TEMP/autobot-published-release"
+          keys="$RUNNER_TEMP/autobot-release-keys"
+          mkdir -p "$published/assets" "$keys"
+          umask 077
+          printf '%s' "$TRUSTED_KEY_BASE64" | base64 --decode > "$keys/trusted-public.der"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$published" --pattern "*"
+          test -f "$published/coordinator-source.json"
+          test "$(sha256sum "$published/coordinator-source.json" | cut -d ' ' -f1)" = "$COORDINATOR_PROVENANCE_SHA256"
+          test "$(jq -r '.coordinatorSourceSha256' "$published/provenance.json")" = "$COORDINATOR_PROVENANCE_SHA256"
+          while IFS= read -r file; do
+            case "$file" in assets/[A-Za-z0-9][A-Za-z0-9._-]*) ;; *) echo "::error::Unsafe verified asset index path: $file" >&2; exit 1 ;; esac
+            base="${file#assets/}"
+            test -f "$published/$base"
+            mv "$published/$base" "$published/$file"
+          done < <(jq -r '.assets[].file' "$published/asset-index.json")
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
+          tag_type="$(printf '%s' "$tag_ref" | jq -er '.object.type')"
+          tag_sha="$(printf '%s' "$tag_ref" | jq -er '.object.sha')"
+          case "$tag_type" in
+            commit) tagged_commit="$tag_sha" ;;
+            tag) tagged_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object | select(.type == "commit") | .sha')" ;;
+            *) echo "::error::Published release tag does not resolve to a commit" >&2; exit 1 ;;
+          esac
+          test "$tagged_commit" = "$FORK_COMMIT"
+          bun scripts/autobot-release-verify.ts \
+            --envelope "$published/signed-envelope.json" \
+            --asset-index "$published/asset-index.json" \
+            --provenance "$published/provenance.json" \
+            --coordinator-source "$published/coordinator-source.json" \
+            --coordinator-source-sha256 "$COORDINATOR_PROVENANCE_SHA256" \
+            --trusted-key "$TRUSTED_KEY_ID=$keys/trusted-public.der" \
+            --source-root "$GITHUB_WORKSPACE/autobot-release-source"
+      - name: Publish the verified draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ needs.plan.outputs.release_sequence }}
+        run: |
+          set -euo pipefail
+          gh release edit "autobot-r${RELEASE_SEQUENCE}" --repo "$GITHUB_REPOSITORY" --draft=false
+      - name: Advance only the configured signed channel last
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL_REPOSITORY: ${{ vars.AUTOBOT_CHANNEL_REPOSITORY }}
+          CHANNEL_BRANCH: ${{ vars.AUTOBOT_CHANNEL_BRANCH }}
+          CHANNEL_PATH: ${{ vars.AUTOBOT_CHANNEL_PATH }}
+        run: |
+          set -euo pipefail
+          channel_root="$RUNNER_TEMP/autobot-channel"
+          source_envelope="$RUNNER_TEMP/autobot-release-inputs/signed-envelope.json"
+          gh auth setup-git
+          git clone --depth=1 --branch "$CHANNEL_BRANCH" "https://github.com/$CHANNEL_REPOSITORY.git" "$channel_root"
+          destination="$channel_root/$CHANNEL_PATH"
+          mkdir -p "$(dirname "$destination")"
+          cp "$source_envelope" "$destination"
+          git -C "$channel_root" add -- "$CHANNEL_PATH"
+          if git -C "$channel_root" diff --cached --quiet; then
+            echo "::error::Configured channel already contains this envelope; refusing an ambiguous promotion" >&2
+            exit 1
+          fi
+          git -C "$channel_root" -c user.name=autobot-release -c user.email=autobot-release@invalid commit -m "chore(autobot): promote signed release"
+          git -C "$channel_root" push origin "HEAD:refs/heads/$CHANNEL_BRANCH"

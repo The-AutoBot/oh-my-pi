@@ -2,7 +2,7 @@
 
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { compileCodingAgent } from "./compile-binary";
+import { compileCodingAgent, parseAutoBotBuildIdentity } from "./compile-binary";
 
 const packageDir = path.join(import.meta.dir, "..");
 const repoRoot = path.join(packageDir, "..", "..");
@@ -75,6 +75,7 @@ async function runCommand(
 
 async function main(): Promise<void> {
 	const crossBuild = resolveCrossBuild(Bun.env.CROSS_TARGET);
+	const autoBotBuildIdentity = parseAutoBotBuildIdentity(Bun.env.OMP_AUTOBOT_BUILD_IDENTITY);
 	const shouldAdhocSign = process.platform === "darwin" && !crossBuild && Bun.env.BUN_NO_CODESIGN_MACHO_BINARY !== "1";
 	const outName = crossBuild ? `omp-${crossBuild.id}` : "omp";
 	const outputPath = path.join(packageDir, "dist", outName);
@@ -97,6 +98,7 @@ async function main(): Promise<void> {
 				entrypoint: path.join(packageDir, "src", "cli.ts"),
 				outfile: outputPath,
 				transformersVersion,
+				autoBotBuildIdentity,
 				target: crossBuild?.target,
 				executablePath: Bun.env.BUN_COMPILE_EXECUTABLE_PATH || undefined,
 				skipBuiltinCodesign: shouldAdhocSign,

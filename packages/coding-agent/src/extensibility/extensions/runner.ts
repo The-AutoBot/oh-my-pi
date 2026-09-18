@@ -18,6 +18,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { AutoBotCoordinatorService } from "../../autobot-runtime";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
@@ -462,6 +463,7 @@ export class ExtensionRunner {
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#ensureCollabFn: (options?: EnsureCollabOptions) => Promise<EnsureCollabResult> = throwCollabNonInteractive;
+	#setAutoBotUpdateCoordinator: (service: AutoBotCoordinatorService | undefined) => void = () => {};
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
@@ -711,6 +713,7 @@ export class ExtensionRunner {
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#ensureCollabFn = contextActions.ensureCollab ?? throwCollabNonInteractive;
+		this.#setAutoBotUpdateCoordinator = contextActions.setAutoBotUpdateCoordinator ?? (() => {});
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -1214,6 +1217,7 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			ensureCollab: options => this.#ensureCollabFn(options),
+			setAutoBotUpdateCoordinator: service => this.#setAutoBotUpdateCoordinator(service),
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
 			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),

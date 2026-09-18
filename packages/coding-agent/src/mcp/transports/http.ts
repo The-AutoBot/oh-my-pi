@@ -180,6 +180,11 @@ export class HttpTransport implements MCPTransport {
 		return this.#connected;
 	}
 
+	/** A streamable-HTTP server session cannot be recreated losslessly mid-run. */
+	get hasStatefulSession(): boolean {
+		return this.#sessionId !== null;
+	}
+
 	get url(): string {
 		return this.config.url;
 	}

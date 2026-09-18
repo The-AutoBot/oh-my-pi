@@ -570,6 +570,11 @@ export class StdioTransport implements MCPTransport {
 		return this.#connected;
 	}
 
+	/** A live stdio process is stateful until it exits. */
+	get hasStatefulSession(): boolean {
+		return this.#connected;
+	}
+
 	/**
 	 * Start the subprocess and begin reading.
 	 */

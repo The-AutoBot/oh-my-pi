@@ -80,6 +80,11 @@ export class LegacySseTransport implements MCPTransport {
 		return this.#connected;
 	}
 
+	/** Legacy SSE uses one server-side endpoint/session for the live event stream. */
+	get hasStatefulSession(): boolean {
+		return this.#endpointUrl !== null;
+	}
+
 	get url(): string {
 		return this.#config.url;
 	}

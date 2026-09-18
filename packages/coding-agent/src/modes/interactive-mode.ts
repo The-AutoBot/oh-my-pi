@@ -108,7 +108,8 @@ import guidedGoalInterviewPrompt from "../prompts/goals/guided-goal-interview.md
 import planFilenamePrompt from "../prompts/system/plan-filename.md" with { type: "text" };
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
-import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentLifecycleManager, type AutoBotUpdateLifecycleBarrier } from "../registry/agent-lifecycle";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -698,6 +699,20 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 	];
 }
 
+export interface AutoBotUpdateAdmission {
+	readonly sessionFile: string;
+	readonly sessionId: string;
+	readonly cwd: string;
+}
+
+interface AutoBotUpdateAdmissionState extends AutoBotUpdateAdmission {
+	readonly session: AgentSession;
+	readonly sessionManager: SessionManager;
+	readonly inputEpoch: number;
+	readonly submitWasDisabled: boolean;
+	readonly lifecycleBarrier: AutoBotUpdateLifecycleBarrier;
+}
+
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
 export class InteractiveMode implements InteractiveModeContext {
@@ -841,6 +856,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	#pendingSubmissionDispose: (() => void) | undefined;
 	#pendingSubmissionPreservesDraft = false;
 	#optimisticUserMessageComponents: Component[] = [];
+	/** Monotonic keystroke fence for a reversible AutoBot update admission. */
+	#autoBotUpdateInputEpoch = 0;
+	#autoBotUpdateAdmission: AutoBotUpdateAdmissionState | undefined;
+	#sealedAutoBotUpdateAdmission: AutoBotUpdateAdmissionState | undefined;
+	#autoBotUpdateExitRequested: AutoBotUpdateAdmissionState | undefined;
+	#autoBotProtectedStartupControlsHeld = false;
+	#autoBotProtectedStartupExitRequested = false;
+	#autoBotProtectedStartupExitWake: PromiseWithResolvers<void> | undefined;
+	#autoBotInputFenceUnsubscribe: (() => void) | undefined;
 	#optimisticSkillMessageComponents: Component[] = [];
 	/** True while an optimistically-rendered `/skill:` row awaits its canonical
 	 *  `message_start`. Read by the event controller to reconcile the row. */
@@ -927,7 +951,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const previousHost = this.#lastCollabHost;
 		if (previousHost && !previousHost.stopped && previousHost.sessionId !== this.sessionManager.getSessionId()) {
-			await previousHost.waitForReady();
+			// Preserve the typed session-boundary result for this caller, but do
+			// not let the next caller race an ending host from the old session.
+			await previousHost.stop("session switched", "session-switch");
 			throw new CollabUnavailableError("session-changed");
 		}
 		let ensured: CollabEnsureResult;
@@ -939,15 +965,36 @@ export class InteractiveMode implements InteractiveModeContext {
 			});
 		} catch (error) {
 			if (this.sessionManager.getSessionId() !== requestedSessionId) {
+				await this.collabController.idle();
 				throw new CollabUnavailableError("session-changed");
 			}
-			if (error instanceof CollabHostStoppedError) throw new CollabUnavailableError("stopped");
+			if (error instanceof CollabHostStoppedError) {
+				// A handler can stop or rotate the host before startup returns. The
+				// controller's operation chain owns that teardown; await it so a
+				// later ensure can start a replacement rather than see an ending host.
+				await this.collabController.idle();
+				throw new CollabUnavailableError("stopped");
+			}
 			throw error;
 		}
 		const { host, reused } = ensured;
-		await host.waitForReady();
+		try {
+			await host.waitForReady();
+		} catch (error) {
+			if (this.sessionManager.getSessionId() !== requestedSessionId) {
+				await host.stop("session switched", "session-switch");
+				await this.collabController.idle();
+				throw new CollabUnavailableError("session-changed");
+			}
+			throw error;
+		}
 		if (this.collabHost !== host || host.sessionId !== this.sessionManager.getSessionId()) {
-			throw new CollabUnavailableError(host.sessionId === this.sessionManager.getSessionId() ? "stopped" : "session-changed");
+			const currentSessionId = this.sessionManager.getSessionId();
+			if (host.sessionId !== currentSessionId) {
+				await host.stop("session switched", "session-switch");
+				await this.collabController.idle();
+			}
+			throw new CollabUnavailableError(host.sessionId === currentSessionId ? "stopped" : "session-changed");
 		}
 		return Object.freeze({
 			link: host.link,
@@ -1065,8 +1112,232 @@ export class InteractiveMode implements InteractiveModeContext {
 	unfocusSession(): Promise<void> {
 		return this.#focusController.unfocus();
 	}
+	/**
+	 * Records an explicit local exit without allowing it to race a protected
+	 * startup or a reversible update admission. The owner finishes its
+	 * authenticated cancellation, then calls the matching completion method
+	 * below to perform ordinary shutdown.
+	 */
+	#requestAutoBotProtectedExit(): boolean {
+		if (this.#autoBotProtectedStartupControlsHeld) {
+			if (!this.#autoBotProtectedStartupExitRequested) {
+				this.#autoBotProtectedStartupExitRequested = true;
+				const wake = this.#autoBotProtectedStartupExitWake;
+				this.#autoBotProtectedStartupExitWake = undefined;
+				wake?.resolve();
+			}
+			return true;
+		}
+		const admission = this.#autoBotUpdateAdmission;
+		if (!admission) return false;
+		this.#autoBotUpdateExitRequested = admission;
+		return true;
+	}
+
+	/** Whether a protected candidate or fallback startup must abandon activation for an explicit user exit. */
+	isAutoBotProtectedStartupExitRequested(): boolean {
+		return this.#autoBotProtectedStartupExitRequested;
+	}
+
+	/** Resolves once a user requests an explicit exit during protected startup. */
+	waitForAutoBotProtectedStartupExit(): Promise<void> {
+		if (this.#autoBotProtectedStartupExitRequested) return Promise.resolve();
+		return (this.#autoBotProtectedStartupExitWake ??= Promise.withResolvers<void>()).promise;
+	}
+
+	/** Releases the protected-startup control fence only when no exit was requested. */
+	releaseAutoBotProtectedStartupControls(): boolean {
+		if (!this.#autoBotProtectedStartupControlsHeld || this.#autoBotProtectedStartupExitRequested) return false;
+		this.#autoBotProtectedStartupControlsHeld = false;
+		return true;
+	}
+
+	/**
+	 * Completes a protected-startup user exit after its owner has durably
+	 * signaled the launcher. Draft text stays in the editor until normal
+	 * shutdown snapshots it.
+	 */
+	async completeAutoBotProtectedStartupExit(): Promise<boolean> {
+		if (!this.#autoBotProtectedStartupControlsHeld || !this.#autoBotProtectedStartupExitRequested) return false;
+		this.#autoBotProtectedStartupControlsHeld = false;
+		this.#autoBotProtectedStartupExitRequested = false;
+		this.#autoBotProtectedStartupExitWake = undefined;
+		await this.shutdown();
+		return true;
+	}
+
+	/** Whether an explicit user exit interrupted this exact update admission. */
+	isAutoBotUpdateExitRequested(admission: AutoBotUpdateAdmission): boolean {
+		return this.#autoBotUpdateExitRequested === admission;
+	}
+
+	/**
+	 * Releases an interrupted update admission and exits normally. This is used
+	 * only after its runtime owner cancels every still-reversible remote claim.
+	 */
+	async completeAutoBotUpdateExit(admission: AutoBotUpdateAdmission): Promise<boolean> {
+		if (this.#autoBotUpdateExitRequested !== admission) return false;
+		const current = this.#autoBotUpdateAdmission;
+		if (current === admission) {
+			this.#sealedAutoBotUpdateAdmission = undefined;
+			current.lifecycleBarrier.release();
+			this.#autoBotUpdateAdmission = undefined;
+			this.editor.disableSubmit = current.submitWasDisabled;
+		}
+		this.#autoBotUpdateExitRequested = undefined;
+		await this.shutdown();
+		return true;
+	}
+
 	invalidatePendingFocus(): void {
 		this.#focusController.invalidatePendingFocus();
+	}
+
+	/**
+	 * Reports why this exact interactive surface cannot be frozen for a
+	 * process-replacement handoff. The check is deliberately stricter than a
+	 * quiet prompt: any in-memory work, transient UI, or live non-main agent
+	 * keeps the current process authoritative.
+	 */
+	getAutoBotUpdateDeferralReason(): string | undefined {
+		if (!this.isInitialized || this.#isShuttingDown || this.shutdownRequested) return "interactive teardown is active";
+		if (this.#autoBotUpdateExitRequested !== undefined) return "an explicit user exit is pending";
+		if (this.ui.hasOverlay()) return "a modal interface is open";
+		if (this.#focusController.isTransitioning || this.focusedAgentId !== undefined) return "session focus is changing";
+		if (this.#inputController.isExternalEditorActive) return "an external editor owns the draft";
+		if (
+			this.editor.getText().length > 0 ||
+			this.editor.pendingImages.length > 0 ||
+			this.editor.pendingImageLinks.length > 0 ||
+			this.editor.pendingTexts.length > 0
+		) {
+			return "the composer has an unsent draft or attachment";
+		}
+		if (this.#pendingSubmittedInput !== undefined) return "a submitted prompt is still pending";
+		if (this.session.hasPendingAutoBotUpdateWork()) return "session work is still active";
+		if (this.compactionQueuedMessages.length > 0) return "compaction has queued messages";
+		if (
+			this.loopModeEnabled ||
+			this.#loopAutoSubmitTimer !== undefined ||
+			this.#loopConditionAbort !== undefined ||
+			this.planModeEnabled ||
+			this.goalModeEnabled ||
+			this.vibeModeEnabled ||
+			this.#goalContinuationTimer !== undefined ||
+			this.#pendingGoalContinuationTurns > 0 ||
+			this.#vibeSkillInFlight > 0 ||
+			this.#vibeScopeSuspendedForSwitch ||
+			this.#pendingModelSwitch !== undefined ||
+			this.#planReviewOverlay !== undefined ||
+			this.#planReviewOverlayHandle !== undefined
+		) {
+			return "an automatic mode or session transition is active";
+		}
+		if (
+			this.#btwController.hasActiveRequest() ||
+			this.#omfgController.hasActiveRequest() ||
+			this.#cleanseController.hasActiveRun() ||
+			this.liveActive ||
+			(this.#sttController !== undefined && this.#sttController.state !== "idle")
+		) {
+			return "an interactive side request is active";
+		}
+		if (AgentRegistry.global().list().some(ref => ref.id !== MAIN_AGENT_ID && ref.session !== null)) {
+			return "a non-main agent still has a live session";
+		}
+		if (AgentLifecycleManager.global().hasPendingAgentTransition()) {
+			return "an agent lifecycle transition is active";
+		}
+		return undefined;
+	}
+
+	/**
+	 * Starts a reversible, keystroke-fenced handoff admission. The caller must
+	 * revalidate the returned identity after every await and cancel it on any
+	 * failed pre-activation preparation.
+	 */
+	beginAutoBotUpdateAdmission(): AutoBotUpdateAdmission | undefined {
+		if (this.#autoBotUpdateAdmission !== undefined) return undefined;
+		const reason = this.getAutoBotUpdateDeferralReason();
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (reason !== undefined || !sessionFile) return undefined;
+		const lifecycleBarrier = AgentLifecycleManager.global().beginAutoBotUpdateBarrier();
+		if (!lifecycleBarrier) return undefined;
+
+		const admission: AutoBotUpdateAdmissionState = Object.freeze({
+			session: this.session,
+			sessionManager: this.sessionManager,
+			sessionFile,
+			sessionId: this.sessionManager.getSessionId(),
+			cwd: this.sessionManager.getCwd(),
+			inputEpoch: this.#autoBotUpdateInputEpoch,
+			submitWasDisabled: this.editor.disableSubmit,
+			lifecycleBarrier,
+		});
+		this.#autoBotUpdateAdmission = admission;
+		this.#sealedAutoBotUpdateAdmission = undefined;
+		this.#autoBotUpdateExitRequested = undefined;
+		this.editor.disableSubmit = true;
+		return admission;
+	}
+
+	/** Whether a handoff admission still refers to the unchanged, idle session. */
+	isAutoBotUpdateAdmissionValid(admission: AutoBotUpdateAdmission): boolean {
+		const current = this.#autoBotUpdateAdmission;
+		return (
+			current === admission &&
+			this.#autoBotUpdateExitRequested !== current &&
+			current.session === this.session &&
+			current.sessionManager === this.sessionManager &&
+			current.inputEpoch === this.#autoBotUpdateInputEpoch &&
+			current.sessionFile === this.sessionManager.getSessionFile() &&
+			current.sessionId === this.sessionManager.getSessionId() &&
+			current.cwd === this.sessionManager.getCwd() &&
+			this.getAutoBotUpdateDeferralReason() === undefined &&
+			current.lifecycleBarrier.isQuiescent()
+		);
+	}
+
+	/** Cancels a reversible handoff admission and restores the prior submit gate. */
+	cancelAutoBotUpdateAdmission(admission: AutoBotUpdateAdmission): void {
+		const current = this.#autoBotUpdateAdmission;
+		if (current !== admission) return;
+		this.#sealedAutoBotUpdateAdmission = undefined;
+		current.lifecycleBarrier.release();
+		this.#autoBotUpdateAdmission = undefined;
+		this.editor.disableSubmit = current.submitWasDisabled;
+	}
+
+	/**
+	 * Synchronously seals an unchanged admission immediately before an
+	 * irreversible external shutdown. Explicit exit is held as an intent until
+	 * the runtime cancels its reservation or completes ordinary shutdown.
+	 */
+	sealAutoBotUpdateAdmission(admission: AutoBotUpdateAdmission): boolean {
+		if (!this.isAutoBotUpdateAdmissionValid(admission)) return false;
+		this.#sealedAutoBotUpdateAdmission = this.#autoBotUpdateAdmission;
+		return true;
+	}
+
+	/**
+	 * Performs the final synchronous local shutdown without draining stdin.
+	 * It requires the immediately preceding seal so ordinary exit cannot race
+	 * the external handoff. Typed draft input remains buffered for persistence.
+	 */
+	stopForAutoBotUpdate(admission: AutoBotUpdateAdmission): boolean {
+		const current = this.#autoBotUpdateAdmission;
+		if (
+			current !== admission ||
+			this.#sealedAutoBotUpdateAdmission !== admission ||
+			this.#autoBotUpdateExitRequested === admission
+		) {
+			return false;
+		}
+		this.stop();
+		this.#sealedAutoBotUpdateAdmission = undefined;
+		this.#autoBotUpdateAdmission = undefined;
+		current.lifecycleBarrier.release();
+		return true;
 	}
 	/**
 	 * Whether inline mouse capture is opted in. Never throws: the render hot
@@ -1457,6 +1728,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
 		if (this.isInitialized) return;
+		this.#autoBotProtectedStartupControlsHeld = options.holdControls === true;
+		if (this.#autoBotProtectedStartupControlsHeld) {
+			this.collabController.deferHostCreationUntilStartupComplete();
+		}
 
 		this.keybindings = logger.time("InteractiveMode.init:keybindings", () => KeybindingsManager.create());
 
@@ -1574,6 +1849,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		]);
 		this.ui.setFocus(this.editor);
 		this.syncComposerShape();
+
+		this.#autoBotInputFenceUnsubscribe ??= this.ui.addInputListener(data => {
+			const admission = this.#autoBotUpdateAdmission;
+			if (admission !== undefined) this.#autoBotUpdateInputEpoch++;
+			if (!this.#autoBotProtectedStartupControlsHeld && admission === undefined) return undefined;
+			// Preserve every typed draft byte while a protected startup/update is
+			// pending. Ctrl+D keeps the editor's normal forward-delete/empty-exit
+			// behavior; its eventual shutdown is recorded above rather than raced.
+			if (this.keybindings.matches(data, "app.exit")) return undefined;
+			this.editor.handleDraftEdit(data);
+			return { consume: true };
+		});
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -1811,7 +2098,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// initial CLI prompt and a user submission both flow with
 		// `streamingBehavior: "steer"`, so whichever lands second queues into the
 		// other's turn instead of dying.
-		this.editor.disableSubmit = false;
+		this.editor.disableSubmit = options.holdSubmit === true;
 	}
 
 	/** Reload the title-generation system prompt override for the provided working
@@ -5486,6 +5773,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	stop(): void {
 		this.#appearanceRefreshRequest = undefined;
+		this.#autoBotInputFenceUnsubscribe?.();
+		this.#autoBotInputFenceUnsubscribe = undefined;
 		// Last chance to refresh the startup status placeholder for the next launch.
 		this.#persistComposerStatus();
 		if (this.loadingAnimation) {
@@ -5539,6 +5828,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async shutdown(): Promise<void> {
+		if (this.#requestAutoBotProtectedExit()) return;
 		if (this.#isShuttingDown) return;
 		// The previous graceful teardown failed AT the memoized session.dispose()
 		// (the session is already disposing), so it re-rejects identically forever
@@ -5602,6 +5892,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * spawning the replacement and lingering only to forward its exit code.
 	 */
 	async restart(): Promise<void> {
+		if (this.#requestAutoBotProtectedExit()) return;
 		if (this.#isShuttingDown) return;
 		this.#isShuttingDown = true;
 		try {
@@ -5700,6 +5991,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	requestShutdown(): void {
+		if (this.#requestAutoBotProtectedExit()) return;
 		this.shutdownRequested = true;
 		// Background extensions do not submit terminal input. Start the same
 		// settled-boundary check without waiting for another user keystroke.
@@ -5714,6 +6006,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async checkShutdownRequested(): Promise<void> {
+		if (this.#autoBotProtectedStartupControlsHeld || this.#autoBotUpdateAdmission !== undefined) return;
 		if (!this.shutdownRequested || this.isShuttingDown) return;
 		// Quiesce in a loop: an admitted submission that settles may have started a turn
 		// whose recovery work waitForIdle() must observe again before the final decision.

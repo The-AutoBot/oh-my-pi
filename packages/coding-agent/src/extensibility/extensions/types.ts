@@ -60,6 +60,7 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
+import type { AutoBotCoordinatorService } from "../../autobot-runtime";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
@@ -519,6 +520,12 @@ export interface ExtensionContext {
 	 * Rejects with {@link CollabNonInteractiveError} outside interactive mode.
 	 */
 	ensureCollab(options?: EnsureCollabOptions): Promise<EnsureCollabResult>;
+	/**
+	 * Bind or clear the signed coordinator extension's session-local managed
+	 * update service. The core runtime consumes it without creating a second
+	 * coordinator connection for the session.
+	 */
+	setAutoBotUpdateCoordinator(service: AutoBotCoordinatorService | undefined): void;
 	/** Current working directory */
 	cwd: string;
 	/** Session manager (read-only) */
@@ -835,6 +842,10 @@ export interface CollabStoppedEvent extends CollabLinks {
  */
 export interface CollabInputStateEvent {
 	type: "collab_input_state";
+	/** Identity of the host that owns this input state. */
+	readonly hostId: string;
+	/** Session bound to that host; consumers must ignore a stale generation. */
+	readonly sessionId: string;
 	needsInput: boolean;
 	inputType: "select" | "editor" | null;
 }
@@ -1841,6 +1852,8 @@ export interface ExtensionContextActions {
 	getSystemPrompt: () => string[];
 	/** Present only in the interactive TUI; other hosts reject with `collab-noninteractive`. */
 	ensureCollab?: (options?: EnsureCollabOptions) => Promise<EnsureCollabResult>;
+	/** Binds the coordinator extension's single session-local managed-update service. */
+	setAutoBotUpdateCoordinator?: (service: AutoBotCoordinatorService | undefined) => void;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */
