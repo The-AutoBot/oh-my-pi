@@ -182,6 +182,7 @@ jobs:
       contents: write
       pull-requests: write
       statuses: write
+    environment: autobot-upstream-automation
     outputs:
       pr_number: ${{ steps.pr.outputs.number }}
     steps:
@@ -190,32 +191,37 @@ jobs:
           name: autobot-upstream-candidate
           path: ${{ runner.temp }}/autobot-upstream-candidate
       # This job moves verified git objects only; it never checks out or executes candidate content.
-      - name: Push the reviewed candidate with a downstream-trigger credential
+      - name: Push the reviewed candidate branch
         id: pr
         shell: bash
         env:
           AUTOMATION_TOKEN: ${{ secrets.AUTOBOT_AUTOMATION_TOKEN }}
+          REVIEW_TOKEN: ${{ github.token }}
           CANONICAL_BRANCH: ${{ needs.candidate.outputs.canonical_branch }}
           UPSTREAM_COMMIT: ${{ needs.candidate.outputs.upstream_commit }}
           CANDIDATE_COMMIT: ${{ needs.candidate.outputs.candidate_commit }}
           REQUIRES_COMPATIBILITY_REVIEW: ${{ needs.candidate.outputs.requires_compatibility_review }}
         run: |
           set -euo pipefail
-          if [ -z "$AUTOMATION_TOKEN" ]; then
-            echo "::error::AUTOBOT_AUTOMATION_TOKEN must be a PAT or GitHub App token so candidate PR checks are triggered" >&2
+          if [ -z "$REVIEW_TOKEN" ]; then
+            echo "::error::GitHub token is required to resolve the candidate review PR" >&2
             exit 1
           fi
-          export GH_TOKEN="$AUTOMATION_TOKEN"
-          gh auth setup-git
+          GH_TOKEN="$REVIEW_TOKEN" gh auth setup-git
           candidate_branch="autobot/upstream-${UPSTREAM_COMMIT}"
           worktree="$RUNNER_TEMP/autobot-review-repository"
-          git clone --no-checkout "https://github.com/${GITHUB_REPOSITORY}.git" "$worktree"
-          git -C "$worktree" fetch --no-tags origin "refs/heads/$CANONICAL_BRANCH"
+          GH_TOKEN="$REVIEW_TOKEN" git clone --no-checkout "https://github.com/${GITHUB_REPOSITORY}.git" "$worktree"
+          GH_TOKEN="$REVIEW_TOKEN" git -C "$worktree" fetch --no-tags origin "refs/heads/$CANONICAL_BRANCH"
           git -C "$worktree" fetch "$RUNNER_TEMP/autobot-upstream-candidate/candidate.bundle" "$CANDIDATE_COMMIT:refs/heads/$candidate_branch"
-          git -C "$worktree" push origin "refs/heads/$candidate_branch:refs/heads/$candidate_branch"
-          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$candidate_branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$AUTOMATION_TOKEN" ]; then
+            echo "::error::AUTOBOT_AUTOMATION_TOKEN must be an environment-only PAT for the candidate branch push" >&2
+            exit 1
+          fi
+          GH_TOKEN="$AUTOMATION_TOKEN" git -C "$worktree" push origin "refs/heads/$candidate_branch:refs/heads/$candidate_branch"
+          unset AUTOMATION_TOKEN
+          existing="$(GH_TOKEN="$REVIEW_TOKEN" gh pr list --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$candidate_branch" --state open --json number --jq '.[0].number // empty')"
           if [ -z "$existing" ]; then
-            existing="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$candidate_branch" \
+            existing="$(GH_TOKEN="$REVIEW_TOKEN" gh pr create --repo "$GITHUB_REPOSITORY" --base "$CANONICAL_BRANCH" --head "$candidate_branch" \
               --title "chore(autobot): integrate upstream ${UPSTREAM_COMMIT:0:12}" \
               --body "Pinned upstream candidate. The isolated build, native-addon smoke, browser-relay embed check, and collaboration contract tests passed before this branch was pushed.
 
@@ -259,15 +265,10 @@ jobs:
       - name: Request GitHub auto-merge only after protected checks and required reviews
         shell: bash
         env:
-          AUTOMATION_TOKEN: ${{ secrets.AUTOBOT_AUTOMATION_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.review.outputs.pr_number }}
         run: |
           set -euo pipefail
-          if [ -z "$AUTOMATION_TOKEN" ]; then
-            echo "::error::AUTOBOT_AUTOMATION_TOKEN must be a PAT or GitHub App token so the canonical push triggers release promotion" >&2
-            exit 1
-          fi
-          export GH_TOKEN="$AUTOMATION_TOKEN"
           if [ -z "$PR_NUMBER" ]; then
             echo "::error::No reviewed candidate PR is available for auto-merge" >&2
             exit 1

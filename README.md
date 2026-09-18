@@ -643,15 +643,25 @@ The repository contains two independent hourly GitHub Actions workflows:
 
 - **Upstream integration** runs at minute 17. It resolves the configured
   canonical branch and fully qualified upstream ref, makes a detached candidate
-  merge, builds/tests that isolated candidate, and records its provenance. A
-  scheduled review branch/PR requires
-  `AUTOBOT_UPSTREAM_AUTOMATION=enabled` and the operator-owned
-  `AUTOBOT_AUTOMATION_TOKEN`; protected-branch auto-merge remains opt-in.
+  merge, builds/tests that isolated candidate, and records its provenance. The
+  canonical AutoBot branch is `autobot/auto-collab`. A scheduled review
+  branch/PR requires `AUTOBOT_UPSTREAM_AUTOMATION=enabled` and the
+  `AUTOBOT_AUTOMATION_TOKEN` PAT stored only in the
+  `autobot-upstream-automation` environment; that PAT is used solely to push
+  the candidate branch. `github.token` resolves or creates the review PR and
+  posts its exact-SHA `AutoBot validated candidate` status. Protected-branch
+  auto-merge remains opt-in.
 - **Signed release promotion** runs at minute 43. It only promotes a retained,
   reviewed candidate: it assembles every configured target, signs a verified
   predecessor chain, publishes and re-downloads the release for verification,
   then advances the channel as the final step. It is enabled only with
   `AUTOBOT_RELEASE_AUTOMATION=enabled` (or a deliberate dispatch).
+
+GitHub does not start ordinary pull-request workflows for a PR created with
+`github.token`. The required `AutoBot validated candidate` status instead
+attests that the exact candidate SHA passed isolated verification before the
+candidate branch was published. Protect `autobot/auto-collab` by requiring that
+status and one code-owner approval from `@The-AutoBot/release-maintainers`.
 
 Before enabling either workflow, repository operators must configure the
 following values themselves—none are inferred from a checkout or a workflow
