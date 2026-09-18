@@ -72,6 +72,23 @@ async function resolveRemoteCommit(repository: string, ref: string, label: strin
 	return requireCommit(matches[0]?.[0] ?? "", `${label} resolved commit`);
 }
 
+async function isAncestor(sourceRoot: string, ancestor: string, descendant: string): Promise<boolean> {
+	const child = Bun.spawn(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+		cwd: sourceRoot,
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "pipe",
+	});
+	const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+	if (exitCode === 0) return true;
+	if (exitCode === 1) return false;
+	const detail = stderr.trim();
+	throw new AutoBotReleaseError(
+		`Could not determine whether pinned upstream is already integrated${detail ? `: ${detail}` : ""}`,
+	);
+}
+
+
 async function exactBunVersion(executable: string, expected: string, label: string): Promise<void> {
 	const result = await runCommand([executable, "--version"], { capture: true });
 	if (result.stdout.trim() !== expected) {
@@ -284,6 +301,23 @@ async function main(): Promise<void> {
 		const canonicalCommit = await gitOutput(clone, ["rev-parse", "FETCH_HEAD^{commit}"]);
 		await runCommand(["git", "fetch", "--no-tags", upstreamRepository, upstreamObject], { cwd: clone, capture: true });
 		const upstreamCommit = await gitOutput(clone, ["rev-parse", "FETCH_HEAD^{commit}"]);
+		const integrationIdentity = {
+			schemaVersion: 1,
+			canonicalRepository,
+			canonicalBranch,
+			canonicalCommit,
+			upstreamRepository,
+			upstreamRef,
+			upstreamCommit,
+		};
+		if (await isAncestor(clone, upstreamCommit, canonicalCommit)) {
+			await writeJsonAtomic(path.join(output, "integration-result.json"), {
+				...integrationIdentity,
+				outcome: "unchanged",
+			});
+			console.log(`Pinned upstream ${upstreamCommit.slice(0, 12)} is already integrated into ${canonicalBranch}; no candidate created`);
+			return;
+		}
 		const upstreamVersion = await upstreamPackageVersion(clone, upstreamCommit);
 		await runCommand(["git", "checkout", "--detach", canonicalCommit], { cwd: clone, capture: true });
 		try {
@@ -359,6 +393,10 @@ async function main(): Promise<void> {
 				compilerBunVersion: requiredOption(args, "compiler-bun-version"),
 				compilerBunSha256: compilerBunHash.sha256,
 			},
+		});
+		await writeJsonAtomic(path.join(output, "integration-result.json"), {
+			...integrationIdentity,
+			outcome: "created",
 		});
 		console.log(`Created isolated AutoBot candidate ${candidateCommit.slice(0, 12)} for ${canonicalBranch}`);
 	} finally {
