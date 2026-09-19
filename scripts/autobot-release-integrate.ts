@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import { autoBotPathRequiresCompatibilityReview } from "../packages/coding-agent/src/autobot-update/contract.ts";
+import { currentAutoBotRuntimeTarget } from "../packages/coding-agent/src/autobot-update/platform.ts";
 import { isRecord } from "../packages/utils/src/type-guards.ts";
 import {
 	AutoBotReleaseError,
@@ -22,26 +23,50 @@ import {
 	runCommand,
 	writeJsonAtomic,
 } from "./autobot-release-common.ts";
-
+import { createManagedBundle, deriveManagedBundleId } from "./autobot-release-web.ts";
 
 const FULL_REF = /^refs\/(?:heads|tags)\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const UPSTREAM_VERSION = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,127}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const CANDIDATE_CONTRACT_MAX_BYTES = 1024 * 1024;
+const CANDIDATE_EPOCH_LINE = /^\s*export\s+const\s+AUTO_BOT_COMPATIBILITY_EPOCH\s*=\s*([1-9]\d*)\s+as\s+const\s*;\s*$/;
 
-function requireRef(value: string, label: string): string {
-	if (!FULL_REF.test(value) || value.includes("..") || value.endsWith("/") || value.includes("//")) {
-		throw new AutoBotReleaseError(`${label} must be a fully qualified refs/heads/... or refs/tags/... ref`);
+function hasSafeRefComponents(value: string): boolean {
+	return (
+		!value.endsWith(".") &&
+		value.split("/").every(component => {
+			const normalized = component.toLowerCase();
+			return component.length > 0 && !component.startsWith(".") && !normalized.endsWith(".lock");
+		})
+	);
+}
+
+export function requireRef(value: string, label: string): string {
+	if (
+		!FULL_REF.test(value) ||
+		!hasSafeRefComponents(value) ||
+		value.includes("..") ||
+		value.endsWith("/") ||
+		value.includes("//")
+	) {
+		throw new AutoBotReleaseError(`${label} must be a fully qualified safe refs/heads/... or refs/tags/... ref`);
 	}
 	return value;
 }
 
-function requireBranch(value: string): string {
-	if (!BRANCH.test(value) || value.includes("..") || value.endsWith("/") || value.includes("//")) {
-		throw new AutoBotReleaseError("Canonical branch must be an explicit safe branch name");
+export function requireBranch(value: string): string {
+	if (
+		!BRANCH.test(value) ||
+		!hasSafeRefComponents(value) ||
+		value.includes("..") ||
+		value.endsWith("/") ||
+		value.includes("//")
+	) {
+		throw new AutoBotReleaseError("Branch must be an explicit safe branch name");
 	}
 	return value;
 }
-function requireHttpsRepository(value: string, label: string): string {
+export function requireHttpsRepository(value: string, label: string): string {
 	let parsed: URL;
 	try {
 		parsed = new URL(value);
@@ -61,8 +86,7 @@ function requireHttpsRepository(value: string, label: string): string {
 	return value;
 }
 
-
-async function resolveRemoteCommit(repository: string, ref: string, label: string): Promise<string> {
+export async function resolveRemoteCommit(repository: string, ref: string, label: string): Promise<string> {
 	const result = await runCommand(["git", "ls-remote", "--refs", repository, ref], { capture: true });
 	const matches = result.stdout
 		.split("\n")
@@ -72,7 +96,7 @@ async function resolveRemoteCommit(repository: string, ref: string, label: strin
 	return requireCommit(matches[0]?.[0] ?? "", `${label} resolved commit`);
 }
 
-async function isAncestor(sourceRoot: string, ancestor: string, descendant: string): Promise<boolean> {
+export async function isAncestor(sourceRoot: string, ancestor: string, descendant: string): Promise<boolean> {
 	const child = Bun.spawn(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
 		cwd: sourceRoot,
 		stdin: "ignore",
@@ -88,11 +112,12 @@ async function isAncestor(sourceRoot: string, ancestor: string, descendant: stri
 	);
 }
 
-
-async function exactBunVersion(executable: string, expected: string, label: string): Promise<void> {
+export async function exactBunVersion(executable: string, expected: string, label: string): Promise<void> {
 	const result = await runCommand([executable, "--version"], { capture: true });
 	if (result.stdout.trim() !== expected) {
-		throw new AutoBotReleaseError(`${label} version must be exactly ${expected}; found ${result.stdout.trim() || "<empty>"}`);
+		throw new AutoBotReleaseError(
+			`${label} version must be exactly ${expected}; found ${result.stdout.trim() || "<empty>"}`,
+		);
 	}
 }
 
@@ -106,8 +131,7 @@ async function assertCandidateNativeAddon(candidate: string): Promise<void> {
 	}
 }
 
-
-async function upstreamPackageVersion(sourceRoot: string, upstreamCommit: string): Promise<string> {
+export async function upstreamPackageVersion(sourceRoot: string, upstreamCommit: string): Promise<string> {
 	const packageJson = await runCommand(["git", "show", `${upstreamCommit}:packages/coding-agent/package.json`], {
 		cwd: sourceRoot,
 		capture: true,
@@ -124,51 +148,233 @@ async function upstreamPackageVersion(sourceRoot: string, upstreamCommit: string
 	return parsed.version;
 }
 
-interface CandidateReleaseIdentity {
+export interface CandidateReleaseIdentity {
 	readonly compatibilityEpoch: number;
 	readonly compatibilityReviewPaths: readonly string[];
 	readonly runtimeTarget: string;
 }
 
-async function candidateReleaseIdentity(
+export function candidateMergeSubject(upstreamCommit: string): string {
+	return `chore(autobot): candidate upstream ${requireCommit(upstreamCommit, "Candidate upstream commit").slice(0, 12)}`;
+}
+
+export interface CandidateMerge {
+	readonly commit: string;
+	readonly firstParent: string;
+	readonly upstreamCommit: string;
+}
+
+export async function assertCandidateMerge(
+	sourceRoot: string,
+	candidateCommit: string,
+	upstreamCommit: string,
+	expectedFirstParent?: string,
+): Promise<CandidateMerge> {
+	const commit = requireCommit(candidateCommit, "Candidate merge commit");
+	const upstream = requireCommit(upstreamCommit, "Candidate upstream parent");
+	const parents = (await gitOutput(sourceRoot, ["show", "-s", "--format=%P", commit]))
+		.split(" ")
+		.filter(Boolean)
+		.map((parent, index) => requireCommit(parent, `Candidate merge parent ${index + 1}`));
+	if (parents.length !== 2) {
+		throw new AutoBotReleaseError(`AutoBot candidate ${commit} must retain its canonical and upstream merge parents`);
+	}
+	if (parents[1] !== upstream) {
+		throw new AutoBotReleaseError(`AutoBot candidate ${commit} must retain the pinned upstream as its second parent`);
+	}
+	if (expectedFirstParent && parents[0] !== requireCommit(expectedFirstParent, "Candidate canonical parent")) {
+		throw new AutoBotReleaseError(`AutoBot candidate ${commit} must retain its expected canonical first parent`);
+	}
+	const subject = await gitOutput(sourceRoot, ["show", "-s", "--format=%s", commit]);
+	if (subject !== candidateMergeSubject(upstream)) {
+		throw new AutoBotReleaseError(`AutoBot candidate ${commit} must retain its required subject`);
+	}
+	return { commit, firstParent: parents[0] ?? "", upstreamCommit: upstream };
+}
+
+export async function latestCandidateMerge(
+	sourceRoot: string,
+	descendant: string,
+): Promise<CandidateMerge | undefined> {
+	const history = await runCommand(["git", "log", "--topo-order", "--format=%H%x00%s", descendant], {
+		cwd: sourceRoot,
+		capture: true,
+	});
+	for (const row of history.stdout.split("\n")) {
+		const [candidateCommit, subject] = row.split("\u0000", 2);
+		const match = /^chore\(autobot\): candidate upstream ([0-9a-f]{12})$/.exec(subject ?? "");
+		if (!match) continue;
+		const commit = requireCommit(candidateCommit ?? "", "Candidate merge commit");
+		const parents = (await gitOutput(sourceRoot, ["show", "-s", "--format=%P", commit])).split(" ").filter(Boolean);
+		if (parents.length !== 2) {
+			throw new AutoBotReleaseError(
+				`AutoBot candidate ${commit} must retain its canonical and upstream merge parents`,
+			);
+		}
+		const upstream = requireCommit(parents[1] ?? "", "Candidate upstream parent");
+		if (!upstream.startsWith(match[1] ?? "")) {
+			throw new AutoBotReleaseError(`AutoBot candidate ${commit} subject does not match its upstream merge parent`);
+		}
+		return assertCandidateMerge(sourceRoot, commit, upstream);
+	}
+	return undefined;
+}
+
+function candidateCompatibilityEpoch(source: string): number {
+	let blockComment = false;
+	let quote: "'" | '"' | undefined;
+	let braceDepth = 0;
+	for (const line of source.split("\n")) {
+		const depthAtLineStart = braceDepth;
+		let masked = "";
+		for (let index = 0; index < line.length;) {
+			const character = line[index] ?? "";
+			const next = line[index + 1] ?? "";
+			if (blockComment) {
+				masked += " ";
+				if (character === "*" && next === "/") {
+					masked += " ";
+					index += 2;
+					blockComment = false;
+				} else {
+					index++;
+				}
+				continue;
+			}
+			if (quote) {
+				masked += " ";
+				if (character === "\\") {
+					if (index + 1 < line.length) {
+						masked += " ";
+						index += 2;
+					} else {
+						index++;
+					}
+					continue;
+				}
+				if (character === quote) quote = undefined;
+				index++;
+				continue;
+			}
+			if (character === "/" && next === "/") {
+				masked += " ".repeat(line.length - index);
+				break;
+			}
+			if (character === "/" && next === "*") {
+				masked += "  ";
+				index += 2;
+				blockComment = true;
+				continue;
+			}
+			if (character === "'" || character === '"') {
+				masked += " ";
+				quote = character;
+				index++;
+				continue;
+			}
+			if (character === "`" || character === "/") {
+				throw new AutoBotReleaseError(
+					"Candidate AutoBot compatibility epoch must precede template literals and non-comment slash expressions",
+				);
+			}
+			if (character === "{") braceDepth++;
+			if (character === "}") {
+				braceDepth--;
+				if (braceDepth < 0) throw new AutoBotReleaseError("Candidate AutoBot contract has unbalanced braces");
+			}
+			masked += character;
+			index++;
+		}
+		if (depthAtLineStart !== 0) continue;
+		const match = CANDIDATE_EPOCH_LINE.exec(masked);
+		if (match) {
+			return requirePositiveSafeInteger(Number(match[1]), "Candidate compatibility epoch");
+		}
+	}
+	if (blockComment || quote || braceDepth !== 0) {
+		throw new AutoBotReleaseError("Candidate AutoBot contract has an unterminated declaration prefix");
+	}
+	throw new AutoBotReleaseError("Candidate AutoBot contract must declare a literal compatibility epoch");
+}
+
+interface CandidateContractPolicy {
+	readonly compatibilityEpoch: number;
+	readonly differsFromProducer: boolean;
+}
+
+async function candidateContractPolicy(sourceRoot: string): Promise<CandidateContractPolicy> {
+	const candidatePath = path.join(sourceRoot, "packages", "coding-agent", "src", "autobot-update", "contract.ts");
+	const producerPath = path.join(
+		import.meta.dir,
+		"..",
+		"packages",
+		"coding-agent",
+		"src",
+		"autobot-update",
+		"contract.ts",
+	);
+	let candidateStat: Stats;
+	try {
+		candidateStat = await fs.lstat(candidatePath);
+	} catch (error) {
+		throw new AutoBotReleaseError("Candidate AutoBot contract is unavailable", { cause: error });
+	}
+	if (!candidateStat.isFile() || candidateStat.size > CANDIDATE_CONTRACT_MAX_BYTES) {
+		throw new AutoBotReleaseError("Candidate AutoBot contract must be a bounded regular file");
+	}
+	let candidateSource: string;
+	let producerSource: string;
+	try {
+		[candidateSource, producerSource] = await Promise.all([
+			fs.readFile(candidatePath, "utf8"),
+			fs.readFile(producerPath, "utf8"),
+		]);
+	} catch (error) {
+		throw new AutoBotReleaseError("Could not read the declarative AutoBot compatibility contract", { cause: error });
+	}
+	return {
+		compatibilityEpoch: candidateCompatibilityEpoch(candidateSource),
+		differsFromProducer: candidateSource !== producerSource,
+	};
+}
+
+export async function candidateReleaseIdentity(
 	sourceRoot: string,
 	canonicalCommit: string,
 	candidateCommit: string,
 ): Promise<CandidateReleaseIdentity> {
-	// Candidate modules are runtime-selected from the detached clone. The producer policy below remains the non-bypassable baseline.
-	const contract = await import(
-		pathToFileURL(path.join(sourceRoot, "packages", "coding-agent", "src", "autobot-update", "contract.ts")).href,
-	);
-	const candidatePathPolicy = contract.autoBotPathRequiresCompatibilityReview;
-	if (typeof candidatePathPolicy !== "function") {
-		throw new AutoBotReleaseError("Candidate AutoBot contract must export autoBotPathRequiresCompatibilityReview");
-	}
-	const platform = await import(
-		pathToFileURL(path.join(sourceRoot, "packages", "coding-agent", "src", "autobot-update", "platform.ts")).href,
-	);
-	if (typeof platform.currentAutoBotRuntimeTarget !== "function") {
-		throw new AutoBotReleaseError("Candidate AutoBot platform module must export currentAutoBotRuntimeTarget");
-	}
-	const changed = await runCommand(["git", "diff", "--name-only", "--no-renames", "-z", canonicalCommit, candidateCommit], {
-		cwd: sourceRoot,
-		capture: true,
-	});
+	const [candidatePolicy, changed] = await Promise.all([
+		candidateContractPolicy(sourceRoot),
+		runCommand(["git", "diff", "--name-only", "--no-renames", "-z", canonicalCommit, candidateCommit], {
+			cwd: sourceRoot,
+			capture: true,
+		}),
+	]);
 	return {
-		compatibilityEpoch: requirePositiveSafeInteger(contract.AUTO_BOT_COMPATIBILITY_EPOCH, "Candidate compatibility epoch"),
+		compatibilityEpoch: candidatePolicy.compatibilityEpoch,
+		// Candidate policy code is source input, not executable controller code.
+		// If it differs from the trusted producer policy, conservatively route
+		// every candidate change through compatibility review.
 		compatibilityReviewPaths: changed.stdout
 			.split("\u0000")
 			.filter(Boolean)
 			.filter(
 				repositoryPath =>
+					candidatePolicy.differsFromProducer ||
 					autoBotPathRequiresCompatibilityReview(repositoryPath) ||
-					candidatePathPolicy(repositoryPath) ||
 					repositoryPath === "packages/coding-agent/src/autobot-update/contract.ts",
 			),
-		runtimeTarget: requireString(platform.currentAutoBotRuntimeTarget(), "Candidate runtime target"),
+		runtimeTarget: requireString(currentAutoBotRuntimeTarget(), "Trusted runtime target"),
 	};
 }
 
-async function buildCandidate(
+export interface CandidateBuildResult {
+	readonly runtimeFile: string;
+	readonly webArchive: string;
+	readonly webBundleId: string;
+}
+
+export async function buildCandidate(
 	candidate: string,
 	runnerBun: string,
 	compilerBun: string,
@@ -176,7 +382,7 @@ async function buildCandidate(
 	upstreamCommit: string,
 	upstreamVersion: string,
 	output: string,
-): Promise<{ readonly runtimeFile: string; readonly webArchive: string; readonly webBundleId: string }> {
+): Promise<CandidateBuildResult> {
 	const runnerDirectory = path.dirname(runnerBun);
 	const commandEnvironment: NodeJS.ProcessEnv = {
 		...Bun.env,
@@ -184,12 +390,30 @@ async function buildCandidate(
 	};
 	await runCommand([runnerBun, "install", "--frozen-lockfile"], { cwd: candidate, env: commandEnvironment });
 	// This must precede compilation: build-extension regenerates the text assets embedded into the runtime.
-	await runCommand([runnerBun, "--cwd=packages/browser-relay", "run", "build"], { cwd: candidate, env: commandEnvironment });
+	await runCommand([runnerBun, "--cwd=packages/browser-relay", "run", "build"], {
+		cwd: candidate,
+		env: commandEnvironment,
+	});
 	await Promise.all([
 		fs.access(path.join(candidate, "packages", "browser-relay", "dist", "omp-browser-relay-extension.zip")),
-		fs.access(path.join(candidate, "packages", "coding-agent", "src", "tools", "browser", "relay", "extension-assets", "background.js.txt")),
+		fs.access(
+			path.join(
+				candidate,
+				"packages",
+				"coding-agent",
+				"src",
+				"tools",
+				"browser",
+				"relay",
+				"extension-assets",
+				"background.js.txt",
+			),
+		),
 	]);
-	await runCommand([runnerBun, "--cwd=packages/collab-web", "run", "build"], { cwd: candidate, env: commandEnvironment });
+	await runCommand([runnerBun, "--cwd=packages/collab-web", "run", "build"], {
+		cwd: candidate,
+		env: commandEnvironment,
+	});
 	await runCommand([runnerBun, "run", "build:native"], { cwd: candidate, env: commandEnvironment });
 	await assertCandidateNativeAddon(candidate);
 	// Compile under the pinned compiler itself. Its helper subprocesses still
@@ -232,17 +456,14 @@ async function buildCandidate(
 	const runtimeOutput = path.join(output, "runtime", runtimeFilename);
 	await fs.mkdir(path.dirname(runtimeOutput), { recursive: true });
 	await fs.copyFile(runtime, runtimeOutput);
-	// Use the candidate's packager so its exact session/collaboration contract controls the archive identity.
-	const candidateWeb = await import(pathToFileURL(path.join(candidate, "scripts", "autobot-release-web.ts")).href);
-	if (typeof candidateWeb.deriveManagedBundleId !== "function" || typeof candidateWeb.createManagedBundle !== "function") {
-		throw new AutoBotReleaseError("Candidate release packager must export web bundle derivation and assembly functions");
-	}
-	const webBundleId = await candidateWeb.deriveManagedBundleId(
+	// The candidate owns the web bytes, but the local controller must not execute
+	// candidate source merely to package those bytes.
+	const webBundleId = await deriveManagedBundleId(
 		path.join(candidate, "packages", "collab-web", "dist"),
 		path.join(candidate, "packages", "collab-web", "public"),
 	);
 	const webArchive = path.join(output, `omp-collab-web-${webBundleId}.tar.gz`);
-	await candidateWeb.createManagedBundle({
+	await createManagedBundle({
 		dist: path.join(candidate, "packages", "collab-web", "dist"),
 		publicDirectory: path.join(candidate, "packages", "collab-web", "public"),
 		out: webArchive,
@@ -299,7 +520,10 @@ async function main(): Promise<void> {
 		await runCommand(["git", "clone", "--no-checkout", canonicalRepository, clone], { capture: true });
 		await runCommand(["git", "fetch", "--no-tags", "origin", canonicalObject], { cwd: clone, capture: true });
 		const canonicalCommit = await gitOutput(clone, ["rev-parse", "FETCH_HEAD^{commit}"]);
-		await runCommand(["git", "fetch", "--no-tags", upstreamRepository, upstreamObject], { cwd: clone, capture: true });
+		await runCommand(["git", "fetch", "--no-tags", upstreamRepository, upstreamObject], {
+			cwd: clone,
+			capture: true,
+		});
 		const upstreamCommit = await gitOutput(clone, ["rev-parse", "FETCH_HEAD^{commit}"]);
 		const integrationIdentity = {
 			schemaVersion: 1,
@@ -315,7 +539,9 @@ async function main(): Promise<void> {
 				...integrationIdentity,
 				outcome: "unchanged",
 			});
-			console.log(`Pinned upstream ${upstreamCommit.slice(0, 12)} is already integrated into ${canonicalBranch}; no candidate created`);
+			console.log(
+				`Pinned upstream ${upstreamCommit.slice(0, 12)} is already integrated into ${canonicalBranch}; no candidate created`,
+			);
 			return;
 		}
 		const upstreamVersion = await upstreamPackageVersion(clone, upstreamCommit);
@@ -337,7 +563,9 @@ async function main(): Promise<void> {
 			);
 		} catch (error) {
 			await runCommand(["git", "merge", "--abort"], { cwd: clone, capture: true }).catch(() => {});
-			throw new AutoBotReleaseError("Pinned upstream integration has conflicts; refusing to create a candidate", { cause: error });
+			throw new AutoBotReleaseError("Pinned upstream integration has conflicts; refusing to create a candidate", {
+				cause: error,
+			});
 		}
 		await runCommand(
 			[
@@ -349,7 +577,7 @@ async function main(): Promise<void> {
 				"commit",
 				"--no-gpg-sign",
 				"-m",
-				`chore(autobot): candidate upstream ${upstreamCommit.slice(0, 12)}`,
+				candidateMergeSubject(upstreamCommit),
 			],
 			{ cwd: clone, capture: true },
 		);
@@ -365,10 +593,13 @@ async function main(): Promise<void> {
 			upstreamVersion,
 			output,
 		);
-		await runCommand(["git", "bundle", "create", path.join(output, "candidate.bundle"), candidateCommit, `^${canonicalCommit}`], {
-			cwd: clone,
-			capture: true,
-		});
+		await runCommand(
+			["git", "bundle", "create", path.join(output, "candidate.bundle"), candidateCommit, `^${canonicalCommit}`],
+			{
+				cwd: clone,
+				capture: true,
+			},
+		);
 		await writeJsonAtomic(path.join(output, "candidate-provenance.json"), {
 			schemaVersion: 1,
 			upstreamRepository,
@@ -386,7 +617,10 @@ async function main(): Promise<void> {
 				required: identity.compatibilityReviewPaths.length > 0,
 				paths: identity.compatibilityReviewPaths,
 			},
-			runtime: { target: identity.runtimeTarget, file: path.relative(output, built.runtimeFile).replaceAll("\\", "/") },
+			runtime: {
+				target: identity.runtimeTarget,
+				file: path.relative(output, built.runtimeFile).replaceAll("\\", "/"),
+			},
 			collabWeb: { target: "web", file: path.relative(output, built.webArchive).replaceAll("\\", "/") },
 			toolchain: {
 				runnerBunVersion: requiredOption(args, "runner-bun-version"),

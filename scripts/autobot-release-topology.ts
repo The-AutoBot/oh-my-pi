@@ -1,30 +1,40 @@
 import { AutoBotReleaseError } from "./autobot-release-common.ts";
 import { COORDINATOR_CLIENT_TARGET } from "./autobot-release-coordinator.ts";
-import { AUTO_BOT_RUNTIME_TARGETS } from "./autobot-release-targets.ts";
+import { AUTO_BOT_RELEASE_REQUIRED_RUNTIME_TARGETS } from "./autobot-release-targets.ts";
 
 interface ReleaseAssetIdentity {
 	readonly kind: string;
 	readonly target: string;
 }
 
-/** Require every signed release to carry the complete immutable runtime target set. */
+/** Require the exact producer-owned asset topology for every signed release. */
 export function assertCompleteAutoBotReleaseTopology(assets: readonly ReleaseAssetIdentity[]): void {
-	const expectedTargets = Object.keys(AUTO_BOT_RUNTIME_TARGETS);
+	const expectedTargets: readonly string[] = AUTO_BOT_RELEASE_REQUIRED_RUNTIME_TARGETS;
 	const runtimeTargets = new Set<string>();
 	const bootstrapTargets = new Set<string>();
+	const seenIdentities = new Set<string>();
 	let coordinatorCount = 0;
 	let collabWebCount = 0;
 	for (const asset of assets) {
+		const identity = `${asset.kind}\u0000${asset.target}`;
+		if (seenIdentities.has(identity)) {
+			throw new AutoBotReleaseError(`Release contains a duplicate asset identity: ${asset.kind}/${asset.target}`);
+		}
+		seenIdentities.add(identity);
 		switch (asset.kind) {
 			case "runtime":
-				if (!Object.hasOwn(AUTO_BOT_RUNTIME_TARGETS, asset.target)) {
-					throw new AutoBotReleaseError(`Release contains an unsupported runtime target: ${asset.target}`);
+				if (!expectedTargets.includes(asset.target)) {
+					throw new AutoBotReleaseError(
+						`Release contains a runtime target outside the required release topology: ${asset.target}`,
+					);
 				}
 				runtimeTargets.add(asset.target);
 				break;
 			case "bootstrap":
-				if (!Object.hasOwn(AUTO_BOT_RUNTIME_TARGETS, asset.target)) {
-					throw new AutoBotReleaseError(`Release contains an unsupported bootstrap target: ${asset.target}`);
+				if (!expectedTargets.includes(asset.target)) {
+					throw new AutoBotReleaseError(
+						`Release contains a bootstrap target outside the required release topology: ${asset.target}`,
+					);
 				}
 				bootstrapTargets.add(asset.target);
 				break;
@@ -47,8 +57,11 @@ export function assertCompleteAutoBotReleaseTopology(assets: readonly ReleaseAss
 		bootstrapTargets.size !== expectedTargets.length ||
 		expectedTargets.some(target => !runtimeTargets.has(target) || !bootstrapTargets.has(target))
 	) {
-		throw new AutoBotReleaseError("Release must contain one runtime and one bootstrap for every supported target");
+		throw new AutoBotReleaseError(
+			"Release must contain one runtime and one bootstrap for every required release target",
+		);
 	}
-	if (coordinatorCount !== 1) throw new AutoBotReleaseError("Release must contain exactly one universal coordinator-client asset");
+	if (coordinatorCount !== 1)
+		throw new AutoBotReleaseError("Release must contain exactly one universal coordinator-client asset");
 	if (collabWebCount !== 1) throw new AutoBotReleaseError("Release must contain exactly one web collab-web asset");
 }

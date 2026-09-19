@@ -639,48 +639,93 @@ verified runtimes under its private installation root.
 
 #### Operator setup and hourly producer workflows
 
-The repository contains two independent hourly GitHub Actions workflows:
+The retired Actions producers have been replaced by one local, Windows x64
+producer. It is operator-run under a single Windows account with that account's
+existing OMP and `gh` authentication; it neither creates nor copies a PAT,
+release credential, or login. It is not an installation, deployment, or
+general release-automation setup.
 
-- **Upstream integration** runs at minute 17. It resolves the configured
-  canonical branch and fully qualified upstream ref, makes a detached candidate
-  merge, builds/tests that isolated candidate, and records its provenance. The
-  canonical AutoBot branch is `autobot/auto-collab`. A scheduled review
-  branch/PR requires `AUTOBOT_UPSTREAM_AUTOMATION=enabled` and the
-  `AUTOBOT_AUTOMATION_TOKEN` PAT stored only in the
-  `autobot-upstream-automation` environment; that PAT is used solely to push
-  the candidate branch. `github.token` resolves or creates the review PR and
-  posts its exact-SHA `AutoBot validated candidate` status. Protected-branch
-  auto-merge remains opt-in.
-- **Signed release promotion** runs at minute 43. It only promotes a retained,
-  reviewed candidate: it assembles every configured target, signs a verified
-  predecessor chain, publishes and re-downloads the release for verification,
-  then advances the channel as the final step. It is enabled only with
-  `AUTOBOT_RELEASE_AUTOMATION=enabled` (or a deliberate dispatch).
+Create a private, absolute-path JSON configuration that contains *exactly* the
+fields in [`scripts/autobot-local-types.ts`](scripts/autobot-local-types.ts)'s
+`LocalAutomationConfig` (`schemaVersion` must be `1`; unknown or omitted
+fields are rejected):
 
-GitHub does not start ordinary pull-request workflows for a PR created with
-`github.token`. The required `AutoBot validated candidate` status instead
-attests that the exact candidate SHA passed isolated verification before the
-candidate branch was published. Protect `autobot/auto-collab` by requiring that
-status and one code-owner approval from `@The-AutoBot/release-maintainers`.
+- Source inputs: `repository` is `The-AutoBot/oh-my-pi`; set distinct
+  `canonicalBranch` and `integrationBranch`, plus credential-free HTTPS
+  `upstreamRepository` and a fully qualified `upstreamRef`. The controller
+  keeps an owned persistent repository and worktree under the private,
+  absolute `workRoot`; it must be separate from the trusted producer checkout.
+- Pinned executables: set existing absolute `runnerBun` and `compilerBun`
+  paths and their exact `runnerBunVersion` and `compilerBunVersion`, plus the
+  existing absolute `ompExecutable`. Both configured Bun executables are
+  checked against their pins on each run.
+- Coordinator and signing inputs: `coordinatorRoot` names a distinct clean,
+  committed coordinator checkout with a credential-free HTTPS origin.
+  `keyId`, `privateKeyPath`, and `publicKeyPath` identify existing signing
+  material. Keep the private-key path and this configuration private; do not
+  put key bytes in the file.
+- Channel and bounds: set `channelRepository`, `channelBranch`, and relative
+  `channelPath`; the channel branch cannot be the protected canonical or
+  integration branch. `allowInitial` is `false` unless deliberately authorizing
+  the first channel publication. Set `maxOmpAttempts` from `0` through `3` and
+  `ompMaxTime` as a positive `s`, `m`, or `h` duration no longer than two
+  hours.
 
-Before enabling either workflow, repository operators must configure the
-following values themselves—none are inferred from a checkout or a workflow
-input: `AUTOBOT_CANONICAL_BRANCH`, `AUTOBOT_UPSTREAM_REPOSITORY`,
-`AUTOBOT_UPSTREAM_REF`, an exact supported `AUTOBOT_COMPILER_BUN_VERSION`,
-`AUTOBOT_COORDINATOR_PROVENANCE_SHA256`, and the exact complete
-`AUTOBOT_RELEASE_TARGETS_JSON` target set. Promotion also requires
-`AUTOBOT_PRODUCER_REF`, the channel envelope URL/repository/branch/path,
-`AUTOBOT_RELEASE_TRUSTED_KEY_ID`, its base64 public key, and the protected
-`AUTOBOT_RELEASE_SIGNING_KEY_BASE64` secret. URLs must be credential-free
-HTTPS values; the coordinator provenance digest and release signing material
-are independent operator-owned trust inputs. First-channel promotion requires
-an explicit `allow_initial` approval; later promotions verify a prior signed
-envelope and a monotonically newer release sequence.
+From the committed trusted producer checkout, an operator can run the
+controller once with absolute existing-file paths:
 
-This repository currently verifies the managed native/Bun path on isolated
-Win32 x64 fixtures. These workflows and tests are not a claim that the
-AutoBot distribution has been deployed, nor cross-platform runtime
-verification.
+```powershell
+& 'C:\tools\bun\bun.exe' .\scripts\autobot-local.ts `
+  --config 'C:\secure\autobot-local.json'
+```
+
+The scheduled-task launcher uses the same entrypoint:
+
+```powershell
+& .\scripts\Invoke-AutoBotLocalBuild.ps1 `
+  -ConfigPath 'C:\secure\autobot-local.json' `
+  -BunPath 'C:\tools\bun\bun.exe'
+```
+
+It suppresses sensitive child output, propagates the controller exit code, and
+rejects rooted-relative as well as ordinary relative config and Bun paths. A
+same-user/configuration mutex makes an overlapping invocation a successful
+no-op rather than a second producer run.
+
+To register, but not start, the dedicated hourly task:
+
+```powershell
+& .\scripts\Install-AutoBotLocalBuildTask.ps1 `
+  -ConfigPath 'C:\secure\autobot-local.json' `
+  -BunPath 'C:\tools\bun\bun.exe'
+```
+
+The installer registers **AutoBot Local Build** for the current Windows user
+at limited, interactive privilege. It begins at the next `:17` and repeats
+hourly; Task Scheduler ignores a new instance while one is active and does not
+restart failed runs. It refuses to overwrite a task with a different action.
+
+Each run pins the protected canonical branch and upstream input, then updates
+only its owned persistent integration worktree. It retains the committed
+producer, canonical, and upstream ancestry in a candidate merge before
+pushing the dedicated integration branch. OMP is invoked only to resolve an
+integration conflict, review a sensitive compatibility change, or repair a
+candidate build/check failure. Its zero exit is not trusted alone: afterward
+the controller independently checks the worktree, ancestry, refs, and remote
+snapshot. OMP cannot add a remote or change anything except the managed local
+candidate ref; any fix must be committed while retaining candidate ancestry.
+Candidate failures may consume only the configured OMP attempts; other
+failures block the run rather than being repaired or retried.
+
+The publisher validates the clean committed candidate, exact pinned tools, and
+the signed predecessor before building the Windows x64 quartet: runtime and
+bootstrap (`win32-x64`), coordinator client (`universal`), and collab web
+bundle (`web`). It performs focused candidate checks and fresh-home runtime
+smokes, signs and verifies the local bundle, uploads a draft, downloads and
+verifies the published bytes independently, publishes that verified draft, and
+advances the signed channel last. This documents the local controls and
+observed Windows x64 subsystem smokes; it does not claim that a full pipeline,
+installation, deployment, or cross-platform release has occurred.
 
 #### Install or migrate the immutable bootstrap
 

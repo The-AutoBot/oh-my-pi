@@ -16,13 +16,35 @@ export interface LocalHostAddon {
 	readonly x64Variant: "modern" | "baseline" | null;
 }
 
-/** Resolve the exact filename and x86-64 ISA emitted by the local N-API build. */
+/**
+ * Resolve the exact filename and x86-64 ISA emitted by the local N-API build.
+ * The explicit baseline target is intentionally limited to Windows x64.
+ */
 export function resolveLocalHostAddon(host: {
 	readonly platform: string;
 	readonly arch: string;
 	readonly avx2: boolean;
 }): LocalHostAddon {
-	const x64Variant = host.arch === "x64" ? (host.avx2 ? "modern" : "baseline") : null;
+	const targetVariant = Bun.env.OMP_NATIVE_TARGET_VARIANT?.trim();
+	if (targetVariant) {
+		if (targetVariant !== "baseline") {
+			throw new Error(
+				`Unknown OMP_NATIVE_TARGET_VARIANT "${targetVariant}" (only "baseline" is supported for win32-x64 host builds)`,
+			);
+		}
+		if (host.platform !== "win32" || host.arch !== "x64") {
+			throw new Error(
+				`OMP_NATIVE_TARGET_VARIANT=baseline is supported only for win32-x64 host builds (current ${host.platform}-${host.arch})`,
+			);
+		}
+	}
+
+	let x64Variant: LocalHostAddon["x64Variant"] = null;
+	if (targetVariant === "baseline") {
+		x64Variant = "baseline";
+	} else if (host.arch === "x64") {
+		x64Variant = host.avx2 ? "modern" : "baseline";
+	}
 	const variantSuffix = x64Variant ? `-${x64Variant}` : "";
 	return {
 		filename: `pi_natives.${host.platform}-${host.arch}${variantSuffix}.node`,
