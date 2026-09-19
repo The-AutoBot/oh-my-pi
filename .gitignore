@@ -18,6 +18,10 @@ target/
 # Environment
 .env
 
+# Local Semgrep Guardian state
+/.semgrep/guardian.yml
+/.semgrep/guardian.yml.lock
+
 # Editors
 .vscode/
 .zed/
