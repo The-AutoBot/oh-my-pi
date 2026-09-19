@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { ReadableStreamDefaultReader, ReadableStreamReadResult } from "node:stream/web";
 import { type } from "@oh-my-pi/omptype";
 import {
 	parseAutoBotReleasePayload,
@@ -106,11 +107,15 @@ function parseChannelConfig(value: unknown): AutoBotChannelConfig {
 			throw new Error("AutoBot trusted key ID is invalid");
 		}
 		const key = strictBase64(encodedKey, "AutoBot trusted public key");
-		if (key.byteLength === 0 || key.byteLength > 16 * 1024) throw new Error("AutoBot trusted public key has an invalid size");
+		if (key.byteLength === 0 || key.byteLength > 16 * 1024)
+			throw new Error("AutoBot trusted public key has an invalid size");
 		trustedKeys[keyId] = encodedKey;
 	}
 	if (Object.keys(trustedKeys).length === 0) throw new Error("AutoBot channel has no trusted signing keys");
-	const origins: Record<string, true> = Object.assign(Object.create(null), { [envelope]: true }) as Record<string, true>;
+	const origins: Record<string, true> = Object.assign(Object.create(null), { [envelope]: true }) as Record<
+		string,
+		true
+	>;
 	const extraOrigins: string[] = [];
 	for (const origin of config.allowedArtifactOrigins ?? []) {
 		const normalized = allowedOrigin(origin, "AutoBot allowed artifact origin");
@@ -206,7 +211,7 @@ async function boundedResponseBytes(response: Response, label: string): Promise<
 		}
 		const chunks: Uint8Array[] = [];
 		let size = 0;
-		let reader: ReadableStreamDefaultReader<any>;
+		let reader: ReadableStreamDefaultReader<Uint8Array>;
 		try {
 			reader = response.body.getReader();
 		} catch {
@@ -215,19 +220,17 @@ async function boundedResponseBytes(response: Response, label: string): Promise<
 		let streamCompleted = false;
 		try {
 			while (true) {
-				let done: boolean;
-				let value: Uint8Array;
+				let result: ReadableStreamReadResult<Uint8Array>;
 				try {
-					const result = await reader.read();
-					done = result.done;
-					value = result.value as Uint8Array;
+					result = await reader.read();
 				} catch {
 					throw new Error(`${label} response stream failed`);
 				}
-				if (done) {
+				if (result.done) {
 					streamCompleted = true;
 					break;
 				}
+				const value = result.value;
 				size += value.byteLength;
 				if (size > MAX_CHANNEL_BYTES) throw new Error(`${label} exceeds the maximum size`);
 				chunks.push(value);
@@ -257,10 +260,9 @@ export async function fetchVerifiedAutoBotRelease(
 	deps: AutoBotFetchDeps = {},
 ): Promise<VerifiedAutoBotRelease> {
 	const checkedConfig = parseChannelConfig(config);
-	const allowedOrigins: Record<string, true> = Object.assign(
-		Object.create(null),
-		{ [secureUrl(checkedConfig.envelopeUrl, "AutoBot envelope URL").origin]: true },
-	) as Record<string, true>;
+	const allowedOrigins: Record<string, true> = Object.assign(Object.create(null), {
+		[secureUrl(checkedConfig.envelopeUrl, "AutoBot envelope URL").origin]: true,
+	}) as Record<string, true>;
 	for (const origin of checkedConfig.allowedArtifactOrigins) allowedOrigins[origin] = true;
 	const response = await fetchApproved(
 		checkedConfig.envelopeUrl,
@@ -272,7 +274,9 @@ export async function fetchVerifiedAutoBotRelease(
 	let envelopeValue: unknown;
 	let envelopeJson: string;
 	try {
-		envelopeJson = new TextDecoder("utf-8", { fatal: true }).decode(await boundedResponseBytes(response, "AutoBot release channel"));
+		envelopeJson = new TextDecoder("utf-8", { fatal: true }).decode(
+			await boundedResponseBytes(response, "AutoBot release channel"),
+		);
 		envelopeValue = JSON.parse(envelopeJson);
 	} catch (error) {
 		throw new Error("AutoBot release channel is not valid UTF-8 JSON", { cause: error });
@@ -339,7 +343,7 @@ export async function downloadVerifiedAutoBotAsset(input: {
 			const hash = createHash("sha256");
 			let size = 0;
 			try {
-				let reader: ReadableStreamDefaultReader<any>;
+				let reader: ReadableStreamDefaultReader<Uint8Array>;
 				try {
 					reader = response.body.getReader();
 				} catch {
@@ -348,19 +352,17 @@ export async function downloadVerifiedAutoBotAsset(input: {
 				let streamCompleted = false;
 				try {
 					while (true) {
-						let done: boolean;
-						let value: Uint8Array;
+						let result: ReadableStreamReadResult<Uint8Array>;
 						try {
-							const result = await reader.read();
-							done = result.done;
-							value = result.value as Uint8Array;
+							result = await reader.read();
 						} catch {
 							throw new Error(`AutoBot ${asset.kind} asset response stream failed`);
 						}
-						if (done) {
+						if (result.done) {
 							streamCompleted = true;
 							break;
 						}
+						const value = result.value;
 						size += value.byteLength;
 						if (size > asset.size) throw new Error(`AutoBot ${asset.kind} asset exceeds signed size`);
 						hash.update(value);
@@ -376,7 +378,8 @@ export async function downloadVerifiedAutoBotAsset(input: {
 				await output.close();
 			}
 			if (size !== asset.size) throw new Error(`AutoBot ${asset.kind} asset size does not match signed size`);
-			if (hash.digest("hex") !== asset.sha256) throw new Error(`AutoBot ${asset.kind} asset SHA-256 does not match signed digest`);
+			if (hash.digest("hex") !== asset.sha256)
+				throw new Error(`AutoBot ${asset.kind} asset SHA-256 does not match signed digest`);
 			if (process.platform !== "win32") await fs.chmod(tempPath, 0o755);
 			await fs.rename(tempPath, destinationPath);
 			responseConsumed = true;

@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn, vi } fro
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CollabController } from "@oh-my-pi/pi-coding-agent/collab/controller";
+import { CollabController, type CollabUpdateTarget } from "@oh-my-pi/pi-coding-agent/collab/controller";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost, CollabHostStoppedError } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -748,9 +748,9 @@ describe("interactive collaboration startup", () => {
 });
 
 describe("CollabController", () => {
-	const updateTarget = {
+	const updateTarget: CollabUpdateTarget = {
 		releaseSequence: 1,
-		collabProtocolVersion: 1,
+		collabProtocolVersion: COLLAB_PROTO,
 		webBundleId: "bundle-1",
 	};
 

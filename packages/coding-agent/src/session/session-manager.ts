@@ -2687,6 +2687,7 @@ export class SessionManager {
 	 *   Auto titles are ignored once the user has set a name.
 	 */
 	async setSessionName(name: string, source: SessionTitleSource = "auto", trigger?: string): Promise<boolean> {
+		if (this.#autoBotStandby) return false;
 		if (this.#released) return false;
 		if (this.#titleSource === "user" && source === "auto") return false;
 

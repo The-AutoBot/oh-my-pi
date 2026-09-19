@@ -6,17 +6,20 @@
 
 - Extensions can start or reuse interactive collaboration sessions and observe their lifecycle and pending-input state.
 - Authorized browser guests can provide live voice input and receive assistant audio without using the host microphone.
-- Added operator guidance for the signed AutoBot channel, immutable bootstrap installation/legacy migration, and its external hourly integration and promotion workflows.
+- Added operator guidance for the signed AutoBot channel, immutable bootstrap installation/legacy migration, and the local hourly integration, build, and release producer.
 
 ### Changed
 
-- Maintained custom 18.2.3 collaboration builds use repository-pinned Bun 1.4.0 with a matching source-built native addon through the maintained build scripts, preserving compiled `import.meta` startup.
+- Maintained collaboration builds use pinned Bun 1.4.0 with a matching source-built native addon through the maintained build scripts, preserving compiled `import.meta` startup.
 - Managed AutoBot updates now run serially at safe idle and resume the exact persisted session/profile/cwd/current model without replaying the original prompt. The broker reservation is 390 seconds (270-second execution floor plus 120-second pre-commit margin); candidates have a 60-second ready deadline.
 
 ### Fixed
 
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
+- Prevented standby AutoBot candidates from exposing session title changes before acquiring activation ownership.
+- Restored maintained launch and update integration typing against the current upstream SDK.
+
 ## [18.2.6] - 2026-09-18
 
 ### Fixed
