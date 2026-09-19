@@ -20,6 +20,7 @@
 - Prevented standby AutoBot candidates from exposing session title changes before acquiring activation ownership.
 - Prevented standby AutoBot candidates from attempting session journal repairs before activation.
 - Restored maintained launch and update integration typing against the current upstream SDK.
+- Fixed Windows session enumeration in indexed and in-memory storage when journal paths use native backslash separators.
 ### Breaking Changes
 
 - Removed support for the env parameter in the bash tool

@@ -85,7 +85,12 @@ for await (const raw of console) {
 		const frame = JSON.parse(raw) as Record<string, unknown>;
 		if (frame && typeof frame === "object" && typeof frame.type === "string") {
 			if (Bun.env.MOCK_RPC_EXIT_ON_COMMAND) {
-				process.stderr.write(Bun.env.MOCK_RPC_EXIT_STDERR ?? "");
+				const message = Bun.env.MOCK_RPC_EXIT_STDERR ?? "";
+				if (message) {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					process.stderr.write(message, () => resolve());
+					await promise;
+				}
 				process.exit(Number(Bun.env.MOCK_RPC_EXIT_ON_COMMAND));
 			}
 			if (Bun.env.MOCK_RPC_INVALID_OUTPUT === "1") {

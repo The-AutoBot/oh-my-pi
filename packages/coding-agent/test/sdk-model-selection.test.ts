@@ -113,6 +113,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			agentDir: tempDir,
 			authStorage,
 			modelRegistry,
+			settings: Settings.isolated(),
 			sessionManager: SessionManager.inMemory(),
 			disableExtensionDiscovery: true,
 			extensions: [providerExtension],
@@ -147,40 +148,44 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 	test("resolves explicit dynamic-only modelPattern from fresh runtime cache", async () => {
 		const authStorage = createInMemoryAuthStorage();
-		authStoragesToClose.push(authStorage);
-		const modelsPath = path.join(tempDir, "models.yml");
-		const primerRegistry = new ModelRegistry(authStorage, modelsPath);
-		primerRegistry.registerProvider("runtime-provider", dynamicOnlyProviderConfig, "ext://runtime");
-		await primerRegistry.refreshRuntimeProviders("online");
-		const modelRegistry = new ModelRegistry(authStorage, modelsPath);
-
-		const { session, modelFallbackMessage } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
-			authStorage,
-			modelRegistry,
-			sessionManager: SessionManager.inMemory(),
-			disableExtensionDiscovery: true,
-			extensions: [dynamicOnlyProviderExtension],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMCP: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
-			rules: [],
-			preloadedCustomToolPaths: [],
-			toolNames: ["read"],
-			modelPattern: "runtime-provider/cached-runtime-model",
-		});
-
 		try {
-			expect(session.model?.provider).toBe("runtime-provider");
-			expect(session.model?.id).toBe("cached-runtime-model");
-			expect(modelFallbackMessage).toBeUndefined();
+			const modelsPath = path.join(tempDir, "models.yml");
+			const primerRegistry = new ModelRegistry(authStorage, modelsPath);
+			primerRegistry.registerProvider("runtime-provider", dynamicOnlyProviderConfig, "ext://runtime");
+			await primerRegistry.refreshRuntimeProviders("online");
+			const modelRegistry = new ModelRegistry(authStorage, modelsPath);
+
+			const { session, modelFallbackMessage } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				authStorage,
+				modelRegistry,
+				settings: Settings.isolated(),
+				sessionManager: SessionManager.inMemory(),
+				disableExtensionDiscovery: true,
+				extensions: [dynamicOnlyProviderExtension],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				rules: [],
+				preloadedCustomToolPaths: [],
+				toolNames: ["read"],
+				modelPattern: "runtime-provider/cached-runtime-model",
+			});
+
+			try {
+				expect(session.model?.provider).toBe("runtime-provider");
+				expect(session.model?.id).toBe("cached-runtime-model");
+				expect(modelFallbackMessage).toBeUndefined();
+			} finally {
+				await session.dispose();
+			}
 		} finally {
-			await session.dispose();
+			authStorage.close();
 		}
 	});
 
@@ -220,6 +225,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			authStorage,
 			modelRegistry,
 			model,
+			settings: Settings.isolated(),
 			sessionManager: SessionManager.inMemory(),
 			disableExtensionDiscovery: true,
 			extensions: [extension],
@@ -276,6 +282,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			authStorage,
 			modelRegistry,
 			model: explicitModel,
+			settings: Settings.isolated(),
 			sessionManager: SessionManager.inMemory(),
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -539,6 +546,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			authStorage,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
 			disableExtensionDiscovery: true,
 			extensions: [providerExtension],
 			skills: [],

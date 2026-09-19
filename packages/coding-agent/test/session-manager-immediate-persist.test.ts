@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	MemorySessionStorage,
+	type SessionStorageWriter,
+	type WriteTextAtomicOptions,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
@@ -17,6 +22,47 @@ function makeTempDir(prefix: string): string {
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
+
+class TransientAppendFailureStorage extends FileSessionStorage {
+	failNextAppend = false;
+
+	override openWriter(
+		filePath: string,
+		options?: { flags?: "a" | "w"; onError?: (err: Error) => void },
+	): SessionStorageWriter {
+		const inner = super.openWriter(filePath, options);
+		let error: Error | undefined;
+		const appendSync = (line: string): void => {
+			if (error) throw error;
+			if (this.failNextAppend) {
+				this.failNextAppend = false;
+				error = Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+				options?.onError?.(error);
+				throw error;
+			}
+			if (!inner.appendSync) throw new Error("File writer must expose appendSync");
+			inner.appendSync(line);
+		};
+		return {
+			append: async line => appendSync(line),
+			appendSync,
+			flush: async () => {
+				if (error) throw error;
+				await inner.flush();
+			},
+			flushSync: () => {
+				if (error) throw error;
+				inner.flushSync?.();
+			},
+			isOpen: () => inner.isOpen(),
+			close: async () => {
+				await inner.close();
+				if (error) throw error;
+			},
+			getError: () => error ?? inner.getError(),
+		};
+	}
+}
 
 function assistantMessage(text: string) {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -351,42 +397,36 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("alerts once and retries all in-memory entries after a transient write failure", () => {
 		const cwd = makeTempDir("@pi-write-fail-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const storage = new TransientAppendFailureStorage();
+		const manager = SessionManager.create(cwd, sessionDir, storage);
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 
 		manager.appendMessage(assistantMessage("seed"));
 		manager.appendMessage({ role: "user", content: "ok-user", timestamp: Date.now() });
 
-		const writeSpy = spyOn(fs, "writeSync").mockImplementation(() => {
-			throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
-		});
 		const failures: Error[] = [];
 		manager.onPersistenceError(error => {
 			failures.push(error);
 		});
+		storage.failNextAppend = true;
 
-		try {
-			expect(() =>
-				manager.appendMessage({ role: "user", content: "failed-user", timestamp: Date.now() }),
-			).not.toThrow();
-			expect(() => manager.flushSync()).toThrow("ENOSPC");
-			expect(failures).toHaveLength(1);
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "failed-user", timestamp: Date.now() }),
+		).not.toThrow();
+		expect(() => manager.flushSync()).toThrow("ENOSPC");
+		expect(failures).toHaveLength(1);
 
-			writeSpy.mockRestore();
-			expect(() =>
-				manager.appendMessage({ role: "user", content: "recovered-user", timestamp: Date.now() }),
-			).not.toThrow();
-			expect(() => manager.flushSync()).not.toThrow();
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "recovered-user", timestamp: Date.now() }),
+		).not.toThrow();
+		expect(() => manager.flushSync()).not.toThrow();
 
-			const users = readJsonl(sessionFile)
-				.filter(entry => entry.type === "message" && messageRole(entry) === "user")
-				.map(entry => messageContent(entry));
-			expect(users).toEqual(["ok-user", "failed-user", "recovered-user"]);
-			expect(failures).toHaveLength(1);
-		} finally {
-			writeSpy.mockRestore();
-		}
+		const users = readJsonl(sessionFile)
+			.filter(entry => entry.type === "message" && messageRole(entry) === "user")
+			.map(entry => messageContent(entry));
+		expect(users).toEqual(["ok-user", "failed-user", "recovered-user"]);
+		expect(failures).toHaveLength(1);
 	});
 
 	it("reparents metadata children when durably discarding an entry", async () => {
