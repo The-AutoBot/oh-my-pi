@@ -38,6 +38,13 @@ import {
 	upstreamPackageVersion,
 } from "./autobot-release-integrate.ts";
 import type { CandidateReleaseIdentity } from "./autobot-release-integrate.ts";
+import {
+	assertCandidatePublicationBoundary,
+	assertDeclaredStagedDiff,
+	assertNoForbiddenWorktreeResidue,
+	stageDeclaredRepair,
+} from "./autobot-publication-boundary.ts";
+import type { RepairIntent } from "./autobot-publication-boundary.ts";
 import { runLocalOmp } from "./autobot-local-omp.ts";
 import { buildAndPublishLocalRelease, LocalBuildFailure } from "./autobot-local-release.ts";
 import type { LocalAutomationConfig, LocalCandidate } from "./autobot-local-types.ts";
@@ -649,6 +656,7 @@ async function assertCleanWorktree(worktree: string, localRef: string, base?: st
 	await assertNoUnmergedIndex(worktree);
 	if (await mergeHead(worktree)) throw new AutoBotReleaseError("Local integration retains an unfinished merge");
 	await assertDiffCheck(worktree, base);
+	await assertNoForbiddenWorktreeResidue(worktree);
 	const status = await runCommand(["git", "status", "--porcelain=v1", "-z"], { cwd: worktree, capture: true });
 	if (status.stdout.length !== 0)
 		throw new AutoBotReleaseError("Local integration has retained changes; preserving worktree for inspection");
@@ -671,21 +679,22 @@ async function snapshotLocalRefs(worktree: string): Promise<ReadonlyMap<string, 
 	return refs;
 }
 
-async function assertOnlyManagedRefAdvanced(
+async function assertLocalRefsUnchanged(
 	worktree: string,
 	before: ReadonlyMap<string, string>,
 	localRef: string,
 	previousHead: string,
 ): Promise<void> {
+	if ((await currentCommit(worktree, "Post-OMP integration HEAD")) !== previousHead) {
+		throw new AutoBotReleaseError("OMP changed the managed integration HEAD");
+	}
 	const after = await snapshotLocalRefs(worktree);
-	const names = new Set([...before.keys(), ...after.keys()]);
-	for (const name of names) {
-		const oldValue = before.get(name);
-		const newValue = after.get(name);
-		if (oldValue === newValue) continue;
-		if (name !== localRef || !newValue || !(await isAncestor(worktree, previousHead, newValue))) {
-			throw new AutoBotReleaseError("OMP changed an unauthorized local Git ref");
-		}
+	if (after.get(localRef) !== previousHead) {
+		throw new AutoBotReleaseError("OMP changed the managed integration branch");
+	}
+	if (after.size !== before.size) throw new AutoBotReleaseError("OMP changed an unauthorized local Git ref");
+	for (const [name, object] of before) {
+		if (after.get(name) !== object) throw new AutoBotReleaseError("OMP changed an unauthorized local Git ref");
 	}
 }
 
@@ -786,12 +795,15 @@ async function finalizeMerge(
 	other: string,
 	subject: string,
 	candidate: boolean,
+	repairIntent: RepairIntent | undefined,
 ): Promise<string> {
 	const pending = await mergeHead(worktree);
 	if (pending) {
 		if (pending !== other)
 			throw new AutoBotReleaseError("Local integration merge head differs from its pinned input");
 		await assertNoUnmergedIndex(worktree);
+		if (repairIntent !== undefined) await assertDeclaredStagedDiff(worktree, base, repairIntent, other);
+		await assertNoForbiddenWorktreeResidue(worktree, other);
 		await assertDiffCheck(worktree, base);
 		await runCommand(
 			[
@@ -862,16 +874,16 @@ async function commitPendingChanges(
 	localRef: string,
 	base: string,
 	subject: string,
+	repairIntent: RepairIntent,
 ): Promise<string> {
 	await assertManagedBranch(worktree, localRef);
 	await assertNoUnmergedIndex(worktree);
-	await assertDiffCheck(worktree, base);
 	const before = await currentCommit(worktree, "Pre-commit integration HEAD");
-	const status = await runCommand(["git", "status", "--porcelain=v1", "-z"], { cwd: worktree, capture: true });
-	if (status.stdout.length === 0) return before;
-	await runCommand(["git", "add", "--all"], { cwd: worktree, capture: true });
+	await stageDeclaredRepair(worktree, repairIntent);
 	await assertNoUnmergedIndex(worktree);
 	await assertDiffCheck(worktree, base);
+	const status = await runCommand(["git", "status", "--porcelain=v1", "-z"], { cwd: worktree, capture: true });
+	if (status.stdout.length === 0) return before;
 	await runCommand(
 		[
 			"git",
@@ -899,7 +911,7 @@ async function invokeOmpGuarded(
 	reason: "conflicts" | "compatibility" | "build-failure",
 	sensitivePaths: readonly string[],
 	diagnostics: string | undefined,
-): Promise<void> {
+): Promise<RepairIntent> {
 	const beforeHead = await currentCommit(context.worktree, "Pre-OMP integration HEAD");
 	const localRefs = await snapshotLocalRefs(context.worktree);
 	const remoteRefs = await snapshotRemoteRefs(context.canonicalRepository);
@@ -910,16 +922,19 @@ async function invokeOmpGuarded(
 	if (remoteRefs.refs.get(integrationRef) !== context.expectedIntegrationCommit) {
 		throw new AutoBotReleaseError("Integration branch changed before local OMP execution");
 	}
+	let repairIntent: RepairIntent | undefined;
 	let ompError: unknown;
 	try {
-		await runLocalOmp(context.config, {
-			cwd: context.worktree,
-			reason,
-			forkCommit: beforeHead,
-			upstreamCommit: context.expectedUpstreamCommit,
-			sensitivePaths,
-			diagnostics,
-		});
+		repairIntent = (
+			await runLocalOmp(context.config, {
+				cwd: context.worktree,
+				reason,
+				forkCommit: beforeHead,
+				upstreamCommit: context.expectedUpstreamCommit,
+				sensitivePaths,
+				diagnostics,
+			})
+		).repairIntent;
 	} catch (error) {
 		ompError = error;
 	}
@@ -929,17 +944,16 @@ async function invokeOmpGuarded(
 		if ((await gitOutput(context.worktree, ["remote"])) !== "") {
 			throw new AutoBotReleaseError("OMP added a Git remote to the managed integration worktree");
 		}
-		const afterHead = await currentCommit(context.worktree, "Post-OMP integration HEAD");
-		if (!(await isAncestor(context.worktree, beforeHead, afterHead))) {
-			throw new AutoBotReleaseError("OMP did not preserve the prior integration ancestry");
-		}
-		await assertOnlyManagedRefAdvanced(context.worktree, localRefs, context.localRef, beforeHead);
+		await assertLocalRefsUnchanged(context.worktree, localRefs, context.localRef, beforeHead);
 		assertRemoteSnapshotsEqual(remoteRefs, await snapshotRemoteRefs(context.canonicalRepository));
+		if (reason !== "conflicts") await assertNoForbiddenWorktreeResidue(context.worktree);
 	} catch (error) {
 		postconditionError = error;
 	}
 	if (postconditionError !== undefined) throw postconditionError;
 	if (ompError !== undefined) throw ompError;
+	if (repairIntent === undefined) throw new AutoBotReleaseError("Local OMP returned without a repair intent");
+	return repairIntent;
 }
 
 async function mergePinnedInput(
@@ -955,14 +969,15 @@ async function mergePinnedInput(
 		if (candidate) return createSyntheticCandidateMerge(context.worktree, context.localRef, base, target);
 		throw new AutoBotReleaseError("Required source synchronization was unexpectedly already integrated");
 	}
+	let repairIntent: RepairIntent | undefined;
 	if (outcome === "conflicted") {
 		if (ompAttempts.value >= context.config.maxOmpAttempts) {
 			throw new AutoBotReleaseError("Configured OMP attempt limit reached while resolving an integration conflict");
 		}
 		ompAttempts.value++;
-		await invokeOmpGuarded(context, "conflicts", [], undefined);
+		repairIntent = await invokeOmpGuarded(context, "conflicts", [], undefined);
 	}
-	return finalizeMerge(context.worktree, context.localRef, base, target, subject, candidate);
+	return finalizeMerge(context.worktree, context.localRef, base, target, subject, candidate, repairIntent);
 }
 
 async function assertRemoteInputs(
@@ -986,6 +1001,12 @@ async function assertRemoteInputs(
 }
 
 async function pushIntegrationBranch(context: OmpControllerContext, candidateCommit: string): Promise<string> {
+	await assertCandidatePublicationBoundary(
+		context.worktree,
+		candidateCommit,
+		context.expectedCanonicalCommit,
+		context.expectedUpstreamCommit,
+	);
 	const before = await assertRemoteInputs(
 		context.config,
 		context.canonicalRepository,
@@ -1193,12 +1214,13 @@ async function prepareCandidate(
 		await setPhase("reviewing-compatibility");
 		ompAttempts.value++;
 		const beforeReview = currentHead;
-		await invokeOmpGuarded(context(), "compatibility", candidate.sensitivePaths, undefined);
+		const repairIntent = await invokeOmpGuarded(context(), "compatibility", candidate.sensitivePaths, undefined);
 		currentHead = await commitPendingChanges(
 			managed.worktree,
 			managed.localRef,
 			beforeReview,
 			`chore(autobot): compatibility review ${upstreamCommit.slice(0, 12)}`,
+			repairIntent,
 		);
 		if (!(await isAncestor(managed.worktree, beforeReview, currentHead))) {
 			throw new AutoBotReleaseError("OMP compatibility work did not preserve the candidate ancestry");
@@ -1416,7 +1438,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 				});
 				ompAttempts.value++;
 				const repairBase = publishCandidate.forkCommit;
-				await invokeOmpGuarded(
+				const repairIntent = await invokeOmpGuarded(
 					{
 						config,
 						worktree: managed.worktree,
@@ -1436,6 +1458,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 					managed.localRef,
 					repairBase,
 					`chore(autobot): repair candidate ${upstreamCommit.slice(0, 12)}`,
+					repairIntent,
 				);
 				if (repairedHead === repairBase) {
 					throw new AutoBotReleaseError("OMP returned without changing the failed candidate");
@@ -1474,7 +1497,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 					});
 					ompAttempts.value++;
 					const beforeReview = publishCandidate.forkCommit;
-					await invokeOmpGuarded(
+					const repairIntent = await invokeOmpGuarded(
 						{
 							config,
 							worktree: managed.worktree,
@@ -1494,6 +1517,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 						managed.localRef,
 						beforeReview,
 						`chore(autobot): compatibility review ${upstreamCommit.slice(0, 12)}`,
+						repairIntent,
 					);
 					if (!(await isAncestor(managed.worktree, beforeReview, reviewedHead))) {
 						throw new AutoBotReleaseError(

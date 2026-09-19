@@ -3,9 +3,12 @@ import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
 import { getAgentDir, MAIN_CONFIG_FILENAMES } from "@oh-my-pi/pi-utils";
 import {
+	assertAutoBotPrivateFile,
 	ensureAutoBotPrivateDirectory,
 	normalizeAutoBotPrivateFile,
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
+import { parseRepairIntent } from "./autobot-publication-boundary.ts";
+import type { RepairIntent } from "./autobot-publication-boundary.ts";
 import type { LocalAutomationConfig } from "./autobot-local-types.ts";
 
 export interface LocalOmpRequest {
@@ -17,6 +20,10 @@ export interface LocalOmpRequest {
 	readonly diagnostics?: string;
 }
 
+export interface LocalOmpResult {
+	readonly repairIntent: RepairIntent;
+}
+
 interface OwnedChildProcess {
 	readonly pid: number;
 	readonly exited: Promise<number>;
@@ -26,7 +33,10 @@ interface OwnedChildProcess {
 
 interface PrivateContext {
 	readonly directory: string;
+	readonly intentNonce: string;
+	readonly intentPath: string;
 	readonly path: string;
+	readonly scratchDirectory: string;
 }
 
 const producerRoot = path.resolve(import.meta.dir, "..");
@@ -36,6 +46,7 @@ const maxAffectedPathLength = 512;
 const maxDiagnosticLines = 80;
 const maxDiagnosticLineLength = 512;
 const maxDiagnosticLength = 8 * 1024;
+const maxRepairIntentBytes = 1024 * 1024;
 const minimumWatchdogGraceMilliseconds = 250;
 const maximumWatchdogGraceMilliseconds = 5_000;
 const maximumTimerDelayMilliseconds = 2_147_000_000;
@@ -45,10 +56,16 @@ const commit = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const diagnosticTruncationMarker = "\n[truncated]";
 
 const childEnvironmentOverrides: Record<string, true> = {
+	BUN_INSTALL_CACHE_DIR: true,
+	OMP_AUTOBOT_PRIVATE_CONTEXT: true,
+	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: true,
+	OTEL_SDK_DISABLED: true,
 	PI_AUTO_QA: true,
 	PI_AUTO_QA_PUSH: true,
-	OTEL_SDK_DISABLED: true,
-	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: true,
+	TEMP: true,
+	TMP: true,
+	TMPDIR: true,
+	XDG_CACHE_HOME: true,
 };
 
 const removedChildEnvironment: Record<string, true> = {
@@ -113,7 +130,7 @@ function isRemovedChildEnvironment(name: string): boolean {
 	);
 }
 
-function localOmpEnvironment(): NodeJS.ProcessEnv {
+function localOmpEnvironment(scratchDirectory: string): NodeJS.ProcessEnv {
 	const environment: NodeJS.ProcessEnv = {};
 	for (const [name, value] of Object.entries(Bun.env)) {
 		if (value === undefined || isRemovedChildEnvironment(name)) continue;
@@ -122,12 +139,19 @@ function localOmpEnvironment(): NodeJS.ProcessEnv {
 	for (const name of Object.keys(environment)) {
 		if (childEnvironmentOverrides[name.toUpperCase()] === true) delete environment[name];
 	}
+	const cacheDirectory = path.join(scratchDirectory, "cache");
 	return {
 		...environment,
+		BUN_INSTALL_CACHE_DIR: path.join(cacheDirectory, "bun"),
+		OMP_AUTOBOT_PRIVATE_CONTEXT: scratchDirectory,
+		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "false",
+		OTEL_SDK_DISABLED: "true",
 		PI_AUTO_QA: "0",
 		PI_AUTO_QA_PUSH: "0",
-		OTEL_SDK_DISABLED: "true",
-		OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "false",
+		TEMP: scratchDirectory,
+		TMP: scratchDirectory,
+		TMPDIR: scratchDirectory,
+		XDG_CACHE_HOME: cacheDirectory,
 	};
 }
 
@@ -280,7 +304,10 @@ function sanitizeDiagnostics(value: unknown): string | undefined {
 	return sanitized || undefined;
 }
 
-function privateContextContents(request: LocalOmpRequest): string {
+function privateContextContents(
+	request: LocalOmpRequest,
+	context: Pick<PrivateContext, "intentNonce" | "intentPath" | "scratchDirectory">,
+): string {
 	if (request.reason !== "conflicts" && request.reason !== "compatibility" && request.reason !== "build-failure") {
 		throw new Error("Local OMP request contains an invalid reason");
 	}
@@ -298,6 +325,12 @@ function privateContextContents(request: LocalOmpRequest): string {
 				upstreamCommit: requireCommit(request.upstreamCommit),
 				affectedPaths,
 				diagnostics: sanitizeDiagnostics(request.diagnostics) ?? null,
+				repairIntent: {
+					schemaVersion: 1,
+					path: context.intentPath,
+					nonce: context.intentNonce,
+				},
+				scratchDirectory: context.scratchDirectory,
 			},
 			null,
 			2,
@@ -306,18 +339,47 @@ function privateContextContents(request: LocalOmpRequest): string {
 	].join("\n");
 }
 
-async function createPrivateContext(workRoot: string, contents: string): Promise<PrivateContext> {
+async function createPrivateContext(workRoot: string, request: LocalOmpRequest): Promise<PrivateContext> {
 	let directory: string | undefined;
 	try {
 		const privateWorkRoot = await ensureAutoBotPrivateDirectory(workRoot);
 		directory = await fs.mkdtemp(path.join(privateWorkRoot, "omp-autobot-omp-"));
 		directory = await ensureAutoBotPrivateDirectory(directory);
+		const scratchDirectory = await ensureAutoBotPrivateDirectory(path.join(directory, "scratch"));
+		const intentPath = path.join(directory, "repair-intent.json");
+		const intentNonce = crypto.randomUUID();
 		const contextPath = path.join(directory, "context.md");
-		await fs.writeFile(contextPath, contents, { encoding: "utf8", mode: 0o600 });
-		return { directory, path: await normalizeAutoBotPrivateFile(contextPath) };
+		await fs.writeFile(contextPath, privateContextContents(request, { intentNonce, intentPath, scratchDirectory }), {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+		return {
+			directory,
+			intentNonce,
+			intentPath,
+			path: await normalizeAutoBotPrivateFile(contextPath),
+			scratchDirectory,
+		};
 	} catch {
 		if (directory !== undefined) await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
 		throw new Error("Local OMP private context could not be prepared");
+	}
+}
+
+async function readRepairIntent(context: PrivateContext): Promise<RepairIntent> {
+	try {
+		const intentPath = await assertAutoBotPrivateFile(context.intentPath);
+		const stat = await fs.stat(intentPath);
+		if (!stat.isFile() || stat.size <= 0 || stat.size > maxRepairIntentBytes) throw new Error("invalid size");
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await fs.readFile(intentPath, "utf8"));
+		} catch {
+			throw new Error("invalid JSON");
+		}
+		return parseRepairIntent(parsed, context.intentNonce);
+	} catch {
+		throw new Error("Local OMP repair intent is invalid");
 	}
 }
 
@@ -403,7 +465,7 @@ async function invokeOmp(
 			],
 			{
 				cwd: worktree,
-				env: localOmpEnvironment(),
+				env: localOmpEnvironment(context.scratchDirectory),
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
@@ -452,10 +514,11 @@ async function invokeOmp(
 
 /**
  * Run the installed OMP CLI only inside the controller-owned worktree. A zero
- * CLI exit means execution completed; the caller must independently validate
- * Git state, source correctness, builds, and release policy.
+ * CLI exit and valid private repair intent mean execution completed; the caller
+ * must independently validate Git state, source correctness, builds, and
+ * release policy.
  */
-export async function runLocalOmp(config: LocalAutomationConfig, request: LocalOmpRequest): Promise<void> {
+export async function runLocalOmp(config: LocalAutomationConfig, request: LocalOmpRequest): Promise<LocalOmpResult> {
 	if (process.platform !== "win32" || process.arch !== "x64") {
 		throw new Error("Local OMP automation supports Windows x64 only");
 	}
@@ -464,25 +527,25 @@ export async function runLocalOmp(config: LocalAutomationConfig, request: LocalO
 	await requireRegularFile(presetPath, "Local OMP integration preset is unavailable");
 	const watchdogDelay = parseWatchdogDelay(config.ompMaxTime);
 	const profileConfig = await activeProfileConfig();
-	const context = await createPrivateContext(config.workRoot, privateContextContents(request));
+	const context = await createPrivateContext(config.workRoot, request);
+	let result: LocalOmpResult | undefined;
+	let failure: Error | undefined;
 	try {
 		await invokeOmp({ ...config, ompExecutable: executable }, worktree, context, profileConfig, watchdogDelay);
+		result = { repairIntent: await readRepairIntent(context) };
 	} catch (error) {
-		const failure =
+		failure =
 			error instanceof Error && error.message.startsWith("Local OMP")
 				? error
 				: new Error("Local OMP invocation failed");
-		let cleanupError: Error | undefined;
-		try {
-			await removePrivateContext(context);
-		} catch (cleanupFailure) {
-			cleanupError =
-				cleanupFailure instanceof Error
-					? cleanupFailure
-					: new Error("Local OMP private context could not be removed");
-		}
-		if (cleanupError !== undefined) throw new Error("Local OMP failed and its private context could not be removed");
-		throw failure;
 	}
-	await removePrivateContext(context);
+	try {
+		await removePrivateContext(context);
+	} catch {
+		if (failure !== undefined) throw new Error("Local OMP failed and its private context could not be removed");
+		throw new Error("Local OMP private context could not be removed");
+	}
+	if (failure !== undefined) throw failure;
+	if (result === undefined) throw new Error("Local OMP invocation failed");
+	return result;
 }

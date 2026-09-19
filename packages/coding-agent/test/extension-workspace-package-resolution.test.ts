@@ -2,6 +2,7 @@ import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as url from "node:url";
 import { __rewriteLegacyExtensionSourceForTests } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -54,8 +55,8 @@ test("bare workspace-member imports resolve through the workspace root manifest"
 		'import { marker } from "@monorepo/contracts";',
 		importer,
 	);
-
-	expect(rewritten).toContain(path.join("packages", "contracts", "src", "index.ts"));
+	const memberUrl = url.pathToFileURL(await fs.realpath(path.join(memberRoot, "src", "index.ts"))).href;
+	expect(rewritten).toContain(JSON.stringify(memberUrl));
 });
 
 test("installed node_modules copies shadow workspace members at the same level", async () => {

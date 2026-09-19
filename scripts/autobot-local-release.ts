@@ -7,6 +7,7 @@ import {
 	AUTO_BOT_RELEASE_SCHEMA_VERSION,
 	AUTO_BOT_SESSION_FORMAT_VERSION,
 } from "../packages/coding-agent/src/autobot-update/contract.ts";
+import { ensureAutoBotPrivateDirectory } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { isRecord } from "../packages/utils/src/type-guards.ts";
 import {
 	AutoBotReleaseError,
@@ -293,6 +294,47 @@ async function assertExactBun(executable: string, expectedVersion: string, label
 		throw new AutoBotReleaseError(`${label} does not match its configured exact version`);
 }
 
+/**
+ * Candidate commands may create user state and Bun's global cache. Keep both
+ * in the release stage rather than the candidate checkout.
+ */
+async function createPrivateCommandEnvironment(
+	root: string,
+	environment: NodeJS.ProcessEnv,
+): Promise<NodeJS.ProcessEnv> {
+	const privateRoot = await ensureAutoBotPrivateDirectory(root);
+	const [home, xdgConfig, xdgData, xdgCache, xdgState, appData, localAppData, bunCache] = await Promise.all([
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "home")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-config")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-data")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-cache")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-state")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "appdata")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "localappdata")),
+		ensureAutoBotPrivateDirectory(path.join(privateRoot, "bun-cache")),
+	]);
+	return {
+		...environment,
+		HOME: home,
+		USERPROFILE: home,
+		XDG_CONFIG_HOME: xdgConfig,
+		XDG_DATA_HOME: xdgData,
+		XDG_CACHE_HOME: xdgCache,
+		XDG_STATE_HOME: xdgState,
+		APPDATA: appData,
+		LOCALAPPDATA: localAppData,
+		BUN_INSTALL_CACHE_DIR: bunCache,
+	};
+}
+
+export async function createCandidateBuildEnvironment(
+	stageRoot: string,
+	environment: NodeJS.ProcessEnv,
+): Promise<NodeJS.ProcessEnv> {
+	return createPrivateCommandEnvironment(path.join(stageRoot, "candidate-environment"), environment);
+}
+
+/** Publisher and coordinator commands retain the operator's credential and signing environment. */
 function commandEnvironment(config: LocalAutomationConfig, temporaryRoot: string): NodeJS.ProcessEnv {
 	const environment: NodeJS.ProcessEnv = {
 		...process.env,
@@ -851,16 +893,17 @@ async function buildCandidateAssets(
 	environment: NodeJS.ProcessEnv,
 ): Promise<CandidateAssets> {
 	const sourceRoot = candidate.sourceRoot;
+	const candidateEnvironment = await createCandidateBuildEnvironment(stageRoot, environment);
 	const inputs = path.join(stageRoot, "release-inputs");
 	await fs.mkdir(inputs);
 	await runQuiet("Candidate dependency installation", [config.runnerBun, "install", "--frozen-lockfile"], {
 		cwd: sourceRoot,
-		env: environment,
+		env: candidateEnvironment,
 	});
 	await candidateBuildStage("Browser relay build failed", () =>
 		runQuiet("Browser relay build", [config.runnerBun, "--cwd=packages/browser-relay", "run", "build"], {
 			cwd: sourceRoot,
-			env: environment,
+			env: candidateEnvironment,
 		}),
 	);
 	await candidateBuildStage("Browser relay build did not produce its required embedded assets", async () => {
@@ -888,12 +931,12 @@ async function buildCandidateAssets(
 	await candidateBuildStage("Collab web build failed", () =>
 		runQuiet("Collab web build", [config.runnerBun, "--cwd=packages/collab-web", "run", "build"], {
 			cwd: sourceRoot,
-			env: environment,
+			env: candidateEnvironment,
 		}),
 	);
-	await buildWindowsBaselineAddon(config, sourceRoot, environment);
+	await buildWindowsBaselineAddon(config, sourceRoot, candidateEnvironment);
 	const compilerEnvironment: NodeJS.ProcessEnv = {
-		...environment,
+		...candidateEnvironment,
 		OMP_AUTOBOT_BUILD_IDENTITY: JSON.stringify(identity),
 	};
 	await candidateBuildStage("Windows x64 runtime compilation failed", () =>
@@ -909,17 +952,12 @@ async function buildCandidateAssets(
 		await requireRegularFile(builtRuntime, "Windows x64 runtime");
 		await fs.copyFile(builtRuntime, runtime, fsConstants.COPYFILE_EXCL);
 	});
-	const smokeRoot = await fs.mkdtemp(path.join(stageRoot, "runtime-smoke-"));
-	const smokeEnvironment: NodeJS.ProcessEnv = {
-		...environment,
-		HOME: path.join(smokeRoot, "home"),
-		USERPROFILE: path.join(smokeRoot, "home"),
-		XDG_DATA_HOME: path.join(smokeRoot, "xdg"),
-		APPDATA: path.join(smokeRoot, "appdata"),
-		LOCALAPPDATA: path.join(smokeRoot, "localappdata"),
-		PI_NATIVE_VARIANT: "baseline",
-	};
+	const smokeRoot = path.join(stageRoot, "candidate-environment", "runtime-smoke");
 	try {
+		const smokeEnvironment: NodeJS.ProcessEnv = {
+			...(await createPrivateCommandEnvironment(smokeRoot, candidateEnvironment)),
+			PI_NATIVE_VARIANT: "baseline",
+		};
 		await candidateBuildStage("Windows x64 runtime --version check failed", () =>
 			runQuiet("Windows x64 runtime version check", [runtime, "--version"], { env: smokeEnvironment }),
 		);
@@ -954,7 +992,7 @@ async function buildCandidateAssets(
 			[config.runnerBun, "scripts/autobot-build-bootstrap.ts", "--target", RELEASE_TARGET, "--out", bootstrap],
 			{
 				cwd: sourceRoot,
-				env: { ...environment, AUTOBOT_COMPILER_BUN: config.compilerBun },
+				env: { ...candidateEnvironment, AUTOBOT_COMPILER_BUN: config.compilerBun },
 			},
 		),
 	);
@@ -964,13 +1002,13 @@ async function buildCandidateAssets(
 	await candidateBuildStage("Focused coding-agent runtime checks failed", () =>
 		runQuiet("Focused coding-agent runtime checks", [config.runnerBun, "run", "ci:test:coding-agent:runtime"], {
 			cwd: sourceRoot,
-			env: environment,
+			env: candidateEnvironment,
 		}),
 	);
 	await candidateBuildStage("Focused collab web checks failed", () =>
 		runQuiet("Focused collab web checks", [config.runnerBun, "--cwd=packages/collab-web", "test"], {
 			cwd: sourceRoot,
-			env: environment,
+			env: candidateEnvironment,
 		}),
 	);
 	await candidateBuildStage("Focused release contract checks failed", () =>
@@ -979,15 +1017,25 @@ async function buildCandidateAssets(
 			[config.runnerBun, "test", "scripts/autobot-release-security.test.ts"],
 			{
 				cwd: sourceRoot,
-				env: environment,
+				env: candidateEnvironment,
 			},
 		),
 	);
 	await candidateBuildStage("Focused installer contract checks failed", () =>
 		runQuiet("Focused installer contract checks", [config.runnerBun, "test", "scripts/autobot-install.test.ts"], {
 			cwd: sourceRoot,
-			env: environment,
+			env: candidateEnvironment,
 		}),
+	);
+	await candidateBuildStage("Candidate execution environment isolation checks failed", () =>
+		runQuiet(
+			"Candidate execution environment isolation checks",
+			[config.runnerBun, "test", "tests/autobot-local-release-environment.test.ts"],
+			{
+				cwd: sourceRoot,
+				env: candidateEnvironment,
+			},
+		),
 	);
 	const webBundleId = await candidateBuildStage("Collab web bundle identity derivation failed", () =>
 		deriveManagedBundleId(
