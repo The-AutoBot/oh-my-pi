@@ -384,6 +384,24 @@ function ownerId(repository: string, producerRoot: string): string {
 	return sha256(`${repository}\u0000${path.resolve(producerRoot).toLowerCase()}`);
 }
 
+function parseOwner(value: unknown): LocalOwner {
+	if (!isRecord(value)) throw new AutoBotReleaseError("Local work root owner record is invalid");
+	requireExactKeys(value, ["schemaVersion", "repository", "ownerId"], "Local work root owner record");
+	if (value.schemaVersion !== OWNER_SCHEMA_VERSION) {
+		throw new AutoBotReleaseError("Local work root owner schema is unsupported");
+	}
+	const parsedOwnerId = parseOptionalFingerprint(value.ownerId, "Work root owner identity");
+	if (!parsedOwnerId) throw new AutoBotReleaseError("Local work root owner identity is missing");
+	return {
+		schemaVersion: OWNER_SCHEMA_VERSION,
+		repository: requireGitHubRepository(
+			requireString(value.repository, "Work root owner repository"),
+			"Work root owner repository",
+		),
+		ownerId: parsedOwnerId,
+	};
+}
+
 async function pathExists(pathname: string): Promise<boolean> {
 	return fs
 		.lstat(pathname)
