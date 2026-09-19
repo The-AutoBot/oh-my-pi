@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed building the browser relay extension on Windows without installing the Unix `zip` command.
+
 ## [18.0.7] - 2026-08-26
 
 ### Changed
