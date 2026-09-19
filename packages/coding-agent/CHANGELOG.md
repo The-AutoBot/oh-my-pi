@@ -18,6 +18,7 @@
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
 - Prevented standby AutoBot candidates from exposing session title changes before acquiring activation ownership.
+- Prevented standby AutoBot candidates from attempting session journal repairs before activation.
 - Restored maintained launch and update integration typing against the current upstream SDK.
 
 ## [18.2.6] - 2026-09-18
