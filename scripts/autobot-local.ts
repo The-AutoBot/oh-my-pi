@@ -996,15 +996,44 @@ async function pushIntegrationBranch(context: OmpControllerContext, candidateCom
 	return candidateCommit;
 }
 
-function compatibilityFingerprint(candidate: LocalCandidate): string {
-	return sha256(
+async function compatibilityFingerprint(candidate: LocalCandidate, canonicalCommit: string): Promise<string> {
+	// Bind review coverage to exact compatibility-relevant changes, not whole
+	// candidate roots: non-sensitive integrations and repairs retain coverage,
+	// while a changed sensitive blob or compatibility epoch must re-run review.
+	const basis = [String(candidate.compatibilityEpoch), ...candidate.sensitivePaths];
+	if (candidate.sensitivePaths.length === 0) return sha256(basis.join("\u0000"));
+	const compatibilityDiff = await runCommand(
 		[
+			"git",
+			"diff",
+			"--no-ext-diff",
+			"--no-textconv",
+			"--raw",
+			"-z",
+			"--no-abbrev",
+			"--no-renames",
+			requireCommit(canonicalCommit, "Canonical compatibility base"),
 			candidate.forkCommit,
-			candidate.upstreamCommit,
-			String(candidate.compatibilityEpoch),
-			...candidate.sensitivePaths,
-		].join("\u0000"),
+		],
+		{ cwd: candidate.sourceRoot, capture: true },
 	);
+	const fields = compatibilityDiff.stdout.split("\u0000");
+	if (fields.at(-1) !== "") throw new AutoBotReleaseError("Compatibility diff metadata is malformed");
+	const pending = new Set(candidate.sensitivePaths);
+	if (pending.size !== candidate.sensitivePaths.length) {
+		throw new AutoBotReleaseError("Candidate compatibility paths contain duplicates");
+	}
+	const records: string[] = [];
+	for (let index = 0; index < fields.length - 1; index += 2) {
+		const header = fields[index];
+		const pathname = fields[index + 1];
+		if (!header?.startsWith(":") || pathname === undefined) {
+			throw new AutoBotReleaseError("Compatibility diff metadata is malformed");
+		}
+		if (pending.delete(pathname)) records.push(header, pathname);
+	}
+	if (pending.size !== 0) throw new AutoBotReleaseError("Compatibility diff omitted a declared sensitive path");
+	return sha256([...basis, ...records].join("\u0000"));
 }
 
 function buildFailureFingerprint(candidate: LocalCandidate): string {
@@ -1138,7 +1167,7 @@ async function prepareCandidate(
 		identity,
 		sourceChanged || currentState.publishedForkCommit !== currentHead,
 	);
-	const reviewKey = compatibilityFingerprint(candidate);
+	const reviewKey = await compatibilityFingerprint(candidate, canonicalCommit);
 	if (candidate.sensitivePaths.length > 0 && currentState.compatibilityReviewFingerprint !== reviewKey) {
 		if (ompAttempts.value >= config.maxOmpAttempts) {
 			throw new AutoBotReleaseError("Configured OMP attempt limit reached for compatibility review");
@@ -1158,7 +1187,7 @@ async function prepareCandidate(
 		}
 		identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, currentHead);
 		candidate = candidateFromIdentity(managed.worktree, currentHead, upstreamCommit, upstreamVersion, identity, true);
-		const reviewedFingerprint = compatibilityFingerprint(candidate);
+		const reviewedFingerprint = await compatibilityFingerprint(candidate, canonicalCommit);
 		currentState = {
 			...currentState,
 			compatibilityReviewFingerprint: reviewedFingerprint,
@@ -1411,7 +1440,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 					true,
 				);
 				publishCandidateMerge = repairedMerge.commit;
-				const repairReviewKey = compatibilityFingerprint(publishCandidate);
+				const repairReviewKey = await compatibilityFingerprint(publishCandidate, canonicalCommit);
 				if (
 					publishCandidate.sensitivePaths.length > 0 &&
 					state.compatibilityReviewFingerprint !== repairReviewKey
@@ -1468,10 +1497,11 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 						true,
 					);
 					publishCandidateMerge = reviewedMerge.commit;
+					const reviewedFingerprint = await compatibilityFingerprint(publishCandidate, canonicalCommit);
 					state = await transition(config.workRoot, state, "building", {
 						candidateCommit: publishCandidate.forkCommit,
 						candidateMergeCommit: publishCandidateMerge,
-						compatibilityReviewFingerprint: compatibilityFingerprint(publishCandidate),
+						compatibilityReviewFingerprint: reviewedFingerprint,
 					});
 				}
 				state = await transition(config.workRoot, state, "synchronizing", {

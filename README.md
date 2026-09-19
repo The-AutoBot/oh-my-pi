@@ -637,7 +637,7 @@ installation flow. Its bootstrap is immutable: it accepts only a locally
 configured signed channel and locally trusted Ed25519 public keys, then stages
 verified runtimes under its private installation root.
 
-#### Operator setup and hourly producer workflows
+#### Operator setup and hourly local producer
 
 The retired Actions producers have been replaced by one local, Windows x64
 producer. It is operator-run under a single Windows account with that account's
@@ -671,15 +671,9 @@ fields are rejected):
   `ompMaxTime` as a positive `s`, `m`, or `h` duration no longer than two
   hours.
 
-From the committed trusted producer checkout, an operator can run the
-controller once with absolute existing-file paths:
-
-```powershell
-& 'C:\tools\bun\bun.exe' .\scripts\autobot-local.ts `
-  --config 'C:\secure\autobot-local.json'
-```
-
-The scheduled-task launcher uses the same entrypoint:
+From the committed trusted producer checkout, run the launcher once with
+absolute existing-file paths. Use this same launcher for manual and scheduled
+runs so both participate in its non-overlap guard:
 
 ```powershell
 & .\scripts\Invoke-AutoBotLocalBuild.ps1 `
@@ -712,8 +706,8 @@ pushing the dedicated integration branch. OMP is invoked only to resolve an
 integration conflict, review a sensitive compatibility change, or repair a
 candidate build/check failure. Its zero exit is not trusted alone: afterward
 the controller independently checks the worktree, ancestry, refs, and remote
-snapshot. OMP cannot add a remote or change anything except the managed local
-candidate ref; any fix must be committed while retaining candidate ancestry.
+snapshot. Added remotes or unexpected ref changes fail validation; the controller
+commits accepted fixes while retaining candidate ancestry.
 Candidate failures may consume only the configured OMP attempts; other
 failures block the run rather than being repaired or retried.
 
@@ -723,9 +717,8 @@ bootstrap (`win32-x64`), coordinator client (`universal`), and collab web
 bundle (`web`). It performs focused candidate checks and fresh-home runtime
 smokes, signs and verifies the local bundle, uploads a draft, downloads and
 verifies the published bytes independently, publishes that verified draft, and
-advances the signed channel last. This documents the local controls and
-observed Windows x64 subsystem smokes; it does not claim that a full pipeline,
-installation, deployment, or cross-platform release has occurred.
+advances the signed channel last. It does not install a runtime, change PATH,
+or deploy the coordinator.
 
 #### Install or migrate the immutable bootstrap
 
