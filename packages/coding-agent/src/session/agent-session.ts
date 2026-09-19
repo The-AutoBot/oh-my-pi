@@ -5203,15 +5203,17 @@ export class AgentSession {
 
 	/**
 	 * On the first successful response from a lazy-load local model, re-probe its
-	 * runtime context window and fold the result into the live session model.
+	 * runtime metadata and fold any resolved model change into the live session.
 	 *
 	 * Discovery snapshots a not-yet-loaded LM Studio model with its architectural
 	 * `max_context_length`; the runtime `loaded_context_length` only exists once
 	 * the model JIT-loads on the first inference (llama.cpp has the same cold-start
-	 * gap for `meta.n_ctx`). A 2xx here means the load completed, so the probe now
-	 * returns the window the backend actually serves. Compaction and the context
-	 * bar read `agent.state.model` every turn, so `agent.setModel` propagates it
-	 * immediately without a provider-session reset (#9001).
+	 * gap for `meta.n_ctx`). llama.cpp also reports its loaded vision modalities
+	 * through `/props`. A 2xx here means the load completed, so rebind the
+	 * effective limits and modalities the backend actually serves. Compaction and
+	 * the context bar read `agent.state.model` every turn; reconciling the
+	 * dependent tools keeps their capability view in step without a provider-session
+	 * reset (#9001).
 	 *
 	 * Returns `void` synchronously when nothing is due — the common case — so the
 	 * no-callback `#onResponse` fast path stays allocation-free.
@@ -5229,14 +5231,15 @@ export class AgentSession {
 		try {
 			const refreshed = await this.#modelRegistry.refreshSelectedModelMetadata(model);
 			const current = this.model;
-			// Skip if the user switched models mid-stream, or the runtime window
-			// matches what the session already holds.
-			if (!current || !modelsAreEqual(current, refreshed) || refreshed.contextWindow === current.contextWindow) {
+			// Skip if the user switched models mid-stream, or the native probe
+			// did not change this selector's resolved metadata.
+			if (!current || !modelsAreEqual(current, refreshed) || Bun.deepEquals(current, refreshed)) {
 				return;
 			}
 			this.agent.setModel(refreshed);
+			await this.#reconcileModelDependentState(current, refreshed);
 		} catch (error) {
-			logger.debug("Lazy local model context refresh failed", {
+			logger.debug("Lazy local model metadata refresh failed", {
 				provider: model.provider,
 				model: model.id,
 				error,
@@ -11222,9 +11225,9 @@ export class AgentSession {
 	 * discovery; the bundled base entry still carries the full long-context
 	 * window, so a fresh session runs with the 1.05M window that contradicts the
 	 * 400K catalog value until the user re-selects the same model. Re-look-up the
-	 * active selector post-discovery and, when its context window changed, fold
-	 * the refreshed spec into the live model. Same selector, so this is a metadata
-	 * refresh with no provider-session reset; reconcile model-dependent tools and
+	 * active selector post-discovery and, when the resolved model differs,
+	 * fold the refreshed spec into the live model. Same selector, so this is a
+	 * metadata refresh with no provider-session reset; reconcile model-dependent
 	 * append-only state before `model_changed` notifies the status line and RPC
 	 * subscribers. Issue #10488.
 	 */
@@ -11239,7 +11242,7 @@ export class AgentSession {
 		const current = this.model;
 		if (!current || !modelsAreEqual(current, boundAtStartup)) return;
 		const refreshed = this.#modelRegistry.find(current.provider, current.id);
-		if (!refreshed || refreshed.contextWindow === current.contextWindow) return;
+		if (!refreshed || Bun.deepEquals(current, refreshed)) return;
 		this.agent.setModel(refreshed);
 		await this.#reconcileModelDependentState(current, refreshed);
 		if (this.#isDisposed) return;

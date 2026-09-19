@@ -18,7 +18,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { buildDiscoveredModel, buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -5804,6 +5804,142 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.id).toBe("deepseek-v4-tiered");
 		expect(session.model?.contextWindow).toBe(400_000);
 		expect(session.getContextUsage()?.contextWindow).toBe(400_000);
+	});
+
+	it("rebinds same-selector post-discovery routing policy when its context window is unchanged", async () => {
+		authStorage.setRuntimeApiKey("ollama-cloud", "ollama-cloud-test-key");
+		const staleModel = buildModel({
+			id: "qwen3-8b",
+			name: "Qwen3 8B",
+			api: "openai-responses",
+			provider: "ollama-cloud",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 32_000,
+		});
+		const discoveredModel = buildDiscoveredModel(
+			{
+				id: "qwen3-8b",
+				name: "Qwen3 8B",
+				api: "openai-responses",
+				provider: "ollama-cloud",
+				baseUrl: "http://127.0.0.1:8080/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 32_000,
+			},
+			"llama.cpp",
+		);
+		expect(discoveredModel.contextWindow).toBe(staleModel.contextWindow);
+		expect(discoveredModel.api).toBe("openai-completions");
+		writeModelCache(
+			"ollama-cloud",
+			Date.now(),
+			[discoveredModel],
+			true,
+			"",
+			path.join(tempDir.path(), "models.db"),
+		);
+		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.json"));
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: staleModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				throw new Error("Not exercised");
+			},
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: registry,
+			rebindModelAfterDiscovery: true,
+		});
+
+		const { promise: modelChanged, resolve: resolveModelChanged } = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "model_changed") {
+				unsubscribe();
+				resolveModelChanged();
+			}
+		});
+
+		registry.refreshInBackground("offline");
+		await Promise.race([
+			modelChanged,
+			scheduler.wait(5_000).then(() => {
+				throw new Error("model_changed was not emitted after discovery settled");
+			}),
+		]);
+
+		expect(session.model?.id).toBe("qwen3-8b");
+		expect(session.model?.api).toBe("openai-completions");
+		expect(session.model?.providerType).toBe("llama.cpp");
+		expect(session.model?.reasoning).toBe(true);
+	});
+
+	it("rebinds same-selector lazy metadata when its context window is unchanged", async () => {
+		const staleModel = buildModel({
+			id: "lazy-vision",
+			name: "Lazy Vision",
+			api: "ollama-chat",
+			provider: "llama.cpp",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 32_000,
+		});
+		const refreshedModel = buildModel({
+			id: "lazy-vision",
+			name: "Lazy Vision",
+			api: "ollama-chat",
+			provider: "llama.cpp",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_000,
+		});
+		expect(refreshedModel.contextWindow).toBe(staleModel.contextWindow);
+		const lazyMetadata = vi.spyOn(modelRegistry, "hasLazyRuntimeMetadata").mockReturnValue(true);
+		const refreshMetadata = vi.spyOn(modelRegistry, "refreshSelectedModelMetadata").mockResolvedValue(refreshedModel);
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: staleModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: async (model, _context, options) => {
+				await options?.onResponse?.({ status: 200, headers: {} }, model);
+				return recoveredTextStream(model, "ok");
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		try {
+			await session.prompt("Load the local vision model");
+			await session.waitForIdle();
+
+			expect(refreshMetadata).toHaveBeenCalledWith(staleModel);
+			expect(session.model?.input).toEqual(["text", "image"]);
+			expect(session.model?.maxTokens).toBe(16_000);
+		} finally {
+			refreshMetadata.mockRestore();
+			lazyMetadata.mockRestore();
+		}
 	});
 
 	it("warns on unknown or malformed model-selector chain keys at startup", () => {

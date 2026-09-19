@@ -25,19 +25,19 @@ function assistant(content: AssistantMessage["content"], stopReason: AssistantMe
 }
 
 const payload = [
-	'<SM:EDIT path="src/a.ts">',
-	"<SM:FIND>",
+	"*** SM:EDIT src/a.ts",
+	"*** SM:FIND",
 	"const x = 1;",
-	"</SM:FIND>",
-	"<SM:PUT>",
+	"*** SM:PUT",
 	"const x = 2;",
-	"</SM:PUT>",
-	"</SM:EDIT>",
 ].join("\n");
 
 describe("recoverInlineSloppyEdit", () => {
 	test("lifts a stray payload out of prose into a synthetic edit tool call", () => {
-		const message = assistant([{ type: "text", text: `Fixing the constant.\n\n${payload}\n\nDone.` }], "stop");
+		const message = assistant(
+			[{ type: "text", text: `Fixing the constant.\n\n${payload}\n*** End Patch\n\nDone.` }],
+			"stop",
+		);
 
 		expect(recoverInlineSloppyEdit(message)).toBe(1);
 		const text = message.content.find(block => block.type === "text");

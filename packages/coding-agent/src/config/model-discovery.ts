@@ -815,6 +815,7 @@ export async function discoverOpenAIModelsList(
 	const models = payload.data ?? [];
 	const references = getBundledModelReferenceIndex();
 	const discovered: Model<Api>[] = [];
+	const isLmStudio = providerConfig.discovery.type === "lm-studio";
 	for (const item of models) {
 		const id = item.id;
 		if (!id) continue;
@@ -841,41 +842,44 @@ export async function discoverOpenAIModelsList(
 			nativeMetadataForModel?.contextWindow ??
 			reference?.contextWindow ??
 			DISCOVERY_DEFAULT_CONTEXT_WINDOW;
+		const spec = {
+			id,
+			name: reference?.name ?? id,
+			api,
+			provider: providerConfig.provider,
+			baseUrl,
+			reasoning: reference?.reasoning ?? false,
+			thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
+			input: nativeMetadataForModel?.input ??
+				extractOpenAIModelsListInputCapabilities(item) ??
+				reference?.input ?? ["text"],
+			...(isLmStudio ? { imageInputDecoder: "stb" as const } : {}),
+			// Proxy/gateway pricing is provider-specific and rarely matches
+			// upstream bundled catalogs, so keep costs local-unknown even
+			// when we successfully recover the upstream model identity.
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow,
+			// Cap the reference's output limit at the discovered context
+			// window so an ID collision with a larger bundled model can
+			// never request more tokens than the local runtime advertises.
+			maxTokens: Math.min(reference?.maxTokens ?? discoveryDefaultMaxTokens(api), contextWindow),
+			headers,
+			compat: {
+				supportsStore: false,
+				supportsDeveloperRole: false,
+				supportsReasoningEffort: referenceCompat?.supportsReasoningEffort ?? false,
+				...(referenceCompat?.reasoningEffortMap
+					? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
+					: {}),
+				...(referenceCompat?.omitReasoningEffort !== undefined
+					? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
+					: {}),
+			},
+		} as ModelSpec<Api>;
 		discovered.push(
-			buildModel({
-				id,
-				name: reference?.name ?? id,
-				api,
-				provider: providerConfig.provider,
-				baseUrl,
-				reasoning: reference?.reasoning ?? false,
-				thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
-				input: nativeMetadataForModel?.input ??
-					extractOpenAIModelsListInputCapabilities(item) ??
-					reference?.input ?? ["text"],
-				...(providerConfig.discovery.type === "lm-studio" ? { imageInputDecoder: "stb" as const } : {}),
-				// Proxy/gateway pricing is provider-specific and rarely matches
-				// upstream bundled catalogs, so keep costs local-unknown even
-				// when we successfully recover the upstream model identity.
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow,
-				// Cap the reference's output limit at the discovered context
-				// window so an ID collision with a larger bundled model can
-				// never request more tokens than the local runtime advertises.
-				maxTokens: Math.min(reference?.maxTokens ?? discoveryDefaultMaxTokens(api), contextWindow),
-				headers,
-				compat: {
-					supportsStore: false,
-					supportsDeveloperRole: false,
-					supportsReasoningEffort: referenceCompat?.supportsReasoningEffort ?? false,
-					...(referenceCompat?.reasoningEffortMap
-						? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
-						: {}),
-					...(referenceCompat?.omitReasoningEffort !== undefined
-						? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
-						: {}),
-				},
-			} as ModelSpec<Api>),
+			// A configured provider name is credential identity, not its backend:
+			// retain LM Studio so its Qwen template policy survives rebuilds.
+			isLmStudio ? buildDiscoveredModel(spec, "lm-studio") : buildModel(spec),
 		);
 	}
 	return discovered;

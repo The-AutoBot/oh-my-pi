@@ -11,6 +11,8 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { mintToolCallId } from "@oh-my-pi/pi-ai/dialect";
 import { extractInlineSloppyRegions } from "@oh-my-pi/pi-natives";
 
+const INLINE_SLOPPY_END_PATCH = /^[ \t]*\*{3}\s*End\b[^\r\n]*(?:\r?\n|$)/iu;
+
 /**
  * Convert stray sloppy payloads in `message`'s text blocks into one synthetic
  * `edit` tool call. Mutates the message in place; returns the number of
@@ -34,6 +36,10 @@ export function recoverInlineSloppyEdit(message: AssistantMessage): number {
 			remaining += block.text.slice(cursor, region.start);
 			cursor = region.end;
 			payloads.push(region.payload);
+			// Header payloads use `*** End Patch` to delimit following prose. The
+			// sentinel is control syntax, not assistant text, so lift it too.
+			const endPatch = INLINE_SLOPPY_END_PATCH.exec(block.text.slice(cursor));
+			if (endPatch) cursor += endPatch[0].length;
 		}
 		remaining += block.text.slice(cursor);
 		block.text = remaining;
