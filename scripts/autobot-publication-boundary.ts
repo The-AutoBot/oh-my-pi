@@ -44,6 +44,7 @@ const SENSITIVE_LOCAL_FILENAMES: Record<string, true> = {
 
 interface PathChange {
 	readonly path: string;
+	readonly status: string;
 }
 
 interface TreeEntry {
@@ -99,6 +100,7 @@ function parseNameStatus(value: string, label: string): PathChange[] {
 		}
 		changes.push({
 			path: normalizeRepositoryPath(pathname, `${label} path`),
+			status,
 		});
 	}
 	return changes;
@@ -156,6 +158,16 @@ function assertNoForbiddenPaths(paths: Iterable<string>): void {
 	}
 }
 
+function assertNoForbiddenChanges(changes: Iterable<PathChange>): void {
+	for (const change of changes) {
+		if (change.status === "D") continue;
+		const violation = pathViolation(change.path);
+		if (violation !== undefined) {
+			throw new AutoBotReleaseError(`AutoBot publication boundary rejects ${violation}: ${change.path}`);
+		}
+	}
+}
+
 async function stagedPathMatchesInput(worktree: string, inputCommit: string, pathname: string): Promise<boolean> {
 	const child = Bun.spawn(
 		[
@@ -183,6 +195,7 @@ async function assertNoForbiddenStagedChanges(
 	allowedInputCommit: string | undefined,
 ): Promise<void> {
 	for (const change of changes) {
+		if (change.status === "D") continue;
 		const violation = pathViolation(change.path);
 		if (violation === undefined) continue;
 		if (
@@ -252,7 +265,8 @@ export function parseRepairIntent(value: unknown, expectedNonce: string): Repair
 export async function assertNoForbiddenWorktreeResidue(worktree: string, allowedInputCommit?: string): Promise<void> {
 	const changes = await workingTreeChanges(worktree);
 	await assertNoForbiddenStagedChanges(worktree, changes.staged, allowedInputCommit);
-	assertNoForbiddenPaths([...changes.unstaged.map(change => change.path), ...changes.untracked]);
+	assertNoForbiddenChanges(changes.unstaged);
+	assertNoForbiddenPaths(changes.untracked);
 }
 
 /**
@@ -262,11 +276,8 @@ export async function assertNoForbiddenWorktreeResidue(worktree: string, allowed
  */
 export async function stageDeclaredRepair(worktree: string, intent: RepairIntent): Promise<void> {
 	const before = await workingTreeChanges(worktree);
-	assertNoForbiddenPaths([
-		...before.unstaged.map(change => change.path),
-		...before.staged.map(change => change.path),
-		...before.untracked,
-	]);
+	assertNoForbiddenChanges([...before.unstaged, ...before.staged]);
+	assertNoForbiddenPaths(before.untracked);
 	assertExactPathSet(
 		[...before.unstaged.map(change => change.path), ...before.staged.map(change => change.path), ...before.untracked],
 		intent.paths,
@@ -276,11 +287,8 @@ export async function stageDeclaredRepair(worktree: string, intent: RepairIntent
 		await runCommand(["git", "add", "--", literalPathspec(pathname)], { cwd: worktree, capture: true });
 	}
 	const after = await workingTreeChanges(worktree);
-	assertNoForbiddenPaths([
-		...after.unstaged.map(change => change.path),
-		...after.staged.map(change => change.path),
-		...after.untracked,
-	]);
+	assertNoForbiddenChanges([...after.unstaged, ...after.staged]);
+	assertNoForbiddenPaths(after.untracked);
 	assertExactPathSet(
 		after.staged.map(change => change.path),
 		intent.paths,
@@ -359,25 +367,48 @@ function candidateTreeViolation(entry: TreeEntry): string | undefined {
 }
 
 /**
- * Reject forbidden worktree residue and inspect every non-input commit that
- * would be pushed. Exact blobs inherited from either pinned input remain
- * valid; locally committed generated, secret, or executable artifacts cannot
- * be laundered through a clean worktree.
+ * Reject forbidden worktree residue, the final candidate tree, and every
+ * non-input commit that would be pushed. Exact blobs inherited from either
+ * pinned input remain valid in the release tree; exact entries published at
+ * the pinned existing integration tip remain valid only in pushed history.
  */
 export async function assertCandidatePublicationBoundary(
 	worktree: string,
 	candidateCommit: string,
 	canonicalCommit: string,
 	upstreamCommit: string,
+	existingIntegrationCommit?: string,
 ): Promise<void> {
 	const candidate = requireCommit(candidateCommit, "Candidate publication commit");
 	const canonical = requireCommit(canonicalCommit, "Canonical publication input");
 	const upstream = requireCommit(upstreamCommit, "Upstream publication input");
+	const existingIntegration =
+		existingIntegrationCommit === undefined
+			? undefined
+			: requireCommit(existingIntegrationCommit, "Existing integration publication input");
 	await assertNoForbiddenWorktreeResidue(worktree);
-	const history = await runCommand(["git", "rev-list", "--topo-order", candidate, `^${canonical}`, `^${upstream}`], {
-		cwd: worktree,
-		capture: true,
-	});
+	const inputs = await Promise.all([
+		treeAt(worktree, canonical, "Canonical publication input"),
+		treeAt(worktree, upstream, "Upstream publication input"),
+	]);
+	for (const entry of (await treeAt(worktree, candidate, "Candidate publication")).values()) {
+		const violation = candidateTreeViolation(entry);
+		if (violation !== undefined && !inputContainsEntry(inputs, entry)) {
+			throw new AutoBotReleaseError(`Candidate publication boundary rejects ${violation}: ${entry.path}`);
+		}
+	}
+	const history = await runCommand(
+		[
+			"git",
+			"rev-list",
+			"--topo-order",
+			candidate,
+			`^${canonical}`,
+			`^${upstream}`,
+			...(existingIntegration === undefined ? [] : [`^${existingIntegration}`]),
+		],
+		{ cwd: worktree, capture: true },
+	);
 	const commits = history.stdout
 		.split("\n")
 		.filter(Boolean)
@@ -385,14 +416,14 @@ export async function assertCandidatePublicationBoundary(
 	if (commits.length > MAX_CANDIDATE_HISTORY_COMMITS) {
 		throw new AutoBotReleaseError("Candidate publication history exceeds the review boundary");
 	}
-	const inputs = await Promise.all([
-		treeAt(worktree, canonical, "Canonical publication input"),
-		treeAt(worktree, upstream, "Upstream publication input"),
-	]);
+	const historyInputs =
+		existingIntegration === undefined
+			? inputs
+			: [...inputs, await treeAt(worktree, existingIntegration, "Existing integration publication input")];
 	for (const commit of commits) {
 		for (const entry of (await treeAt(worktree, commit, "Candidate publication history")).values()) {
 			const violation = candidateTreeViolation(entry);
-			if (violation !== undefined && !inputContainsEntry(inputs, entry)) {
+			if (violation !== undefined && !inputContainsEntry(historyInputs, entry)) {
 				throw new AutoBotReleaseError(`Candidate publication boundary rejects ${violation}: ${entry.path}`);
 			}
 		}

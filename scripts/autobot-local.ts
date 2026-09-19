@@ -1001,12 +1001,6 @@ async function assertRemoteInputs(
 }
 
 async function pushIntegrationBranch(context: OmpControllerContext, candidateCommit: string): Promise<string> {
-	await assertCandidatePublicationBoundary(
-		context.worktree,
-		candidateCommit,
-		context.expectedCanonicalCommit,
-		context.expectedUpstreamCommit,
-	);
 	const before = await assertRemoteInputs(
 		context.config,
 		context.canonicalRepository,
@@ -1026,6 +1020,13 @@ async function pushIntegrationBranch(context: OmpControllerContext, candidateCom
 			throw new AutoBotReleaseError("Candidate would discard existing dedicated integration branch history");
 		}
 	}
+	await assertCandidatePublicationBoundary(
+		context.worktree,
+		candidateCommit,
+		context.expectedCanonicalCommit,
+		context.expectedUpstreamCommit,
+		context.expectedIntegrationCommit,
+	);
 	await runCommand(
 		["git", "push", context.canonicalRepository, `${candidateCommit}:refs/heads/${context.config.integrationBranch}`],
 		{ cwd: context.worktree, capture: true },

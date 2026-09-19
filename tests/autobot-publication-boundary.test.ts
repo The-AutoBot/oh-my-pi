@@ -247,6 +247,64 @@ describe("AutoBot candidate publication history", () => {
 		);
 	});
 
+	test("rejects an unchanged artifact at the final pinned integration tip", async () => {
+		const repository = await createRepository();
+		await writeRepositoryFile(repository, ".gitignore", ".semgrep/guardian.yml\n");
+		await writeRepositoryFile(repository, "src/base.ts", "export const base = true;\n");
+		const canonical = await commitPaths(repository, "initial", [".gitignore", "src/base.ts"]);
+
+		await git(repository, ["checkout", "-b", "integration", canonical]);
+		await writeRepositoryFile(repository, ".semgrep/guardian.yml", "local state\n");
+		await stagePaths(repository, [".semgrep/guardian.yml"], true);
+		const existingIntegration = await commitStaged(repository, "published local artifact");
+
+		await expect(
+			assertCandidatePublicationBoundary(repository, existingIntegration, canonical, canonical, existingIntegration),
+		).rejects.toThrow("publication boundary rejects");
+	});
+
+	test("allows declared cleanup of an artifact inherited from the pinned integration tip", async () => {
+		const repository = await createRepository();
+		await writeRepositoryFile(repository, ".gitignore", "# Local build residue\n");
+		await writeRepositoryFile(repository, "src/base.ts", "export const base = true;\n");
+		const canonical = await commitPaths(repository, "initial", [".gitignore", "src/base.ts"]);
+		const artifactPath = ".semgrep/guardian.yml";
+
+		await git(repository, ["checkout", "-b", "integration", canonical]);
+		await writeRepositoryFile(repository, artifactPath, "local state\n");
+		const existingIntegration = await commitPaths(repository, "published local artifact", [artifactPath]);
+
+		await git(repository, ["checkout", "-b", "candidate", existingIntegration]);
+		await fs.rm(path.join(repository, ...artifactPath.split("/")));
+		await writeRepositoryFile(repository, ".gitignore", "# Local build residue\n.semgrep/guardian.yml\n");
+		const intent = { paths: [".gitignore", artifactPath] };
+		await stageDeclaredRepair(repository, intent);
+		await assertDeclaredStagedDiff(repository, existingIntegration, intent);
+		const cleanedCandidate = await commitStaged(repository, "remove published local artifact");
+
+		await assertCandidatePublicationBoundary(repository, cleanedCandidate, canonical, canonical, existingIntegration);
+	});
+
+	test("rejects an artifact introduced and later removed from new candidate history", async () => {
+		const repository = await createRepository();
+		const artifactPath = ".semgrep/guardian.yml";
+		await writeRepositoryFile(repository, ".gitignore", ".semgrep/guardian.yml\n");
+		await writeRepositoryFile(repository, "src/base.ts", "export const base = true;\n");
+		const canonical = await commitPaths(repository, "initial", [".gitignore", "src/base.ts"]);
+
+		await git(repository, ["checkout", "-b", "candidate", canonical]);
+		await writeRepositoryFile(repository, artifactPath, "new local state\n");
+		await stagePaths(repository, [artifactPath], true);
+		await commitStaged(repository, "introduce local artifact");
+		await fs.rm(path.join(repository, ...artifactPath.split("/")));
+		await stageDeclaredRepair(repository, { paths: [artifactPath] });
+		const cleanedCandidate = await commitStaged(repository, "remove new local artifact");
+
+		await expect(
+			assertCandidatePublicationBoundary(repository, cleanedCandidate, canonical, canonical),
+		).rejects.toThrow("publication boundary rejects");
+	});
+
 	test("rejects an ignored generated artifact force-committed in candidate history", async () => {
 		const repository = await createRepository();
 		await writeRepositoryFile(repository, ".gitignore", ".integration-check/\n");
