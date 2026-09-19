@@ -16,6 +16,8 @@ const environmentNames = [
 	"BUN_INSTALL_CACHE_DIR",
 ] as const;
 
+const toolchainEnvironmentNames = ["CARGO_HOME", "RUSTUP_HOME"] as const;
+
 function isInside(parent: string, child: string): boolean {
 	const relative = path.relative(parent, child);
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -78,6 +80,10 @@ test("keeps candidate home and Bun cache inside the release stage without changi
 		await fs.writeFile(publisherGitConfig, "");
 
 		const candidateEnvironment = await createCandidateBuildEnvironment(stageRoot, publisherEnvironment);
+		const expectedToolchainHomes = {
+			CARGO_HOME: path.join(publisherHome, ".cargo"),
+			RUSTUP_HOME: path.join(publisherHome, ".rustup"),
+		};
 		const expectedPaths: Record<string, string> = {};
 		for (const name of environmentNames) {
 			const value = candidateEnvironment[name];
@@ -99,25 +105,44 @@ test("keeps candidate home and Bun cache inside the release stage without changi
 import * as os from "node:os";
 import * as path from "node:path";
 const names = ${JSON.stringify(environmentNames)};
+const toolchainNames = ${JSON.stringify(toolchainEnvironmentNames)};
+const environmentValue = name =>
+	Object.entries(process.env).find(([key]) => key.toUpperCase() === name)?.[1];
 const locations = Object.fromEntries(names.map(name => [name, process.env[name]]));
+const toolchainHomes = Object.fromEntries(toolchainNames.map(name => [name, environmentValue(name)]));
 locations.osHome = os.homedir();
 for (const [name, directory] of Object.entries(locations)) {
 	if (!directory) throw new Error(\`Missing \${name}\`);
 	await fs.mkdir(directory, { recursive: true });
 	await fs.writeFile(path.join(directory, \`\${name}.probe\`), name);
 }
-process.stdout.write(JSON.stringify(locations));`,
+process.stdout.write(JSON.stringify({ locations, toolchainHomes }));`,
 				],
 				{ cwd: sourceRoot, env: candidateEnvironment },
 			),
-		) as Record<string, string>;
-		expect(observedPaths).toEqual({ ...expectedPaths, osHome: expectedPaths.HOME });
-		for (const [name, directory] of Object.entries(observedPaths)) {
+		) as { locations: Record<string, string>; toolchainHomes: Record<string, string> };
+		expect(observedPaths.locations).toEqual({ ...expectedPaths, osHome: expectedPaths.HOME });
+		expect(observedPaths.toolchainHomes).toEqual(expectedToolchainHomes);
+		for (const [name, directory] of Object.entries(observedPaths.locations)) {
 			expect(isInside(stageRoot, directory)).toBe(true);
 			expect(isInside(sourceRoot, directory)).toBe(false);
 			expect(await Bun.file(path.join(directory, `${name}.probe`)).text()).toBe(name);
 		}
+		for (const directory of Object.values(observedPaths.toolchainHomes)) {
+			expect(isInside(stageRoot, directory)).toBe(false);
+			expect(isInside(sourceRoot, directory)).toBe(false);
+		}
 		expect(await fs.readdir(sourceRoot)).toEqual([]);
+
+		const explicitCargoHome = path.join(root, "explicit-cargo-home");
+		const explicitRustupHome = path.join(root, "explicit-rustup-home");
+		const explicitToolchainEnvironment = await createCandidateBuildEnvironment(path.join(stageRoot, "explicit"), {
+			...publisherEnvironment,
+			cargo_home: explicitCargoHome,
+			rustup_home: explicitRustupHome,
+		});
+		expect(explicitToolchainEnvironment.CARGO_HOME).toBe(explicitCargoHome);
+		expect(explicitToolchainEnvironment.RUSTUP_HOME).toBe(explicitRustupHome);
 
 		const publisherIdentity = await runText(["git", "var", "GIT_AUTHOR_IDENT"], {
 			cwd: sourceRoot,

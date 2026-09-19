@@ -65,6 +65,13 @@ out.html
 pi-*.html
 .close_issue.sh
 
+
+# AutoBot integration worker scratch
+/.integration-check/
+/.bun-cache/
+/packages/coding-agent/.semgrep/guardian.yml
+/packages/coding-agent/.semgrep/.lock
+/packages/coding-agent/.semgrep/guardian.yml.lock
 # Generated files
 packages/coding-agent/src/export/html/tool-views.generated.js
 packages/natives/npm/

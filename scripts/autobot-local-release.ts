@@ -294,6 +294,12 @@ async function assertExactBun(executable: string, expectedVersion: string, label
 		throw new AutoBotReleaseError(`${label} does not match its configured exact version`);
 }
 
+function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
+	if (environment[name] !== undefined) return environment[name];
+	const normalizedName = name.toUpperCase();
+	return Object.entries(environment).find(([key]) => key.toUpperCase() === normalizedName)?.[1];
+}
+
 /**
  * Candidate commands may create user state and Bun's global cache. Keep both
  * in the release stage rather than the candidate checkout.
@@ -303,6 +309,10 @@ async function createPrivateCommandEnvironment(
 	environment: NodeJS.ProcessEnv,
 ): Promise<NodeJS.ProcessEnv> {
 	const privateRoot = await ensureAutoBotPrivateDirectory(root);
+	const originalHome = environmentValue(environment, "HOME") ?? environmentValue(environment, "USERPROFILE");
+	const cargoHome = environmentValue(environment, "CARGO_HOME") ?? (originalHome && path.join(originalHome, ".cargo"));
+	const rustupHome =
+		environmentValue(environment, "RUSTUP_HOME") ?? (originalHome && path.join(originalHome, ".rustup"));
 	const [home, xdgConfig, xdgData, xdgCache, xdgState, appData, localAppData, bunCache] = await Promise.all([
 		ensureAutoBotPrivateDirectory(path.join(privateRoot, "home")),
 		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-config")),
@@ -324,6 +334,8 @@ async function createPrivateCommandEnvironment(
 		APPDATA: appData,
 		LOCALAPPDATA: localAppData,
 		BUN_INSTALL_CACHE_DIR: bunCache,
+		CARGO_HOME: cargoHome,
+		RUSTUP_HOME: rustupHome,
 	};
 }
 

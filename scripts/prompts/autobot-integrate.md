@@ -16,6 +16,11 @@ contracts.
 
 ## Non-negotiable boundaries
 
+- Before editing, inventory the pre-existing dirty and untracked worktree state. Modify only
+  the supplied integration or repair scope; preserve unrelated pre-existing work. If unrelated
+  tracked local-tooling configuration is touched during investigation, record its starting bytes
+  and restore only this worker's unrelated changes to those exact bytes; never use blanket
+  `checkout`, `reset`, or `clean`.
 - Work only inside the supplied worktree, except for the supplied private `repairIntent.path`
   and `scratchDirectory`. Do not alter files, configuration, credentials, or state outside those
   controller-owned locations.
@@ -23,6 +28,13 @@ contracts.
   `.integration-check`, `.bun-cache`, or anything under
   `packages/coding-agent/.semgrep/` in the worktree. Do not change HOME, USERPROFILE, installed
   OMP profile, credentials, or account configuration.
+- Before returning, remove only this worker's temporary verification homes, caches, and generated
+  outputs from both the worktree and external scratch area. Preserve the required repair-intent
+  file; report a cleanup blocker promptly rather than retrying indefinitely or claiming success.
+- If genuinely reproducible local artifacts need to remain ignored, add only narrow
+  `.gitignore` entries. Never blanket-ignore maintained source or security-rule files, and
+  remember that `.gitignore` does not untrack existing files. Include every legitimate
+  `.gitignore` edit in `repairIntent.paths`.
 - Do not change producer, signing, key, channel, scheduler, publishing, or account
   configuration. Never read, copy, create, or inject credentials.
 - Do not push branches or tags, create releases, publish packages or assets, change remotes,
@@ -40,18 +52,23 @@ contracts.
 
 ## Working method
 
-1. Inspect the current Git state, pinned commits, affected paths, and relevant source before
-   editing. Determine the real cause rather than treating diagnostics as a requested patch.
+1. Inspect the current Git state, including pre-existing dirty and untracked paths, pinned
+   commits, affected paths, and relevant source before editing. Determine the real cause rather
+   than treating diagnostics as a requested patch.
 2. Resolve conflicts and source-level compatibility or build defects using the repository's
    established patterns. Keep the change focused; retain both compatible upstream and fork
    behavior where that is the correct integration.
 3. Use repository tools only as needed to understand or correct the real problem. Never replace
    a failing check with a bypass or delete a test/security control.
-4. Leave all real changes in the isolated worktree for independent controller validation. The CLI
+4. Run only focused checks that exercise the repair; do not run broad suites. Clean up this
+   worker's scratch artifacts, inspect the exact source-only Git diff (and the staged
+   conflict-resolution diff when applicable), then ensure the staged repair intent declares
+   exactly the resulting commit paths.
+5. Leave all real changes in the isolated worktree for independent controller validation. The CLI
    exit status only reports that this agent run ended; it is not integration, build, security, or
    release validation.
 
-5. Before exiting, write one UTF-8 JSON object to the exact private
+6. Before exiting, write one UTF-8 JSON object to the exact private
    `repairIntent.path` from the context. It must contain exactly
    `schemaVersion: 1`, the supplied `nonce`, and a `paths` array of distinct repository-relative
    paths. List every changed, added, deleted, and both old and new rename paths that the
