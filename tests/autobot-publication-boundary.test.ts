@@ -99,6 +99,51 @@ describe("AutoBot declared repair staging", () => {
 		);
 	});
 
+	test("stages a cleaned repair and narrow ignore rules without publishing its local artifacts", async () => {
+		const repository = await createRepository();
+		await writeRepositoryFile(repository, ".gitignore", "# Local build residue\n");
+		await writeRepositoryFile(repository, "src/repair.ts", "export const repaired = false;\n");
+		await commitPaths(repository, "initial", [".gitignore", "src/repair.ts"]);
+
+		await writeRepositoryFile(repository, "src/repair.ts", "export const repaired = true;\n");
+		await writeRepositoryFile(repository, ".integration-check/result.json", "{}\n");
+		await writeRepositoryFile(repository, ".bun-cache/cache.json", "{}\n");
+		await expect(stageDeclaredRepair(repository, { paths: ["src/repair.ts"] })).rejects.toThrow(
+			"publication boundary rejects",
+		);
+
+		await fs.rm(path.join(repository, ".integration-check"), { recursive: true, force: true });
+		await fs.rm(path.join(repository, ".bun-cache"), { recursive: true, force: true });
+		await writeRepositoryFile(repository, ".gitignore", "# Local build residue\n.integration-check/\n.bun-cache/\n");
+		const intent = { paths: [".gitignore", "src/repair.ts"] };
+		await stageDeclaredRepair(repository, intent);
+		const repaired = await commitStaged(repository, "clean source repair");
+
+		expect(nulPaths(await git(repository, ["ls-tree", "-r", "--name-only", "-z", repaired]))).toEqual([
+			".gitignore",
+			"src/repair.ts",
+		]);
+	});
+
+	test("rejects root Guardian state while preserving maintained Semgrep rules", async () => {
+		const repository = await createRepository();
+		await writeRepositoryFile(repository, "src/base.ts", "export const base = true;\n");
+		await commitPaths(repository, "initial", ["src/base.ts"]);
+		const rulePath = ".semgrep/maintained-rule.yml";
+		await writeRepositoryFile(repository, rulePath, "rules: []\n");
+
+		for (const guardianPath of [".semgrep/guardian.yml", ".semgrep/.lock", ".semgrep/guardian.yml.lock"]) {
+			await writeRepositoryFile(repository, guardianPath, "local state\n");
+			await expect(stageDeclaredRepair(repository, { paths: [rulePath] })).rejects.toThrow(
+				"Semgrep Guardian local-state path",
+			);
+			await fs.rm(path.join(repository, ...guardianPath.split("/")));
+		}
+
+		await stageDeclaredRepair(repository, { paths: [rulePath] });
+		expect(nulPaths(await git(repository, ["diff", "--cached", "--name-only", "-z"]))).toEqual([rulePath]);
+	});
+
 	test("rejects a force-staged ignored artifact outside the declaration", async () => {
 		const repository = await createRepository();
 		await writeRepositoryFile(repository, ".gitignore", ".bun-cache/\n");

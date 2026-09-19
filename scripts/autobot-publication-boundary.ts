@@ -126,8 +126,8 @@ function pathViolation(pathname: string): string | undefined {
 	if (components.some(component => GENERATED_LOCAL_ROOTS[component] === true)) {
 		return "a generated or local verification path";
 	}
-	if (lowerPath.startsWith("packages/coding-agent/.semgrep/")) {
-		return "a Semgrep local verification path";
+	if (components.at(-2) === ".semgrep" && (filename === "guardian.yml" || filename.endsWith(".lock"))) {
+		return "a Semgrep Guardian local-state path";
 	}
 	if (
 		filename === ".env" ||
