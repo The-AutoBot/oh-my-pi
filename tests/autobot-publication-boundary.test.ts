@@ -71,9 +71,20 @@ afterEach(async () => {
 });
 
 describe("AutoBot declared repair staging", () => {
-	test("rejects the observed generated residue without staging valid source changes", async () => {
+	test("stages declared source changes while ignored scratch and native outputs remain outside the commit", async () => {
 		const repository = await createRepository();
-		await writeRepositoryFile(repository, ".gitignore", ".bun-cache/\n");
+		await writeRepositoryFile(
+			repository,
+			".gitignore",
+			[
+				".bun-cache/\n",
+				".integration-check/\n",
+				"packages/coding-agent/.semgrep/guardian.yml\n",
+				"packages/coding-agent/.semgrep/.lock\n",
+				"packages/coding-agent/.semgrep/guardian.yml.lock\n",
+				"*.node\n",
+			].join(""),
+		);
 		await writeRepositoryFile(repository, "src/kept.ts", "export const kept = 1;\n");
 		await commitPaths(repository, "initial", [".gitignore", "src/kept.ts"]);
 
@@ -85,17 +96,16 @@ describe("AutoBot declared repair staging", () => {
 		await writeRepositoryFile(repository, "packages/coding-agent/.semgrep/guardian.yml", "generated\n");
 		await writeRepositoryFile(repository, "packages/coding-agent/.semgrep/guardian.yml.lock", "generated\n");
 		await writeRepositoryFile(repository, "packages/coding-agent/.semgrep/.lock", "generated\n");
+		await writeRepositoryFile(repository, "packages/natives/npm/verification.node", "native dependency\n");
 
 		const intent = { paths: ["src/kept.ts", literalPath] };
-		await expect(stageDeclaredRepair(repository, intent)).rejects.toThrow("publication boundary rejects");
-		expect(await git(repository, ["diff", "--cached", "--name-only", "-z"])).toBe("");
-
-		await fs.rm(path.join(repository, ".integration-check"), { recursive: true, force: true });
-		await fs.rm(path.join(repository, ".bun-cache"), { recursive: true, force: true });
-		await fs.rm(path.join(repository, "packages", "coding-agent", ".semgrep"), { recursive: true, force: true });
 		await stageDeclaredRepair(repository, intent);
 		expect(nulPaths(await git(repository, ["diff", "--cached", "--name-only", "-z"]))).toEqual(
 			["src/kept.ts", literalPath].sort(),
+		);
+		const repaired = await commitStaged(repository, "source-only repair");
+		expect(nulPaths(await git(repository, ["ls-tree", "-r", "--name-only", "-z", repaired]))).toEqual(
+			[".gitignore", "src/kept.ts", literalPath].sort(),
 		);
 	});
 
@@ -237,14 +247,16 @@ describe("AutoBot candidate publication history", () => {
 		);
 	});
 
-	test("rejects a historic candidate with generated local residue", async () => {
+	test("rejects an ignored generated artifact force-committed in candidate history", async () => {
 		const repository = await createRepository();
 		await writeRepositoryFile(repository, ".gitignore", ".integration-check/\n");
 		await writeRepositoryFile(repository, "src/base.ts", "export const base = true;\n");
-		const candidate = await commitPaths(repository, "initial", [".gitignore", "src/base.ts"]);
+		const canonical = await commitPaths(repository, "initial", [".gitignore", "src/base.ts"]);
 		await writeRepositoryFile(repository, ".integration-check/home/.omp/agent/agent.db-shm", "local state\n");
+		await stagePaths(repository, [".integration-check/home/.omp/agent/agent.db-shm"], true);
+		const contaminated = await commitStaged(repository, "forced generated artifact");
 
-		await expect(assertCandidatePublicationBoundary(repository, candidate, candidate, candidate)).rejects.toThrow(
+		await expect(assertCandidatePublicationBoundary(repository, contaminated, canonical, canonical)).rejects.toThrow(
 			"publication boundary rejects",
 		);
 	});

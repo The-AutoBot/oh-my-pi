@@ -196,28 +196,22 @@ async function assertNoForbiddenStagedChanges(
 }
 
 async function workingTreeChanges(worktree: string): Promise<{
-	readonly ignored: readonly string[];
 	readonly staged: readonly PathChange[];
 	readonly unstaged: readonly PathChange[];
 	readonly untracked: readonly string[];
 }> {
-	const [unstaged, staged, untracked, ignored] = await Promise.all([
+	const [unstaged, staged, untracked] = await Promise.all([
 		runCommand(["git", "diff", "--name-status", "--no-renames", "-z"], { cwd: worktree, capture: true }),
 		runCommand(["git", "diff", "--cached", "--name-status", "--no-renames", "-z"], {
 			cwd: worktree,
 			capture: true,
 		}),
 		runCommand(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd: worktree, capture: true }),
-		runCommand(["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], {
-			cwd: worktree,
-			capture: true,
-		}),
 	]);
 	return {
 		unstaged: parseNameStatus(unstaged.stdout, "Unstaged local integration diff"),
 		staged: parseNameStatus(staged.stdout, "Staged local integration diff"),
 		untracked: parseListedPaths(untracked.stdout, "Untracked local integration paths"),
-		ignored: parseListedPaths(ignored.stdout, "Ignored local integration paths"),
 	};
 }
 
@@ -254,11 +248,11 @@ export function parseRepairIntent(value: unknown, expectedNonce: string): Repair
 	return { paths };
 }
 
-/** Reject forbidden generated/local residue even when Git's ordinary status omits it. */
+/** Reject forbidden staged and nonignored worktree residue. */
 export async function assertNoForbiddenWorktreeResidue(worktree: string, allowedInputCommit?: string): Promise<void> {
 	const changes = await workingTreeChanges(worktree);
 	await assertNoForbiddenStagedChanges(worktree, changes.staged, allowedInputCommit);
-	assertNoForbiddenPaths([...changes.unstaged.map(change => change.path), ...changes.untracked, ...changes.ignored]);
+	assertNoForbiddenPaths([...changes.unstaged.map(change => change.path), ...changes.untracked]);
 }
 
 /**
@@ -272,7 +266,6 @@ export async function stageDeclaredRepair(worktree: string, intent: RepairIntent
 		...before.unstaged.map(change => change.path),
 		...before.staged.map(change => change.path),
 		...before.untracked,
-		...before.ignored,
 	]);
 	assertExactPathSet(
 		[...before.unstaged.map(change => change.path), ...before.staged.map(change => change.path), ...before.untracked],
@@ -287,7 +280,6 @@ export async function stageDeclaredRepair(worktree: string, intent: RepairIntent
 		...after.unstaged.map(change => change.path),
 		...after.staged.map(change => change.path),
 		...after.untracked,
-		...after.ignored,
 	]);
 	assertExactPathSet(
 		after.staged.map(change => change.path),
