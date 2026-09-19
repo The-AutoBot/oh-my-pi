@@ -15,8 +15,8 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
 import { settings } from "../config/settings";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import { isAutoBotMuslLinux, type MuslDetectionOptions } from "../autobot-update/platform";
-import { theme } from "../modes/theme/theme";
 import {
 	isTimeoutError,
 	isUnsupportedProxyError,

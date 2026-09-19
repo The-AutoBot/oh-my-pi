@@ -48,9 +48,13 @@ describe("prepared extension rebinding", () => {
 		expect(bindings[0]).not.toBe(bindings[1]);
 		expect(bindings[0]?.events).toBe(parentEventBus);
 		expect(bindings[1]?.events).toBe(childEventBus);
-		const [parentPwd, childPwd] = await Promise.all([bindings[0]!.exec("pwd", []), bindings[1]!.exec("pwd", [])]);
-		expect(parentPwd.stdout.trim()).toBe(await fs.realpath(parentDirectory));
-		expect(childPwd.stdout.trim()).toBe(await fs.realpath(childDirectory));
+		const cwdProbe = ["--eval", "process.stdout.write(process.cwd())"];
+		const [parentCwd, childCwd] = await Promise.all([
+			bindings[0]!.exec(process.execPath, cwdProbe),
+			bindings[1]!.exec(process.execPath, cwdProbe),
+		]);
+		expect(parentCwd.stdout).toBe(await fs.realpath(parentDirectory));
+		expect(childCwd.stdout).toBe(await fs.realpath(childDirectory));
 		Reflect.deleteProperty(globalThis, counterKey);
 		Reflect.deleteProperty(globalThis, bindingsKey);
 	});

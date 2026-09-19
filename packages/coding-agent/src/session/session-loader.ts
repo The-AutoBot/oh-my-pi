@@ -142,6 +142,38 @@ export async function visitEntriesFromFileStream(
 		await Bun.sleep(0);
 	};
 
+	const visitValue = async (value: unknown): Promise<void> => {
+		if (recordsSeen >= maxRecords) {
+			stopped = true;
+			return;
+		}
+		if (options.shouldContinue && !options.shouldContinue()) {
+			stopped = true;
+			return;
+		}
+		const entry = value as FileEntry;
+		if (!sawFirstEntry) {
+			sawFirstEntry = true;
+			applyTitleSlot(entry, titleSlot);
+		}
+		try {
+			if (visit(entry) === false) {
+				stopped = true;
+				return;
+			}
+			recordsSeen++;
+			entriesSinceYield++;
+			if (recordsSeen >= maxRecords) {
+				stopped = true;
+				return;
+			}
+		} catch (err) {
+			visitorThrew = true;
+			throw err;
+		}
+		await yieldToMacrotask();
+	};
+
 	const drain = async (): Promise<void> => {
 		const view = sink.flush();
 		if (!view) return;
@@ -163,35 +195,8 @@ export async function visitEntriesFromFileStream(
 			}
 			const { values, error, read, done } = Bun.JSONL.parseChunk(buffer);
 			for (const value of values) {
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
-					break;
-				}
-				if (options.shouldContinue && !options.shouldContinue()) {
-					stopped = true;
-					break;
-				}
-				const entry = value as FileEntry;
-				if (!sawFirstEntry) {
-					sawFirstEntry = true;
-					applyTitleSlot(entry, titleSlot);
-				}
-				try {
-					if (visit(entry) === false) {
-						stopped = true;
-						break;
-					}
-					recordsSeen++;
-					entriesSinceYield++;
-					if (recordsSeen >= maxRecords) {
-						stopped = true;
-						break;
-					}
-				} catch (err) {
-					visitorThrew = true;
-					throw err;
-				}
-				await yieldToMacrotask();
+				await visitValue(value);
+				if (stopped) break;
 			}
 			if (stopped) break;
 			if (error) {
@@ -227,56 +232,102 @@ export async function visitEntriesFromFileStream(
 
 	try {
 		const file = Bun.file(filePath);
-		const source = Number.isFinite(maxBytes) ? file.slice(0, maxBytes) : file;
-		for await (const chunk of source.stream()) {
-			if (stopped) break;
-			bytesSinceYield += chunk.byteLength;
-			options.onBytesConsumed?.(chunk.byteLength);
-			// Parsing before the chunk closes a line re-scans the unfinished record
-			// on every chunk, which is quadratic for large records.
-			if (chunk.lastIndexOf(0x0a) === -1) {
-				// Skipping drain() also skips the only enforcement of the record cap,
-				// so re-check it here: a delimiter-free file would otherwise be read
-				// and buffered in full despite an exhausted budget.
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
-					break;
-				}
-				sink.append(chunk);
-				await yieldToMacrotask();
-				continue;
-			}
-			sink.append(chunk);
-			// The optional fixed-width title slot is a physical first line that is
-			// NOT JSON; peel it before the parser would (correctly) reject it. The
-			// first line ends at a '\n' byte, so it is a complete UTF-8 sequence and
-			// safe to decode. A non-slot first line is a real entry and is left for
-			// the parser; a blank first line is left for the parser to skip.
-			if (!sawFirstLine) {
-				const buffered = sink.flush()!;
-				const newline = buffered.indexOf(0x0a);
-				if (newline !== -1) {
-					sawFirstLine = true;
-					const firstLine = decoder.decode(buffered.subarray(0, newline)).trim();
-					if (firstLine) {
-						const slot = parseTitleSlotLine(firstLine);
-						if (slot) {
-							titleSlot = titleUpdateFromSlot(slot);
-							sink.consume(newline + 1);
+		const hasByteLimit = Number.isFinite(maxBytes);
+		const byteLimit = hasByteLimit ? Math.trunc(maxBytes) : Number.POSITIVE_INFINITY;
+		const byteLimitTruncated = hasByteLimit && byteLimit < file.size;
+		const source = hasByteLimit ? file.slice(0, byteLimit) : file;
+		let bytesRemaining = byteLimit;
+		// Bun 1.3.14 on Windows can yield an extra chunk after a Blob slice's
+		// declared end. Keep the explicit guard and stop before requesting it;
+		// subarray also protects runtimes that deliver a chunk spanning the cap.
+		if (bytesRemaining > 0) {
+			for await (const sourceChunk of source.stream()) {
+				if (stopped || bytesRemaining === 0) break;
+				const chunk =
+					sourceChunk.byteLength > bytesRemaining ? sourceChunk.subarray(0, bytesRemaining) : sourceChunk;
+				bytesRemaining -= chunk.byteLength;
+				bytesSinceYield += chunk.byteLength;
+				options.onBytesConsumed?.(chunk.byteLength);
+				// Parsing before the chunk closes a line re-scans the unfinished record
+				// on every chunk, which is quadratic for large records.
+				if (chunk.lastIndexOf(0x0a) === -1) {
+					// Skipping drain() also skips the only enforcement of the record cap,
+					// so re-check it here: a delimiter-free file would otherwise be read
+					// and buffered in full despite an exhausted budget.
+					if (recordsSeen >= maxRecords) {
+						stopped = true;
+						break;
+					}
+					sink.append(chunk);
+					if (bytesRemaining === 0) break;
+					await yieldToMacrotask();
+				} else {
+					sink.append(chunk);
+					// The optional fixed-width title slot is a physical first line that is
+					// NOT JSON; peel it before the parser would (correctly) reject it. The
+					// first line ends at a '\n' byte, so it is a complete UTF-8 sequence and
+					// safe to decode. A non-slot first line is a real entry and is left for
+					// the parser; a blank first line is left for the parser to skip.
+					if (!sawFirstLine) {
+						const buffered = sink.flush()!;
+						const newline = buffered.indexOf(0x0a);
+						if (newline !== -1) {
+							sawFirstLine = true;
+							const firstLine = decoder.decode(buffered.subarray(0, newline)).trim();
+							if (firstLine) {
+								const slot = parseTitleSlotLine(firstLine);
+								if (slot) {
+									titleSlot = titleUpdateFromSlot(slot);
+									sink.consume(newline + 1);
+								}
+							}
 						}
 					}
+					// parseChunk can leave a value unfinished even after a newline; the
+					// sink keeps that remainder for the next chunk.
+					await drain();
+					if (stopped || bytesRemaining === 0) break;
+					await yieldToMacrotask();
 				}
 			}
-			// parseChunk can leave a value unfinished even after a newline; the
-			// sink keeps that remainder for the next chunk.
-			await drain();
-			await yieldToMacrotask();
 		}
-		// A trailing record without a final newline: terminate it so the parser
-		// can complete it (readline yielded it; parseChunk needs the delimiter).
+		// A byte-capped stream may end exactly after a complete JSON value but
+		// before its delimiter. Parse the retained suffix once as strict UTF-8
+		// JSON so complete values (including multiline JSON and trailing JSON
+		// whitespace) retain normal visitor semantics. Do not append an artificial
+		// delimiter to an incomplete suffix: Bun 1.3.14 can take pathological time
+		// in Bun.JSONL.parseChunk on a large truncated multibyte value.
 		if (!stopped && !sink.isEmpty) {
-			sink.append(LF);
-			await drain();
+			if (byteLimitTruncated) {
+				const tail = sink.flush()!;
+				let nonWhitespace = false;
+				for (const byte of tail) {
+					if (byte !== 0x09 && byte !== 0x0d && byte !== 0x20) {
+						nonWhitespace = true;
+						break;
+					}
+				}
+				if (nonWhitespace) {
+					let value: unknown = undefined;
+					let parsed = false;
+					try {
+						value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(tail));
+						parsed = true;
+					} catch {}
+					if (parsed) {
+						await visitValue(value);
+					} else {
+						options.onMalformedRecord?.();
+						recordsSeen++;
+						if (recordsSeen >= maxRecords) stopped = true;
+					}
+				}
+			} else {
+				// A trailing record without a final newline: terminate it so the parser
+				// can complete it (readline yielded it; parseChunk needs the delimiter).
+				sink.append(LF);
+				await drain();
+			}
 		}
 	} catch (err) {
 		if (visitorThrew) throw err;

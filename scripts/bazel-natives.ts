@@ -223,7 +223,7 @@ async function installAddon(sourcePath: string, destPath: string): Promise<void>
 }
 
 /** Build and install the host addon through the local Cargo/N-API path. */
-async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<void> {
+async function buildLocalHostAddon(filename: string, destDir: string): Promise<void> {
 	const script = path.join(repoRoot, "packages/natives/scripts/build-bindings.ts");
 	console.log(`local host build: using ${path.relative(repoRoot, script)}`);
 	const proc = Bun.spawn([process.execPath, script], {
@@ -234,7 +234,6 @@ async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<voi
 	const exitCode = await proc.exited;
 	if (exitCode !== 0) process.exit(exitCode || 1);
 
-	const filename = resolveLocalHostAddon(host).filename;
 	const builtPath = path.join(repoRoot, "packages/natives/native", filename);
 	if (path.dirname(builtPath) !== destDir) {
 		await fs.mkdir(destDir, { recursive: true });
@@ -245,7 +244,13 @@ async function buildLocalHostAddon(host: HostInfo, destDir: string): Promise<voi
 
 async function main(): Promise<void> {
 	const options = parseCliArgs(process.argv.slice(2));
-	const host: HostInfo = { platform: process.platform, arch: process.arch, avx2: detectHostAvx2Support() };
+	const targetVariant = Bun.env.OMP_NATIVE_TARGET_VARIANT?.trim();
+	const host: HostInfo = {
+		platform: process.platform,
+		arch: process.arch,
+		avx2: targetVariant ? false : detectHostAvx2Support(),
+	};
+	const hostAddon = resolveLocalHostAddon(host);
 	const destDir = options.dest ? path.resolve(options.dest) : path.join(repoRoot, "packages/natives/native");
 
 	const backend = Bun.env.OMP_NATIVE_BUILD_BACKEND?.trim();
@@ -273,7 +278,7 @@ async function main(): Promise<void> {
 			}
 			throw new Error("OMP_NATIVE_BUILD_BACKEND=cargo supports only the host target");
 		}
-		await buildLocalHostAddon(host, destDir);
+		await buildLocalHostAddon(hostAddon.filename, destDir);
 		return;
 	}
 	let outputs: string[];
@@ -294,7 +299,7 @@ async function main(): Promise<void> {
 				);
 			}
 			console.log("bazelisk/bazel not found; falling back to the local Cargo/N-API host build");
-			await buildLocalHostAddon(host, destDir);
+			await buildLocalHostAddon(hostAddon.filename, destDir);
 			return;
 		}
 		// CI hands cache wiring (remote or disk) through a bazelrc fragment so

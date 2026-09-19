@@ -18,10 +18,7 @@ import {
 	type AutoBotReleaseManifest,
 } from "../packages/coding-agent/src/autobot-update/contract.ts";
 import { type AssetInput, type TrustedKeySet, verifySignedEnvelope } from "./autobot-release-common.ts";
-import {
-	COORDINATOR_CLIENT_FILENAME,
-	type CoordinatorClientProvenance,
-} from "./autobot-release-coordinator.ts";
+import { COORDINATOR_CLIENT_FILENAME, type CoordinatorClientProvenance } from "./autobot-release-coordinator.ts";
 import {
 	createManagedBundle,
 	deriveManagedBundleId,
@@ -34,16 +31,6 @@ const repoRoot = path.join(import.meta.dir, "..");
 const temporaryDirectories: string[] = [];
 const textEncoder = new TextEncoder();
 const tarBlockSize = 512;
-const completeRuntimeTargets = [
-	"darwin-arm64",
-	"darwin-x64",
-	"linux-arm64",
-	"linux-musl-arm64",
-	"linux-musl-x64",
-	"linux-x64",
-	"win32-arm64",
-	"win32-x64",
-] as const;
 
 interface CommandResult {
 	readonly exitCode: number;
@@ -180,11 +167,7 @@ async function runSigning(
 	]);
 }
 
-async function runVerification(
-	out: string,
-	envelopePath: string,
-	publicKeyPath: string,
-): Promise<CommandResult> {
+async function runVerification(out: string, envelopePath: string, publicKeyPath: string): Promise<CommandResult> {
 	return runReleaseScript("autobot-release-verify.ts", [
 		"--envelope",
 		envelopePath,
@@ -230,26 +213,24 @@ async function createAssemblyFixture(): Promise<AssemblyFixture> {
 			url: `https://releases.example.invalid/${COORDINATOR_CLIENT_FILENAME}`,
 		},
 	];
-	for (const target of completeRuntimeTargets) {
-		const runtimePath = path.join(inputs, `omp-runtime-${target}`);
-		const bootstrapPath = path.join(inputs, `omp-bootstrap-${target}`);
-		await Bun.write(runtimePath, `runtime bytes for ${target}\n`);
-		await Bun.write(bootstrapPath, `bootstrap bytes for ${target}\n`);
-		assetInputs.push(
-			{
-				kind: "runtime",
-				target,
-				source: runtimePath,
-				url: `https://releases.example.invalid/${path.basename(runtimePath)}`,
-			},
-			{
-				kind: "bootstrap",
-				target,
-				source: bootstrapPath,
-				url: `https://releases.example.invalid/${path.basename(bootstrapPath)}`,
-			},
-		);
-	}
+	const runtimePath = path.join(inputs, "omp-runtime-win32-x64");
+	const bootstrapPath = path.join(inputs, "omp-bootstrap-win32-x64");
+	await Bun.write(runtimePath, "runtime bytes for win32-x64\n");
+	await Bun.write(bootstrapPath, "bootstrap bytes for win32-x64\n");
+	assetInputs.push(
+		{
+			kind: "runtime",
+			target: "win32-x64",
+			source: runtimePath,
+			url: `https://releases.example.invalid/${path.basename(runtimePath)}`,
+		},
+		{
+			kind: "bootstrap",
+			target: "win32-x64",
+			source: bootstrapPath,
+			url: `https://releases.example.invalid/${path.basename(bootstrapPath)}`,
+		},
+	);
 
 	const coordinatorProvenance: CoordinatorClientProvenance = {
 		schemaVersion: 1,
@@ -305,6 +286,16 @@ async function createAssemblyFixture(): Promise<AssemblyFixture> {
 	};
 }
 
+async function readFixtureAssetInputs(fixture: AssemblyFixture): Promise<AssetInput[]> {
+	const contents: unknown = JSON.parse(await Bun.file(fixture.assetInputsPath).text());
+	if (!Array.isArray(contents)) throw new Error("Release fixture asset inputs must be an array");
+	return contents as AssetInput[];
+}
+
+async function writeFixtureAssetInputs(fixture: AssemblyFixture, assets: readonly AssetInput[]): Promise<void> {
+	await Bun.write(fixture.assetInputsPath, JSON.stringify(assets));
+}
+
 function writeTarText(target: Uint8Array, offset: number, length: number, value: string): void {
 	const bytes = textEncoder.encode(value);
 	if (bytes.byteLength > length) throw new Error("Tar fixture field exceeds its fixed header width");
@@ -340,7 +331,9 @@ function hostileTarGzip(entryPath: string, type: "0" | "2"): Uint8Array {
 }
 
 afterEach(async () => {
-	await Promise.all(temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	await Promise.all(
+		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 });
 
 describe("AutoBot release signing", () => {
@@ -374,7 +367,7 @@ describe("AutoBot release target selection", () => {
 });
 
 describe("AutoBot coordinator release provenance", () => {
-	test("assembles a pinned coordinator release before signing and independently verifying it", async () => {
+	test("assembles, signs, and independently verifies a complete Windows x64 release", async () => {
 		const fixture = await createAssemblyFixture();
 		const releaseDirectory = path.join(path.dirname(fixture.assetInputsPath), "complete-release");
 		const assembly = await runAssembly(releaseDirectory, fixture);
@@ -387,6 +380,93 @@ describe("AutoBot coordinator release provenance", () => {
 
 		const verification = await runVerification(releaseDirectory, envelopePath, signingKeys.publicKeyPath);
 		expect(verification.exitCode, verification.stderr).toBe(0);
+	});
+
+	test("rejects every missing required release asset before staging", async () => {
+		const omissions: readonly {
+			readonly kind: AssetInput["kind"];
+			readonly target: string;
+			readonly error: string;
+		}[] = [
+			{
+				kind: "runtime",
+				target: "win32-x64",
+				error: "Release must contain one runtime and one bootstrap for every required release target",
+			},
+			{
+				kind: "bootstrap",
+				target: "win32-x64",
+				error: "Release must contain one runtime and one bootstrap for every required release target",
+			},
+			{
+				kind: "coordinator-client",
+				target: "universal",
+				error: "Release must contain exactly one universal coordinator-client asset",
+			},
+			{
+				kind: "collab-web",
+				target: "web",
+				error: "Release must contain exactly one web collab-web asset",
+			},
+		];
+		for (const omission of omissions) {
+			const fixture = await createAssemblyFixture();
+			const assets = await readFixtureAssetInputs(fixture);
+			await writeFixtureAssetInputs(
+				fixture,
+				assets.filter(asset => asset.kind !== omission.kind || asset.target !== omission.target),
+			);
+			const out = path.join(path.dirname(fixture.assetInputsPath), `missing-${omission.kind}-${omission.target}`);
+			const result = await runAssembly(out, fixture);
+			expect(result.exitCode, result.stderr).toBe(1);
+			expect(result.stderr).toContain(omission.error);
+			expect(await Bun.file(path.join(out, "manifest.json")).exists()).toBeFalse();
+		}
+	});
+
+	test("rejects duplicate release asset identities before staging", async () => {
+		const fixture = await createAssemblyFixture();
+		const assets = await readFixtureAssetInputs(fixture);
+		const runtime = assets.find(asset => asset.kind === "runtime" && asset.target === "win32-x64");
+		if (!runtime) throw new Error("Release fixture is missing its Windows x64 runtime");
+		const duplicateSource = path.join(path.dirname(fixture.assetInputsPath), "omp-runtime-win32-x64-duplicate");
+		await Bun.write(duplicateSource, "duplicate runtime bytes for win32-x64\n");
+		assets.push({
+			...runtime,
+			source: duplicateSource,
+			url: `https://releases.example.invalid/${path.basename(duplicateSource)}`,
+		});
+		await writeFixtureAssetInputs(fixture, assets);
+
+		const out = path.join(path.dirname(fixture.assetInputsPath), "duplicate-runtime");
+		const result = await runAssembly(out, fixture);
+
+		expect(result.exitCode, result.stderr).toBe(1);
+		expect(result.stderr).toContain("Release contains a duplicate asset identity: runtime/win32-x64");
+		expect(await Bun.file(path.join(out, "manifest.json")).exists()).toBeFalse();
+	});
+
+	test("rejects generic runtime targets outside the required release topology", async () => {
+		const fixture = await createAssemblyFixture();
+		const assets = await readFixtureAssetInputs(fixture);
+		const extraSource = path.join(path.dirname(fixture.assetInputsPath), "omp-runtime-darwin-x64");
+		await Bun.write(extraSource, "extra runtime bytes for darwin-x64\n");
+		assets.push({
+			kind: "runtime",
+			target: "darwin-x64",
+			source: extraSource,
+			url: `https://releases.example.invalid/${path.basename(extraSource)}`,
+		});
+		await writeFixtureAssetInputs(fixture, assets);
+
+		const out = path.join(path.dirname(fixture.assetInputsPath), "extra-runtime");
+		const result = await runAssembly(out, fixture);
+
+		expect(result.exitCode, result.stderr).toBe(1);
+		expect(result.stderr).toContain(
+			"Release contains a runtime target outside the required release topology: darwin-x64",
+		);
+		expect(await Bun.file(path.join(out, "manifest.json")).exists()).toBeFalse();
 	});
 
 	test("rechecks the trusted raw coordinator provenance pin before signing an assembled release", async () => {
@@ -411,7 +491,9 @@ describe("AutoBot coordinator release provenance", () => {
 		const envelopePath = path.join(path.dirname(fixture.assetInputsPath), "rejected-envelope.json");
 		const signing = await runSigning(releaseDirectory, fixture, signingKeys.privateKeyPath, envelopePath);
 		expect(signing.exitCode, signing.stderr).toBe(1);
-		expect(signing.stderr).toContain("Coordinator source provenance does not match the trusted configured SHA-256 pin");
+		expect(signing.stderr).toContain(
+			"Coordinator source provenance does not match the trusted configured SHA-256 pin",
+		);
 		expect(await Bun.file(envelopePath).exists()).toBeFalse();
 	});
 
@@ -433,7 +515,9 @@ describe("AutoBot coordinator release provenance", () => {
 		const result = await runAssembly(out, fixture);
 
 		expect(result.exitCode, result.stderr).toBe(1);
-		expect(result.stderr).toContain("Coordinator source provenance does not match the trusted configured SHA-256 pin");
+		expect(result.stderr).toContain(
+			"Coordinator source provenance does not match the trusted configured SHA-256 pin",
+		);
 		expect(await fs.readdir(out)).toEqual([]);
 	});
 
@@ -445,7 +529,9 @@ describe("AutoBot coordinator release provenance", () => {
 		const result = await runAssembly(out, fixture);
 
 		expect(result.exitCode, result.stderr).toBe(1);
-		expect(result.stderr).toContain("Coordinator-client artifact does not match its explicit pinned source provenance");
+		expect(result.stderr).toContain(
+			"Coordinator-client artifact does not match its explicit pinned source provenance",
+		);
 		expect(await Bun.file(path.join(out, "manifest.json")).exists()).toBeFalse();
 	});
 });
