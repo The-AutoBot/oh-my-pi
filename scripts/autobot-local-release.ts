@@ -293,10 +293,13 @@ async function assertExactBun(executable: string, expectedVersion: string, label
 		throw new AutoBotReleaseError(`${label} does not match its configured exact version`);
 }
 
-function commandEnvironment(config: LocalAutomationConfig): NodeJS.ProcessEnv {
+function commandEnvironment(config: LocalAutomationConfig, temporaryRoot: string): NodeJS.ProcessEnv {
 	const environment: NodeJS.ProcessEnv = {
 		...process.env,
 		PATH: `${path.dirname(config.runnerBun)}${path.delimiter}${process.env.PATH ?? ""}`,
+		TEMP: temporaryRoot,
+		TMP: temporaryRoot,
+		TMPDIR: temporaryRoot,
 	};
 	delete environment.BUN_COMPILE_EXECUTABLE_PATH;
 	delete environment.AUTOBOT_COMPILER_BUN;
@@ -1358,7 +1361,11 @@ export async function buildAndPublishLocalRelease(
 	}
 	let completed = false;
 	try {
-		const environment = commandEnvironment(config);
+		// Security-sensitive fixtures need the owned staging root's private ancestry,
+		// not the workstation's potentially shared temporary directory.
+		const temporaryRoot = path.join(stageRoot, "tmp");
+		await fs.mkdir(temporaryRoot);
+		const environment = commandEnvironment(config, temporaryRoot);
 		const plan = await readCandidateReleasePlan(config, sourceRoot, stageRoot, environment);
 		assertPlanMatchesCandidate(plan, candidate);
 		const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
