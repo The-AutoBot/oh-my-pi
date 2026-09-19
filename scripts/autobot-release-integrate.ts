@@ -4,6 +4,7 @@ import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ts } from "ts-morph";
 import { autoBotPathRequiresCompatibilityReview } from "../packages/coding-agent/src/autobot-update/contract.ts";
 import { currentAutoBotRuntimeTarget } from "../packages/coding-agent/src/autobot-update/platform.ts";
 import { isRecord } from "../packages/utils/src/type-guards.ts";
@@ -29,7 +30,6 @@ const FULL_REF = /^refs\/(?:heads|tags)\/[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const UPSTREAM_VERSION = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,127}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const CANDIDATE_CONTRACT_MAX_BYTES = 1024 * 1024;
-const CANDIDATE_EPOCH_LINE = /^\s*export\s+const\s+AUTO_BOT_COMPATIBILITY_EPOCH\s*=\s*([1-9]\d*)\s+as\s+const\s*;\s*$/;
 
 function hasSafeRefComponents(value: string): boolean {
 	return (
@@ -220,81 +220,54 @@ export async function latestCandidateMerge(
 	return undefined;
 }
 
+function literalCompatibilityEpoch(expression: ts.Expression | undefined): number | undefined {
+	let current = expression;
+	while (
+		current &&
+		(ts.isAsExpression(current) || ts.isTypeAssertionExpression(current) || ts.isParenthesizedExpression(current))
+	) {
+		current = current.expression;
+	}
+	if (!current || !ts.isNumericLiteral(current) || !/^[1-9]\d*$/.test(current.text)) return undefined;
+	return requirePositiveSafeInteger(Number(current.text), "Candidate compatibility epoch");
+}
+
 function candidateCompatibilityEpoch(source: string): number {
-	let blockComment = false;
-	let quote: "'" | '"' | undefined;
-	let braceDepth = 0;
-	for (const line of source.split("\n")) {
-		const depthAtLineStart = braceDepth;
-		let masked = "";
-		for (let index = 0; index < line.length;) {
-			const character = line[index] ?? "";
-			const next = line[index + 1] ?? "";
-			if (blockComment) {
-				masked += " ";
-				if (character === "*" && next === "/") {
-					masked += " ";
-					index += 2;
-					blockComment = false;
-				} else {
-					index++;
-				}
-				continue;
-			}
-			if (quote) {
-				masked += " ";
-				if (character === "\\") {
-					if (index + 1 < line.length) {
-						masked += " ";
-						index += 2;
-					} else {
-						index++;
-					}
-					continue;
-				}
-				if (character === quote) quote = undefined;
-				index++;
-				continue;
-			}
-			if (character === "/" && next === "/") {
-				masked += " ".repeat(line.length - index);
-				break;
-			}
-			if (character === "/" && next === "*") {
-				masked += "  ";
-				index += 2;
-				blockComment = true;
-				continue;
-			}
-			if (character === "'" || character === '"') {
-				masked += " ";
-				quote = character;
-				index++;
-				continue;
-			}
-			if (character === "`" || character === "/") {
-				throw new AutoBotReleaseError(
-					"Candidate AutoBot compatibility epoch must precede template literals and non-comment slash expressions",
-				);
-			}
-			if (character === "{") braceDepth++;
-			if (character === "}") {
-				braceDepth--;
-				if (braceDepth < 0) throw new AutoBotReleaseError("Candidate AutoBot contract has unbalanced braces");
-			}
-			masked += character;
-			index++;
+	const sourceFile = ts.createSourceFile(
+		"candidate-autobot-contract.ts",
+		source,
+		ts.ScriptTarget.Latest,
+		false,
+		ts.ScriptKind.TS,
+	);
+	const parseDiagnostics = Reflect.get(sourceFile, "parseDiagnostics");
+	if (!Array.isArray(parseDiagnostics) || parseDiagnostics.length !== 0) {
+		throw new AutoBotReleaseError("Candidate AutoBot contract is not valid TypeScript");
+	}
+	let epoch: number | undefined;
+	for (const statement of sourceFile.statements) {
+		if (
+			!ts.isVariableStatement(statement) ||
+			(statement.declarationList.flags & ts.NodeFlags.Const) === 0 ||
+			!statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)
+		) {
+			continue;
 		}
-		if (depthAtLineStart !== 0) continue;
-		const match = CANDIDATE_EPOCH_LINE.exec(masked);
-		if (match) {
-			return requirePositiveSafeInteger(Number(match[1]), "Candidate compatibility epoch");
+		for (const declaration of statement.declarationList.declarations) {
+			if (!ts.isIdentifier(declaration.name) || declaration.name.text !== "AUTO_BOT_COMPATIBILITY_EPOCH") continue;
+			if (epoch !== undefined) {
+				throw new AutoBotReleaseError("Candidate AutoBot contract must declare exactly one compatibility epoch");
+			}
+			epoch = literalCompatibilityEpoch(declaration.initializer);
+			if (epoch === undefined) {
+				throw new AutoBotReleaseError("Candidate AutoBot compatibility epoch must be a positive literal");
+			}
 		}
 	}
-	if (blockComment || quote || braceDepth !== 0) {
-		throw new AutoBotReleaseError("Candidate AutoBot contract has an unterminated declaration prefix");
+	if (epoch === undefined) {
+		throw new AutoBotReleaseError("Candidate AutoBot contract must declare exactly one compatibility epoch");
 	}
-	throw new AutoBotReleaseError("Candidate AutoBot contract must declare a literal compatibility epoch");
+	return epoch;
 }
 
 interface CandidateContractPolicy {
