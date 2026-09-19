@@ -264,6 +264,7 @@ export class CollabController {
 	 */
 	canPrepareUpdate(target: CollabUpdateTarget): CollabUpdateSafety {
 		if (this.#shutdown) return { safe: false, reason: "controller-shutdown" };
+		if (this.#ctx.collabGuest) return { safe: false, reason: "guest-incompatible" };
 		if (this.#preparedUpdates.size > 0) return { safe: false, reason: "reservation-active" };
 		const targetSafety = this.#targetSafety(target);
 		if (!targetSafety.safe) return targetSafety;
@@ -412,6 +413,7 @@ export class CollabController {
 	}
 
 	#localRestartSafety(): CollabUpdateSafety {
+		if (this.#ctx.collabGuest) return { safe: false, reason: "guest-incompatible" };
 		const session = this.#ctx.session;
 		if (session.isSessionTransitioning) return { safe: false, reason: "session-transition" };
 		if (session.isStreaming || session.isAborting || session.queuedMessageCount > 0)

@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { lookupSessionTitle, resetSessionTitleIndexForTests } from "@oh-my-pi/pi-coding-agent/session/title-index";
 import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import type { SessionTitleUpdate } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -65,6 +66,7 @@ describe("session title source persistence", () => {
 	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 	beforeEach(() => {
+		resetSessionTitleIndexForTests();
 		testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-title-source-"));
 		cwd = path.join(testAgentDir, "cwd");
 		fs.mkdirSync(cwd, { recursive: true });
@@ -72,6 +74,7 @@ describe("session title source persistence", () => {
 	});
 
 	afterEach(() => {
+		resetSessionTitleIndexForTests();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {
@@ -123,6 +126,54 @@ describe("session title source persistence", () => {
 		const reopened = await SessionManager.open(sessionFile!);
 		expect(reopened.getSessionName()).toBe("Manual title");
 		expect(reopened.titleSource).toBe("user");
+	});
+
+	it("keeps standby title changes invisible until AutoBot activation", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("session did not materialize");
+		const persistedBeforeStandby = fs.readFileSync(sessionFile, "utf8");
+		const observedNames: Array<string | undefined> = [];
+		const replicatedTitles: string[] = [];
+		const unsubscribe = session.onSessionNameChanged(() => observedNames.push(session.getSessionName()));
+		session.onEntryAppended = entry => {
+			if (entry.type === TITLE_CHANGE_ENTRY_TYPE) replicatedTitles.push(entry.title);
+		};
+
+		try {
+			session.enterAutoBotStandby();
+			await expect(session.setSessionName("Candidate-only title", "user")).resolves.toBe(false);
+			expect(session.getSessionName()).toBeUndefined();
+			expect(session.titleSource).toBeUndefined();
+			expect(session.getEntries().filter(entry => entry.type === TITLE_CHANGE_ENTRY_TYPE)).toHaveLength(0);
+			expect(observedNames).toEqual([]);
+			expect(replicatedTitles).toEqual([]);
+			expect(lookupSessionTitle(session.getSessionId())).toBeUndefined();
+			expect(fs.readFileSync(sessionFile, "utf8")).toBe(persistedBeforeStandby);
+
+			session.activateAutoBotWrites();
+			await expect(session.setSessionName("Activated title", "user")).resolves.toBe(true);
+			await session.flush();
+
+			expect(session.getSessionName()).toBe("Activated title");
+			expect(session.titleSource).toBe("user");
+			expect(
+				session
+					.getEntries()
+					.filter(entry => entry.type === TITLE_CHANGE_ENTRY_TYPE)
+					.map(entry => entry.title),
+			).toEqual(["Activated title"]);
+			expect(observedNames).toEqual(["Activated title"]);
+			expect(replicatedTitles).toEqual(["Activated title"]);
+			expect(lookupSessionTitle(session.getSessionId())).toBe("Activated title");
+			expect(getHeader(await loadEntriesFromFile(sessionFile))?.title).toBe("Activated title");
+		} finally {
+			unsubscribe();
+			await session.close();
+		}
 	});
 
 	it("loads legacy slotless files with header titles", async () => {

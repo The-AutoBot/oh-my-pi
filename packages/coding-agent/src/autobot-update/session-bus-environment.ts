@@ -53,7 +53,9 @@ function environmentValue(environment: EnvironmentSnapshot, name: string): strin
 	return undefined;
 }
 
-function snapshotLaunchEnvironment(environment: EnvironmentSnapshot): Readonly<Record<ManagedSessionEnvironmentName, string | undefined>> {
+function snapshotLaunchEnvironment(
+	environment: EnvironmentSnapshot,
+): Readonly<Record<ManagedSessionEnvironmentName, string | undefined>> {
 	const snapshot = Object.create(null) as Record<ManagedSessionEnvironmentName, string | undefined>;
 	for (const name of MANAGED_SESSION_ENVIRONMENT_NAMES) {
 		snapshot[name] = environmentValue(environment, name);
@@ -70,7 +72,7 @@ function hasEnvironmentValue(value: string | undefined): value is string {
 	return value !== undefined && value.length > 0;
 }
 
-function readDotenvFile(filePath: string): Record<string, string> {
+function readDotenvFile(filePath: string): NodeJS.Dict<string> {
 	try {
 		const metadata = fs.statSync(filePath);
 		if (!metadata.isFile() || metadata.size > MAX_MANAGED_SESSION_ENVIRONMENT_BYTES) return {};
@@ -93,7 +95,7 @@ function clearEnvironmentValue(environment: Environment, name: string): void {
 
 function applyEnvironmentValues(
 	names: readonly ManagedSessionEnvironmentName[],
-	values: Record<string, string>,
+	values: NodeJS.Dict<string>,
 	environment: Environment,
 	launchEnvironment: EnvironmentSnapshot,
 ): void {

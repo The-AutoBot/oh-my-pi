@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed TypeBox builder types omitting their native fluent methods, preventing their use as extension tool schemas.
+
 ## [18.2.1] - 2026-09-15
 
 ### Added

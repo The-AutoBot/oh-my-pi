@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, spyOn, vi } fro
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CollabController } from "@oh-my-pi/pi-coding-agent/collab/controller";
+import { CollabController, type CollabUpdateTarget } from "@oh-my-pi/pi-coding-agent/collab/controller";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost, CollabHostStoppedError } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -748,6 +748,31 @@ describe("interactive collaboration startup", () => {
 });
 
 describe("CollabController", () => {
+	const updateTarget: CollabUpdateTarget = {
+		releaseSequence: 1,
+		collabProtocolVersion: COLLAB_PROTO,
+		webBundleId: "bundle-1",
+	};
+
+	it("rejects an automatic update while a terminal guest owns the session", () => {
+		const { ctx } = makeControllerContext();
+		ctx.collabGuest = new CollabGuestLink(ctx);
+		controller = new CollabController(ctx);
+
+		expect(controller.canPrepareUpdate(updateTarget)).toEqual({ safe: false, reason: "guest-incompatible" });
+	});
+
+	it("rejects a prepared update when a terminal guest joins before commit", async () => {
+		const { ctx } = makeControllerContext();
+		controller = new CollabController(ctx);
+		const prepared = await controller.prepareUpdate(updateTarget, performance.now() + 1_000);
+		if (prepared.kind !== "prepared") throw new Error(`update reservation unexpectedly deferred: ${prepared.reason}`);
+
+		ctx.collabGuest = new CollabGuestLink(ctx);
+
+		expect(await controller.commitPreparedUpdate(prepared.reservation, "test update")).toBe(false);
+	});
+
 	it("recovers later rotations after a teardown UI error without hiding the failure", async () => {
 		const { ctx, state } = makeControllerContext({ autoStart: "control" });
 		controller = new CollabController(ctx);

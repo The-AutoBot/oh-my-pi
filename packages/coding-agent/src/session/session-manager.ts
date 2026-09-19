@@ -964,6 +964,7 @@ export class SessionManager {
 	}
 
 	async #authoritativelyRewriteCurrentStateLocked(operationError: Error): Promise<void> {
+		if (this.#autoBotStandby) return;
 		if (this.#released) {
 			// Terminal seal: repair would reset the disk tail (escaping the
 			// close() serialization) and atomically publish #fileBody() — after
@@ -1021,7 +1022,7 @@ export class SessionManager {
 				try {
 					await this.#storage.writeTextAtomic(sessionFile, body, {
 						expectedSize: this.#expectedDiskSize,
-						commitGuard: () => !this.#released && this.#diskEpoch === epoch,
+						commitGuard: () => !this.#autoBotStandby && !this.#released && this.#diskEpoch === epoch,
 					});
 				} catch (error) {
 					const recoveryErrors = [toError(error)];
@@ -2154,6 +2155,7 @@ export class SessionManager {
 	}
 
 	async #appendEntriesAtomicallyLocked<T>(append: () => T): Promise<T> {
+		if (this.#autoBotStandby) return append();
 		if (!this.#persist || !this.#sessionFile) return append();
 		if (this.#atomicEntryBatch) throw new Error("Atomic persistence lock ownership was violated.");
 		try {
@@ -2217,6 +2219,7 @@ export class SessionManager {
 	 * entry remains intended (for example, an explicit terminal tombstone).
 	 */
 	recoverPersistenceFromCurrentState(): Promise<void> {
+		if (this.#autoBotStandby) return Promise.resolve();
 		return this.#withAtomicPersistenceLock(async () => {
 			if (!this.#persist || !this.#sessionFile) return;
 			if (this.#atomicEntryBatch) throw new Error("Atomic persistence lock ownership was violated.");
@@ -2687,6 +2690,7 @@ export class SessionManager {
 	 *   Auto titles are ignored once the user has set a name.
 	 */
 	async setSessionName(name: string, source: SessionTitleSource = "auto", trigger?: string): Promise<boolean> {
+		if (this.#autoBotStandby) return false;
 		if (this.#released) return false;
 		if (this.#titleSource === "user" && source === "auto") return false;
 
