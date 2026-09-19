@@ -1999,6 +1999,7 @@ export async function runRootCommand(
 				) {
 					throw new Error("AutoBot protected session does not match its authenticated handoff");
 				}
+				sessionManager.enterAutoBotStandby();
 				cwd = autoBotRequest.cwd;
 			} else {
 				foreignSource = resolveForeignSessionSource(parsedArgs);
@@ -2541,6 +2542,7 @@ export async function runRootCommand(
 							candidateActivated = true;
 							candidateCoordinatorActivationStarted = true;
 							await service.activate(coordinator);
+							sessionManager!.activateAutoBotWrites();
 							if (await completeCandidateAutoBotExit()) return;
 							await managedCandidate.acknowledgeActivation();
 							if (await completeCandidateAutoBotExit()) return;
@@ -2569,6 +2571,7 @@ export async function runRootCommand(
 										if (await completeFallbackAutoBotExit()) return;
 										throw new Error("AutoBot predecessor fallback lost its protected exit fence");
 									}
+									sessionManager!.activateAutoBotWrites();
 									fallbackActivationCompleted = true;
 								} catch (error) {
 									if (await completeFallbackAutoBotExit()) return;
