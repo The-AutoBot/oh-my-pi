@@ -53,6 +53,48 @@ const CANONICAL_REPOSITORY = "The-AutoBot/oh-my-pi";
 const CONFIG_SCHEMA_VERSION = 1 as const;
 const STATE_SCHEMA_VERSION = 1 as const;
 const OWNER_SCHEMA_VERSION = 1 as const;
+const COMMAND_DIAGNOSTIC_SCHEMA_VERSION = 1 as const;
+const MAX_COMMAND_DIAGNOSTIC_RECORDS = 16;
+const MAX_COMMAND_DIAGNOSTIC_BYTES = 8 * 1024;
+const MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
+export const LOCAL_COMMAND_DIAGNOSTICS_FILENAME = ".autobot-local-diagnostics.json";
+const LOCAL_COMMAND_STAGES = ["release", "omp"] as const;
+const LOCAL_COMMAND_KINDS = [
+	"release-plan",
+	"integration-branch-fetch",
+	"release-tag-fetch",
+	"release-tag-creation",
+	"github-release-download",
+	"downloaded-release-verification",
+	"baseline-native-addon-build",
+	"candidate-dependency-installation",
+	"browser-relay-build",
+	"collab-web-build",
+	"runtime-compilation",
+	"runtime-version-check",
+	"runtime-smoke-test",
+	"bootstrap-compilation",
+	"focused-coding-agent-runtime-checks",
+	"focused-collab-web-checks",
+	"focused-release-contract-checks",
+	"focused-installer-contract-checks",
+	"candidate-environment-isolation-checks",
+	"coordinator-sdk-preparation",
+	"coordinator-extension-build",
+	"release-assembly",
+	"release-signing",
+	"local-signed-release-verification",
+	"github-draft-release-creation",
+	"github-release-upload",
+	"github-git-credential-setup",
+	"signed-channel-clone",
+	"signed-channel-staging",
+	"signed-channel-commit",
+	"signed-channel-push",
+	"github-draft-release-publication",
+	"omp-invocation",
+] as const;
+const LOCAL_COMMAND_OUTCOMES = ["started", "exited", "timed-out", "start-failed"] as const;
 const MAX_OMP_ATTEMPTS = 3;
 const BUN_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const DURATION = /^([1-9]\d*(?:\.\d+)?)([smh])$/;
@@ -101,6 +143,7 @@ const STATE_KEYS = [
 const WORK_ROOT_ENTRY: Record<string, true> = {
 	".autobot-local-owner.json": true,
 	".autobot-local-state.json": true,
+	[LOCAL_COMMAND_DIAGNOSTICS_FILENAME]: true,
 	"repository.git": true,
 	worktree: true,
 	"cargo-target": true,
@@ -144,6 +187,28 @@ interface LocalState {
 	readonly buildFailure?: BuildFailureState;
 }
 
+export type LocalCommandStage = (typeof LOCAL_COMMAND_STAGES)[number];
+export type LocalCommandKind = (typeof LOCAL_COMMAND_KINDS)[number];
+export type LocalCommandOutcome = (typeof LOCAL_COMMAND_OUTCOMES)[number];
+
+export interface LocalCommandDiagnosticRecord {
+	readonly stage: LocalCommandStage;
+	readonly commandKind: LocalCommandKind;
+	readonly outcome: LocalCommandOutcome;
+	readonly timedOut: boolean;
+	readonly exitCode?: number;
+	readonly durationMs?: number;
+}
+
+export interface LocalCommandRecorder {
+	record(record: LocalCommandDiagnosticRecord): Promise<void>;
+}
+
+interface LocalCommandJournal {
+	readonly schemaVersion: typeof COMMAND_DIAGNOSTIC_SCHEMA_VERSION;
+	readonly records: readonly LocalCommandDiagnosticRecord[];
+}
+
 interface ManagedWorktree {
 	readonly repository: string;
 	readonly worktree: string;
@@ -164,6 +229,7 @@ interface OmpControllerContext {
 	readonly expectedCanonicalCommit: string;
 	readonly expectedUpstreamCommit: string;
 	readonly expectedIntegrationCommit: string | undefined;
+	readonly commandRecorder: LocalCommandRecorder;
 }
 
 function requireExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
@@ -497,6 +563,71 @@ function parseBuildFailure(value: unknown): BuildFailureState | undefined {
 	return { fingerprint, attempts };
 }
 
+function requireLocalCommandEnum<T extends string>(value: unknown, values: readonly T[], label: string): T {
+	if (typeof value !== "string" || !(values as readonly string[]).includes(value)) {
+		throw new AutoBotReleaseError(`Local command diagnostic ${label} is invalid`);
+	}
+	return value as T;
+}
+
+function parseLocalCommandDuration(value: unknown): number {
+	if (
+		typeof value !== "number" ||
+		!Number.isSafeInteger(value) ||
+		value < 0 ||
+		value > MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS
+	) {
+		throw new AutoBotReleaseError("Local command diagnostic duration is invalid");
+	}
+	return value;
+}
+
+function parseLocalCommandExitCode(value: unknown): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new AutoBotReleaseError("Local command diagnostic exit code is invalid");
+	}
+	return value;
+}
+
+function parseLocalCommandDiagnosticRecord(value: unknown): LocalCommandDiagnosticRecord {
+	if (!isRecord(value)) throw new AutoBotReleaseError("Local command diagnostic record is invalid");
+	const stage = requireLocalCommandEnum(value.stage, LOCAL_COMMAND_STAGES, "stage");
+	const commandKind = requireLocalCommandEnum(value.commandKind, LOCAL_COMMAND_KINDS, "kind");
+	const outcome = requireLocalCommandEnum(value.outcome, LOCAL_COMMAND_OUTCOMES, "outcome");
+	const keys =
+		outcome === "started"
+			? ["stage", "commandKind", "outcome", "timedOut"]
+			: outcome === "exited"
+				? ["stage", "commandKind", "outcome", "timedOut", "exitCode", "durationMs"]
+				: ["stage", "commandKind", "outcome", "timedOut", "durationMs"];
+	requireExactKeys(value, keys, "Local command diagnostic record");
+	if (typeof value.timedOut !== "boolean" || value.timedOut !== (outcome === "timed-out")) {
+		throw new AutoBotReleaseError("Local command diagnostic timeout state is invalid");
+	}
+	const common = { stage, commandKind, outcome, timedOut: value.timedOut };
+	if (outcome === "started") return common;
+	const durationMs = parseLocalCommandDuration(value.durationMs);
+	if (outcome === "exited") {
+		return { ...common, exitCode: parseLocalCommandExitCode(value.exitCode), durationMs };
+	}
+	return { ...common, durationMs };
+}
+
+function parseLocalCommandJournal(value: unknown): LocalCommandJournal {
+	if (!isRecord(value)) throw new AutoBotReleaseError("Local command diagnostics are invalid");
+	requireExactKeys(value, ["schemaVersion", "records"], "Local command diagnostics");
+	if (value.schemaVersion !== COMMAND_DIAGNOSTIC_SCHEMA_VERSION) {
+		throw new AutoBotReleaseError("Local command diagnostics schema is unsupported");
+	}
+	if (!Array.isArray(value.records) || value.records.length > MAX_COMMAND_DIAGNOSTIC_RECORDS) {
+		throw new AutoBotReleaseError("Local command diagnostics records are invalid");
+	}
+	return {
+		schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION,
+		records: value.records.map(parseLocalCommandDiagnosticRecord),
+	};
+}
+
 function parseLocalState(value: unknown): LocalState {
 	if (!isRecord(value)) throw new AutoBotReleaseError("Local automation state is invalid");
 	if (
@@ -553,6 +684,64 @@ async function writeLocalState(workRoot: string, state: LocalState): Promise<voi
 	const localStatePath = statePath(workRoot);
 	await writeJsonAtomic(localStatePath, state);
 	await assertAutoBotPrivateFile(localStatePath);
+}
+
+async function readLocalCommandJournal(workRoot: string): Promise<LocalCommandJournal> {
+	const journalPath = path.join(workRoot, LOCAL_COMMAND_DIAGNOSTICS_FILENAME);
+	if (!(await pathExists(journalPath))) {
+		return { schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION, records: [] };
+	}
+	const protectedJournal = await assertAutoBotPrivateFile(journalPath);
+	let contents: Buffer;
+	try {
+		const handle = await fs.open(protectedJournal, "r");
+		try {
+			const buffer = Buffer.allocUnsafe(MAX_COMMAND_DIAGNOSTIC_BYTES + 1);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+			if (bytesRead > MAX_COMMAND_DIAGNOSTIC_BYTES) {
+				throw new AutoBotReleaseError("Local command diagnostics exceed their fixed size limit");
+			}
+			contents = buffer.subarray(0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	} catch (error) {
+		if (error instanceof AutoBotReleaseError) throw error;
+		throw new AutoBotReleaseError("Local command diagnostics could not be read");
+	}
+	let value: unknown;
+	try {
+		value = JSON.parse(contents.toString("utf8"));
+	} catch {
+		throw new AutoBotReleaseError("Local command diagnostics are not valid JSON");
+	}
+	return parseLocalCommandJournal(value);
+}
+
+async function writeLocalCommandJournal(workRoot: string, journal: LocalCommandJournal): Promise<void> {
+	const journalPath = path.join(workRoot, LOCAL_COMMAND_DIAGNOSTICS_FILENAME);
+	await writeJsonAtomic(journalPath, journal);
+	await assertAutoBotPrivateFile(journalPath);
+}
+
+export async function createLocalCommandRecorder(workRoot: string): Promise<LocalCommandRecorder> {
+	let journal = await readLocalCommandJournal(workRoot);
+	let writes = Promise.resolve();
+	return {
+		record(record: LocalCommandDiagnosticRecord): Promise<void> {
+			const parsed = parseLocalCommandDiagnosticRecord(record);
+			const operation = writes.then(async () => {
+				const next: LocalCommandJournal = {
+					schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION,
+					records: [...journal.records, parsed].slice(-MAX_COMMAND_DIAGNOSTIC_RECORDS),
+				};
+				await writeLocalCommandJournal(workRoot, next);
+				journal = next;
+			});
+			writes = operation.catch(() => undefined);
+			return operation;
+		},
+	};
 }
 async function transition(
 	workRoot: string,
@@ -926,14 +1115,18 @@ async function invokeOmpGuarded(
 	let ompError: unknown;
 	try {
 		repairIntent = (
-			await runLocalOmp(context.config, {
-				cwd: context.worktree,
-				reason,
-				forkCommit: beforeHead,
-				upstreamCommit: context.expectedUpstreamCommit,
-				sensitivePaths,
-				diagnostics,
-			})
+			await runLocalOmp(
+				context.config,
+				{
+					cwd: context.worktree,
+					reason,
+					forkCommit: beforeHead,
+					upstreamCommit: context.expectedUpstreamCommit,
+					sensitivePaths,
+					diagnostics,
+				},
+				context.commandRecorder,
+			)
 		).repairIntent;
 	} catch (error) {
 		ompError = error;
@@ -1112,6 +1305,7 @@ async function prepareCandidate(
 	initialSourceChanged: boolean,
 	ompAttempts: { value: number },
 	setPhase: (phase: LocalPhase, patch?: Partial<Omit<LocalState, "schemaVersion" | "phase">>) => Promise<void>,
+	commandRecorder: LocalCommandRecorder,
 ): Promise<{ readonly candidate: LocalCandidate; readonly candidateMergeCommit: string; readonly state: LocalState }> {
 	let currentState = state;
 	let currentHead = await currentCommit(managed.worktree, "Initial local integration HEAD");
@@ -1125,6 +1319,7 @@ async function prepareCandidate(
 		expectedCanonicalCommit: canonicalCommit,
 		expectedUpstreamCommit: upstreamCommit,
 		expectedIntegrationCommit: integrationRemoteCommit,
+		commandRecorder,
 	});
 	let sourceChanged = initialSourceChanged;
 
@@ -1261,6 +1456,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 	const producer = await trustedProducer();
 	const config = await loadLocalAutomationConfig(configPath, producer.root);
 	await claimWorkRoot(config.workRoot, config.repository, producer.root);
+	const commandRecorder = await createLocalCommandRecorder(config.workRoot);
 	let state = await readLocalState(config.workRoot);
 	try {
 		const managed = await ensureManagedWorktree(config, producer.root, producer.commit);
@@ -1329,6 +1525,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 				expectedCanonicalCommit: canonicalCommit,
 				expectedUpstreamCommit: upstreamCommit,
 				expectedIntegrationCommit: integrationRemoteCommit,
+				commandRecorder,
 			};
 			currentHead = await mergePinnedInput(
 				producerContext,
@@ -1356,6 +1553,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 			producerMerged,
 			ompAttempts,
 			setPhase,
+			commandRecorder,
 		);
 		state = { ...state, compatibilityReviewFingerprint: prepared.state.compatibilityReviewFingerprint };
 		const candidate = prepared.candidate;
@@ -1392,6 +1590,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 				expectedCanonicalCommit: canonicalCommit,
 				expectedUpstreamCommit: upstreamCommit,
 				expectedIntegrationCommit: integrationRemoteCommit,
+				commandRecorder,
 			},
 			candidate.forkCommit,
 		);
@@ -1407,7 +1606,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 		while (true) {
 			try {
 				await setPhase("publishing");
-				const published = await buildAndPublishLocalRelease(config, publishCandidate);
+				const published = await buildAndPublishLocalRelease(config, publishCandidate, commandRecorder);
 				await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
 				if ((await currentCommit(managed.worktree, "Published candidate HEAD")) !== publishCandidate.forkCommit) {
 					throw new AutoBotReleaseError("Publisher changed the committed candidate source");
@@ -1449,6 +1648,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 						expectedCanonicalCommit: canonicalCommit,
 						expectedUpstreamCommit: upstreamCommit,
 						expectedIntegrationCommit: expectedIntegrationCommit,
+						commandRecorder,
 					},
 					"build-failure",
 					publishCandidate.sensitivePaths,
@@ -1508,6 +1708,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 							expectedCanonicalCommit: canonicalCommit,
 							expectedUpstreamCommit: upstreamCommit,
 							expectedIntegrationCommit: expectedIntegrationCommit,
+							commandRecorder,
 						},
 						"compatibility",
 						publishCandidate.sensitivePaths,
@@ -1562,6 +1763,7 @@ async function runLocalAutomation(configPath: string): Promise<void> {
 						expectedCanonicalCommit: canonicalCommit,
 						expectedUpstreamCommit: upstreamCommit,
 						expectedIntegrationCommit: expectedIntegrationCommit,
+						commandRecorder,
 					},
 					publishCandidate.forkCommit,
 				);

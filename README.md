@@ -686,6 +686,14 @@ rejects rooted-relative as well as ordinary relative config and Bun paths. A
 same-user/configuration mutex makes an overlapping invocation a successful
 no-op rather than a second producer run.
 
+For opaque local command failures, the controller keeps the latest sixteen
+structural outcomes in a fixed journal below the owner-private work root.
+Records contain only fixed stage, command-kind, and outcome values; timeout
+state; a numeric exit code when known; and a bounded duration. They never
+contain command arguments, child streams, environment values, prompts,
+credentials, URLs, or error text. The journal does not alter launcher stream
+suppression or print diagnostic contents.
+
 To register, but not start, the dedicated hourly task:
 
 ```powershell
@@ -715,10 +723,27 @@ The publisher validates the clean committed candidate, exact pinned tools, and
 the signed predecessor before building the Windows x64 quartet: runtime and
 bootstrap (`win32-x64`), coordinator client (`universal`), and collab web
 bundle (`web`). It performs focused candidate checks and fresh-home runtime
-smokes, signs and verifies the local bundle, uploads a draft, downloads and
-verifies the published bytes independently, publishes that verified draft, and
-advances the signed channel last. It does not install a runtime, change PATH,
-or deploy the coordinator.
+smokes, signs and verifies the local bundle, and creates or confirms the exact
+candidate tag without force before creating a draft. It downloads and verifies
+the uploaded bytes independently, publishes that verified draft, and advances
+the signed channel last. Channel predecessor checks compare raw committed Git
+blobs, not checkout bytes affected by line-ending conversion. It does not install
+a runtime, change PATH, or deploy the coordinator.
+
+To recover a preserved signed stage, a reviewed operator can call
+`publishPreparedLocalRelease(config, candidate, preservedStageRoot, recorder)`
+from `scripts/autobot-local-release.ts`. The caller must select the exact stage;
+the API never searches for the newest stage, rebuilds, or re-signs. It validates
+the retained inputs and copies them into a private verification snapshot,
+preserving the supplied stage. It creates a draft only when none exists, or
+reuses one exact matching next-sequence draft without replacing its assets.
+Conflicting tags, foreign or ambiguous drafts, stale channel state, and an
+already-published target fail closed.
+
+Publisher subprocesses inherit the caller's current environment unless an
+explicit environment is supplied. Operators can therefore isolate Git settings
+with a process-local `GIT_CONFIG_GLOBAL`; the publisher does not itself create
+that isolation file.
 
 #### Install or migrate the immutable bootstrap
 

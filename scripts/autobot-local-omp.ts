@@ -10,6 +10,7 @@ import {
 import { parseRepairIntent } from "./autobot-publication-boundary.ts";
 import type { RepairIntent } from "./autobot-publication-boundary.ts";
 import type { LocalAutomationConfig } from "./autobot-local-types.ts";
+import type { LocalCommandRecorder } from "./autobot-local.ts";
 
 export interface LocalOmpRequest {
 	readonly cwd: string;
@@ -52,6 +53,7 @@ const maximumWatchdogGraceMilliseconds = 5_000;
 const maximumTimerDelayMilliseconds = 2_147_000_000;
 const terminationWaitMilliseconds = 15_000;
 const maxTimeDuration = /^(\d+(?:\.\d+)?)([smh])$/;
+const maximumCommandDiagnosticDurationMilliseconds = 7 * 24 * 60 * 60 * 1000;
 const commit = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const diagnosticTruncationMarker = "\n[truncated]";
 
@@ -443,7 +445,14 @@ async function invokeOmp(
 	context: PrivateContext,
 	profileConfig: string | undefined,
 	watchdogDelay: number,
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
+	try {
+		await recorder.record({ stage: "omp", commandKind: "omp-invocation", outcome: "started", timedOut: false });
+	} catch {
+		throw new Error("Local OMP diagnostics could not be recorded");
+	}
+	const startedAt = performance.now();
 	let child: OwnedChildProcess;
 	try {
 		child = Bun.spawn(
@@ -473,6 +482,21 @@ async function invokeOmp(
 			},
 		);
 	} catch {
+		const durationMs = Math.min(
+			maximumCommandDiagnosticDurationMilliseconds,
+			Math.max(0, Math.floor(performance.now() - startedAt)),
+		);
+		try {
+			await recorder.record({
+				stage: "omp",
+				commandKind: "omp-invocation",
+				outcome: "start-failed",
+				timedOut: false,
+				durationMs,
+			});
+		} catch {
+			// The original process-start failure is already terminal.
+		}
 		throw new Error("Local OMP invocation could not be started");
 	}
 
@@ -494,22 +518,57 @@ async function invokeOmp(
 		watchdog.expired.then(() => ({ kind: "timed-out" as const })),
 	]);
 	watchdog.cancel();
+	const durationMs = Math.min(
+		maximumCommandDiagnosticDurationMilliseconds,
+		Math.max(0, Math.floor(performance.now() - startedAt)),
+	);
 	if (outcome.kind === "timed-out") {
+		let terminationFailed = false;
 		try {
 			await terminateOwnedProcessTree(child, rootProcess);
 		} catch {
+			terminationFailed = true;
+		}
+		try {
+			await recorder.record({
+				stage: "omp",
+				commandKind: "omp-invocation",
+				outcome: "timed-out",
+				timedOut: true,
+				durationMs,
+			});
+		} catch {
+			// The timeout remains terminal after process-tree cleanup completes.
+		}
+		if (terminationFailed) {
 			throw new Error("Local OMP timed out and its process tree could not be terminated");
 		}
 		throw new Error("Local OMP timed out and was terminated");
 	}
+	let reapingFailed = false;
 	try {
 		// A zero root exit does not authorize a background child to outlive this
 		// invocation. The retained native handle pins the original tree identity.
 		rootProcess.killTree();
 	} catch {
-		throw new Error("Local OMP process tree could not be reaped");
+		reapingFailed = true;
 	}
+	let recordingFailed = false;
+	try {
+		await recorder.record({
+			stage: "omp",
+			commandKind: "omp-invocation",
+			outcome: "exited",
+			timedOut: false,
+			exitCode: outcome.exitCode,
+			durationMs,
+		});
+	} catch {
+		recordingFailed = true;
+	}
+	if (reapingFailed) throw new Error("Local OMP process tree could not be reaped");
 	if (outcome.exitCode !== 0) throw new Error(`Local OMP exited with code ${outcome.exitCode}`);
+	if (recordingFailed) throw new Error("Local OMP diagnostics could not be recorded");
 }
 
 /**
@@ -518,7 +577,11 @@ async function invokeOmp(
  * must independently validate Git state, source correctness, builds, and
  * release policy.
  */
-export async function runLocalOmp(config: LocalAutomationConfig, request: LocalOmpRequest): Promise<LocalOmpResult> {
+export async function runLocalOmp(
+	config: LocalAutomationConfig,
+	request: LocalOmpRequest,
+	recorder: LocalCommandRecorder,
+): Promise<LocalOmpResult> {
 	if (process.platform !== "win32" || process.arch !== "x64") {
 		throw new Error("Local OMP automation supports Windows x64 only");
 	}
@@ -531,7 +594,14 @@ export async function runLocalOmp(config: LocalAutomationConfig, request: LocalO
 	let result: LocalOmpResult | undefined;
 	let failure: Error | undefined;
 	try {
-		await invokeOmp({ ...config, ompExecutable: executable }, worktree, context, profileConfig, watchdogDelay);
+		await invokeOmp(
+			{ ...config, ompExecutable: executable },
+			worktree,
+			context,
+			profileConfig,
+			watchdogDelay,
+			recorder,
+		);
 		result = { repairIntent: await readRepairIntent(context) };
 	} catch (error) {
 		failure =
