@@ -183,7 +183,8 @@ const pathsModulePath = path
 const fixtureRuntimeProgramEnvironment = "OMP_TEST_AUTOBOT_RUNTIME_PROGRAM";
 // These are integration guards around separately scheduled child processes;
 // fake timers cannot bound filesystem-lock acquisition or child termination.
-const foreignHandoffLockHolderAcquisitionTimeoutMs = 15_000;
+// Readiness includes protected journal creation and Windows ACL subprocesses.
+const foreignHandoffLockHolderAcquisitionTimeoutMs = 60_000;
 const foreignHandoffLockHolderCleanupTimeoutMs = 5_000;
 const foreignHandoffLockHolderPhases: Record<string, true> = {
 	"modules-loaded": true,
