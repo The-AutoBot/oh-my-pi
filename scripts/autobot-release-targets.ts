@@ -20,6 +20,14 @@ export const AUTO_BOT_RUNTIME_TARGETS: Record<string, AutoBotRuntimeTarget> = {
 	"win32-x64": { platform: "win32", arch: "x64", libc: "none" },
 };
 
+/**
+ * Exact target set required when producing a signed AutoBot release locally.
+ *
+ * The broader runtime map above remains the consumer and legacy-tooling
+ * selector; producer completeness is intentionally a separate policy.
+ */
+export const AUTO_BOT_RELEASE_REQUIRED_RUNTIME_TARGETS = ["win32-x64"] as const;
+
 export function assertAutoBotRuntimeTarget(value: string): AutoBotRuntimeTarget {
 	if (!Object.hasOwn(AUTO_BOT_RUNTIME_TARGETS, value)) {
 		throw new Error(`Unsupported AutoBot runtime/bootstrap target: ${value}`);

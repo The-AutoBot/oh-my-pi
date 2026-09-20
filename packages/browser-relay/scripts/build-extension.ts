@@ -41,7 +41,13 @@ for (const file of ["LICENSE", "THIRD-PARTY-NOTICES.txt"]) {
 	await Bun.write(path.join(distExtension, file), Bun.file(path.join(repoRoot, file)));
 }
 
-const zip = await $`zip -qr ../omp-browser-relay-extension.zip .`.cwd(distExtension).nothrow();
+// Windows ships libarchive's tar, but does not provide the Unix zip command.
+const zip =
+	process.platform === "win32"
+		? await $`tar --format=zip -cf ../omp-browser-relay-extension.zip ${await fs.readdir(distExtension)}`
+				.cwd(distExtension)
+				.nothrow()
+		: await $`zip -qr ../omp-browser-relay-extension.zip .`.cwd(distExtension).nothrow();
 if (zip.exitCode !== 0) {
 	console.error("zip failed:", zip.stderr.toString());
 	process.exit(1);

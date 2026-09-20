@@ -1,5 +1,5 @@
 import { afterAll, afterEach, expect, test } from "bun:test";
-import { watch } from "node:fs";
+import { unwatchFile, watchFile } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -162,7 +162,9 @@ async function stopProcess(processHandle: LegacyProcess): Promise<void> {
 afterEach(async () => {
 	await Promise.all([...activeForeignHandoffLockHolders].map(stopForeignHandoffLockHolder));
 	await Promise.all([...activeBootstrapRuns].map(stopBootstrap));
-	await Promise.all(temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	await Promise.all(
+		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 });
 
 const fixtureTimestamp = "2026-09-17T00:00:00.000Z";
@@ -179,6 +181,18 @@ const pathsModulePath = path
 	.join(repoRoot, "packages", "coding-agent", "src", "autobot-update", "paths.ts")
 	.replaceAll("\\", "/");
 const fixtureRuntimeProgramEnvironment = "OMP_TEST_AUTOBOT_RUNTIME_PROGRAM";
+// These are integration guards around separately scheduled child processes;
+// fake timers cannot bound filesystem-lock acquisition or child termination.
+const foreignHandoffLockHolderAcquisitionTimeoutMs = 15_000;
+const foreignHandoffLockHolderCleanupTimeoutMs = 5_000;
+const foreignHandoffLockHolderPhases: Record<string, true> = {
+	"modules-loaded": true,
+	"acquiring-lock": true,
+	"lock-acquired": true,
+	"pending-rejected": true,
+	"pending-written": true,
+	"ready-to-signal": true,
+};
 const fixtureRuntimeStageEnvironment = "OMP_TEST_AUTOBOT_RUNTIME_STAGE";
 
 let compiledBootstrapDirectory: string | undefined;
@@ -233,6 +247,7 @@ interface ForeignHandoffLockHolder {
 	readonly process: BootstrapProcess;
 	readonly stderr: Promise<string>;
 	readonly acquiredPath: string;
+	readonly phasePath: string;
 	readonly releasePath: string;
 }
 
@@ -337,7 +352,7 @@ async function ensureFixtureRuntime(): Promise<string> {
 			`const programPath = process.env[${JSON.stringify(fixtureRuntimeProgramEnvironment)}];`,
 			`const stagePath = process.env[${JSON.stringify(fixtureRuntimeStageEnvironment)}];`,
 			"const insideRoot = candidate => {",
-			'\tif (!root || !candidate || !path.isAbsolute(candidate)) return false;',
+			"\tif (!root || !candidate || !path.isAbsolute(candidate)) return false;",
 			"\tconst relative = path.relative(path.resolve(root), path.resolve(candidate));",
 			'\treturn Boolean(relative) && relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative);',
 			"};",
@@ -412,10 +427,36 @@ async function createBootstrapFixture(): Promise<BootstrapFixture> {
 		fs.stat(bootstrapPath),
 	]);
 	const target = currentAutoBotRuntimeTarget();
-	const activeManifest = releaseManifest(1, target, runtimeSha256, runtimeStat.size, bootstrapSha256, bootstrapStat.size);
-	const candidateManifest = releaseManifest(2, target, runtimeSha256, runtimeStat.size, bootstrapSha256, bootstrapStat.size);
-	const activeRuntimePath = await writeRuntimeSlot(paths, "1-fixture-active", activeManifest, bootstrapPath, runtimeSource);
-	const candidateRuntimePath = await writeRuntimeSlot(paths, "2-fixture-candidate", candidateManifest, bootstrapPath, runtimeSource);
+	const activeManifest = releaseManifest(
+		1,
+		target,
+		runtimeSha256,
+		runtimeStat.size,
+		bootstrapSha256,
+		bootstrapStat.size,
+	);
+	const candidateManifest = releaseManifest(
+		2,
+		target,
+		runtimeSha256,
+		runtimeStat.size,
+		bootstrapSha256,
+		bootstrapStat.size,
+	);
+	const activeRuntimePath = await writeRuntimeSlot(
+		paths,
+		"1-fixture-active",
+		activeManifest,
+		bootstrapPath,
+		runtimeSource,
+	);
+	const candidateRuntimePath = await writeRuntimeSlot(
+		paths,
+		"2-fixture-candidate",
+		candidateManifest,
+		bootstrapPath,
+		runtimeSource,
+	);
 	await writeAutoBotActivePointer(paths, {
 		schemaVersion: 1,
 		slotId: "1-fixture-active",
@@ -450,8 +491,7 @@ function runtimeProgram(input: {
 	return `
 // Bundle these static checkout imports with the per-run fixture program. The
 // copied runtime only imports that bundled program from its managed root.
-import { watch } from "node:fs";
-import { dirname } from "node:path";
+import { unwatchFile, watchFile } from "node:fs";
 import { readAuthenticatedAutoBotEnvironment } from ${JSON.stringify(identityModulePath)};
 import {
 	readAutoBotHandoff,
@@ -478,58 +518,60 @@ const promotedExitEvidencePath = ${JSON.stringify(input.promotedExitEvidencePath
 const restartGatePath = ${JSON.stringify(input.restartGatePath ?? input.gatePath)};
 const promoteAndQuit = ${JSON.stringify(input.promoteAndQuit)};
 
-async function waitForCondition(directory, condition) {
-	if (await condition()) return;
-	await new Promise((resolve, reject) => {
-		let settled = false;
-		let watcher;
-		const finish = error => {
-			if (settled) return;
-			settled = true;
-			watcher?.close();
-			if (error) reject(error);
-			else resolve();
-		};
-		const check = () => {
-			void Promise.resolve(condition()).then(ready => {
-				if (ready) finish();
-			}, finish);
-		};
-		watcher = watch(directory, check);
-		watcher.once("error", finish);
-		check();
-	});
+async function waitForCondition(filePaths, condition) {
+	const initial = await condition();
+	if (initial) return initial;
+	const { promise, resolve, reject } = Promise.withResolvers();
+	let settled = false;
+	let checking = false;
+	let recheckRequested = false;
+	const finish = (value, error) => {
+		if (settled) return;
+		settled = true;
+		if (error !== undefined) reject(error);
+		else resolve(value);
+	};
+	const check = () => {
+		if (settled) return;
+		if (checking) {
+			recheckRequested = true;
+			return;
+		}
+		checking = true;
+		void Promise.resolve()
+			.then(condition)
+			.then(
+				value => {
+					if (value) finish(value);
+				},
+				error => finish(undefined, error),
+			)
+			.finally(() => {
+				checking = false;
+				if (recheckRequested) {
+					recheckRequested = false;
+					check();
+				}
+			});
+	};
+	const listener = () => check();
+	for (const filePath of filePaths) {
+		watchFile(filePath, { interval: 25, persistent: true }, listener);
+	}
+	listener();
+	try {
+		return await promise;
+	} finally {
+		for (const filePath of filePaths) {
+			unwatchFile(filePath, listener);
+		}
+	}
 }
 
 async function waitForEitherFile(firstPath, secondPath) {
-	const firstReady = await Bun.file(firstPath).exists();
-	if (firstReady) return "first";
-	if (await Bun.file(secondPath).exists()) return "second";
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		const watchers = [];
-		const finish = (result, error) => {
-			if (settled) return;
-			settled = true;
-			for (const watcher of watchers) watcher.close();
-			if (error) reject(error);
-			else resolve(result);
-		};
-		const check = () => {
-			void Promise.all([Bun.file(firstPath).exists(), Bun.file(secondPath).exists()]).then(
-				([firstExists, secondExists]) => {
-					if (firstExists) finish("first");
-					else if (secondExists) finish("second");
-				},
-				error => finish(undefined, error),
-			);
-		};
-		for (const directory of new Set([dirname(firstPath), dirname(secondPath)])) {
-			const watcher = watch(directory, check);
-			watcher.once("error", error => finish(undefined, error));
-			watchers.push(watcher);
-		}
-		check();
+	return waitForCondition([firstPath, secondPath], async () => {
+		if (await Bun.file(firstPath).exists()) return "first";
+		return (await Bun.file(secondPath).exists()) ? "second" : undefined;
 	});
 }
 
@@ -648,7 +690,7 @@ await Bun.write(${JSON.stringify(input.evidencePath)}, JSON.stringify({
 }));
 
 if (environment.role !== "candidate") {
-	await waitForCondition(dirname(restartGatePath), () => Bun.file(restartGatePath).exists());
+	await waitForCondition([restartGatePath], () => Bun.file(restartGatePath).exists());
 	if (promoteAndQuit) {
 		const pending = await readAutoBotPendingRestart(environment.paths);
 		if (!pending) throw new Error("Authenticated active runtime could not authorize its restart");
@@ -673,13 +715,13 @@ if (environment.role !== "candidate") {
 		(await waitForEitherFile(activationPath, ${JSON.stringify(input.gatePath)})) === "first";
 	if (activationObserved) {
 		await Bun.write(${JSON.stringify(input.activationObservedPath ?? input.gatePath)}, "activation observed");
-		await waitForCondition(dirname(${JSON.stringify(input.gatePath)}), () => Bun.file(${JSON.stringify(input.gatePath)}).exists());
+		await waitForCondition([${JSON.stringify(input.gatePath)}], () => Bun.file(${JSON.stringify(input.gatePath)}).exists());
 		await writeAutoBotActivationAcknowledgement(environment.paths, handoff);
 		await promoteAutoBotStartupHandoff();
-		await waitForCondition(environment.paths.controlDir, async () => {
+		await waitForCondition([environment.paths.activePointerPath], async () => {
 			return (await readAutoBotActivePointer(environment.paths))?.runtimePath === process.execPath;
 		});
-		await waitForCondition(environment.paths.controlDir, async () => {
+		await waitForCondition([environment.paths.pendingRestartPath, environment.paths.committedRestartPath], async () => {
 			const [pending, committed] = await Promise.all([
 				readAutoBotPendingRestart(environment.paths),
 				readAutoBotCommittedRestart(environment.paths),
@@ -701,7 +743,7 @@ if (environment.role !== "candidate") {
 			JSON.stringify({ authenticatedAfterPromotion, promotionFailure, ...reauthenticationState }),
 		);
 		if (authenticatedAfterPromotion && promotedExitGatePath !== undefined) {
-			await waitForCondition(dirname(promotedExitGatePath), () => Bun.file(promotedExitGatePath).exists());
+			await waitForCondition([promotedExitGatePath], () => Bun.file(promotedExitGatePath).exists());
 			if (!(await requestAutoBotNormalExit())) {
 				throw new Error("Promoted candidate could not request a normal exit");
 			}
@@ -713,7 +755,7 @@ if (environment.role !== "candidate") {
 				throw new Error("Promoted candidate normal-exit controls are unavailable");
 			}
 			await Bun.write(promotedExitIntentPath, "normal exit intent");
-			await waitForCondition(dirname(promotedExitReleaseGatePath), () => Bun.file(promotedExitReleaseGatePath).exists());
+			await waitForCondition([promotedExitReleaseGatePath], () => Bun.file(promotedExitReleaseGatePath).exists());
 			await Bun.write(promotedExitEvidencePath, JSON.stringify({ nativeExitCode: process.exitCode ?? 0 }));
 		}
 		if (!authenticatedAfterPromotion) process.exitCode = 92;
@@ -722,10 +764,7 @@ if (environment.role !== "candidate") {
 `;
 }
 
-async function startBootstrap(
-	fixture: BootstrapFixture,
-	options: BootstrapStartOptions = {},
-): Promise<BootstrapRun> {
+async function startBootstrap(fixture: BootstrapFixture, options: BootstrapStartOptions = {}): Promise<BootstrapRun> {
 	const { candidate = false, promoteAndQuit = false } = options;
 	const identifier = fixtureId();
 	const stagePath = path.join(fixture.root, `${identifier}.entered`);
@@ -734,13 +773,19 @@ async function startBootstrap(
 	const restartGatePath = promoteAndQuit ? path.join(fixture.root, `${identifier}.restart`) : undefined;
 	const candidateControls = candidate || promoteAndQuit;
 	const activationObservedPath = candidateControls ? path.join(fixture.root, `${identifier}.activation`) : undefined;
-	const postAcknowledgementPath = candidateControls ? path.join(fixture.root, `${identifier}.post-ack.json`) : undefined;
+	const postAcknowledgementPath = candidateControls
+		? path.join(fixture.root, `${identifier}.post-ack.json`)
+		: undefined;
 	const promotedExitGatePath = promoteAndQuit ? path.join(fixture.root, `${identifier}.promoted-exit`) : undefined;
-	const promotedExitIntentPath = promoteAndQuit ? path.join(fixture.root, `${identifier}.promoted-exit-intent`) : undefined;
+	const promotedExitIntentPath = promoteAndQuit
+		? path.join(fixture.root, `${identifier}.promoted-exit-intent`)
+		: undefined;
 	const promotedExitReleaseGatePath = promoteAndQuit
 		? path.join(fixture.root, `${identifier}.promoted-exit-release`)
 		: undefined;
-	const promotedExitEvidencePath = promoteAndQuit ? path.join(fixture.root, `${identifier}.promoted-exit.json`) : undefined;
+	const promotedExitEvidencePath = promoteAndQuit
+		? path.join(fixture.root, `${identifier}.promoted-exit.json`)
+		: undefined;
 	const programSourcePath = path.join(fixture.root, `${identifier}.runtime.ts`);
 	const programPath = path.join(fixture.root, `${identifier}.runtime.js`);
 	await Bun.write(
@@ -815,33 +860,43 @@ async function startBootstrap(
 	return run;
 }
 
+/**
+ * Bun's Linux directory watcher can stop after a rename; stat-poll the target
+ * path so fixture synchronization observes the durable marker itself.
+ */
 async function waitForFile(filePath: string, signal?: AbortSignal): Promise<void> {
 	if (await Bun.file(filePath).exists()) return;
 	if (signal?.aborted) throw signal.reason ?? new Error("Fixture file wait was aborted");
-	await new Promise<void>((resolve, reject) => {
-		let settled = false;
-		let watcher: ReturnType<typeof watch> | undefined;
-		const abort = () => finish(signal?.reason ?? new Error("Fixture file wait was aborted"));
-		const finish = (error?: unknown) => {
-			if (settled) return;
-			settled = true;
-			watcher?.close();
-			signal?.removeEventListener("abort", abort);
-			if (error) reject(error);
-			else resolve();
-		};
-		const check = () => {
-			void Bun.file(filePath).exists().then(exists => {
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	let settled = false;
+	const finish = (error?: unknown): void => {
+		if (settled) return;
+		settled = true;
+		if (error) reject(error);
+		else resolve();
+	};
+	const abort = (): void => finish(signal?.reason ?? new Error("Fixture file wait was aborted"));
+	const check = (): void => {
+		void Bun.file(filePath)
+			.exists()
+			.then(exists => {
 				if (exists) finish();
 			}, finish);
-		};
-		watcher = watch(path.dirname(filePath), check);
-		watcher.once("error", finish);
-		signal?.addEventListener("abort", abort, { once: true });
-		check();
-	});
+	};
+	watchFile(filePath, { interval: 25, persistent: false }, check);
+	signal?.addEventListener("abort", abort, { once: true });
+	check();
+	try {
+		await promise;
+	} finally {
+		unwatchFile(filePath, check);
+		signal?.removeEventListener("abort", abort);
+	}
 }
-type BootstrapCandidatePhase = "candidate activation" | "candidate post-acknowledgement" | "promoted normal-exit intent";
+type BootstrapCandidatePhase =
+	| "candidate activation"
+	| "candidate post-acknowledgement"
+	| "promoted normal-exit intent";
 
 async function waitForBootstrapFile(
 	run: BootstrapRun,
@@ -875,43 +930,56 @@ function foreignHandoffLockHolderProgram(input: {
 	readonly root: string;
 	readonly pending: AutoBotPendingRestart;
 	readonly acquiredPath: string;
+	readonly phasePath: string;
 	readonly releasePath: string;
 }): string {
 	return `
-import { watch } from "node:fs";
-import { dirname } from "node:path";
+import { unwatchFile, watchFile } from "node:fs";
 import { autoBotPaths } from ${JSON.stringify(pathsModulePath)};
 import { createAutoBotPendingRestart, withAutoBotHandoffLock } from ${JSON.stringify(stateModulePath)};
 
 async function waitForFile(filePath) {
 	if (await Bun.file(filePath).exists()) return;
-	await new Promise((resolve, reject) => {
-		let settled = false;
-		let watcher;
-		const finish = error => {
-			if (settled) return;
-			settled = true;
-			watcher?.close();
-			if (error) reject(error);
-			else resolve();
-		};
-		const check = () => {
-			void Bun.file(filePath).exists().then(exists => {
-				if (exists) finish();
-			}, finish);
-		};
-		watcher = watch(dirname(filePath), check);
-		watcher.once("error", finish);
-		check();
-	});
+	const { promise, resolve, reject } = Promise.withResolvers();
+	let settled = false;
+	const finish = error => {
+		if (settled) return;
+		settled = true;
+		if (error) reject(error);
+		else resolve();
+	};
+	const check = () => {
+		void Bun.file(filePath).exists().then(exists => {
+			if (exists) finish();
+		}, finish);
+	};
+	watchFile(filePath, { interval: 25, persistent: true }, check);
+	check();
+	try {
+		await promise;
+	} finally {
+		unwatchFile(filePath, check);
+	}
 }
 
+async function writePhase(phase) {
+	await Bun.write(${JSON.stringify(input.phasePath)}, phase);
+}
+
+await writePhase("modules-loaded");
 const paths = autoBotPaths(${JSON.stringify(input.root)});
 const pending = ${JSON.stringify(input.pending)};
+await writePhase("acquiring-lock");
 await withAutoBotHandoffLock(paths, async () => {
+	await writePhase("lock-acquired");
 	if (!(await createAutoBotPendingRestart(paths, pending))) {
+		await writePhase("pending-rejected");
 		throw new Error("Foreign handoff transaction could not create its pending journal");
 	}
+	await writePhase("pending-written");
+	await writePhase("ready-to-signal");
+	// Do not write another phase marker after this: the parent must observe the
+	// acquisition marker itself rather than a later directory-watch event.
 	await Bun.write(${JSON.stringify(input.acquiredPath)}, "acquired");
 	await waitForFile(${JSON.stringify(input.releasePath)});
 });
@@ -924,6 +992,7 @@ async function startForeignHandoffLockHolder(
 ): Promise<ForeignHandoffLockHolder> {
 	const identifier = fixtureId();
 	const acquiredPath = path.join(fixture.root, `${identifier}.foreign-lock-acquired`);
+	const phasePath = path.join(fixture.root, `${identifier}.foreign-lock-phase`);
 	const releasePath = path.join(fixture.root, `${identifier}.foreign-lock-release`);
 	const programPath = path.join(fixture.root, `${identifier}.foreign-lock-holder.ts`);
 	await Bun.write(
@@ -932,6 +1001,7 @@ async function startForeignHandoffLockHolder(
 			root: fixture.root,
 			pending,
 			acquiredPath,
+			phasePath,
 			releasePath,
 		}),
 	);
@@ -945,32 +1015,80 @@ async function startForeignHandoffLockHolder(
 		process: holderProcess,
 		stderr: new Response(holderProcess.stderr).text(),
 		acquiredPath,
+		phasePath,
 		releasePath,
 	};
 	activeForeignHandoffLockHolders.add(holder);
 	return holder;
 }
 
+async function foreignHandoffLockHolderPhase(holder: ForeignHandoffLockHolder): Promise<string> {
+	try {
+		const phase = await Bun.file(holder.phasePath).text();
+		return Object.hasOwn(foreignHandoffLockHolderPhases, phase) ? phase : "unavailable";
+	} catch {
+		return "unavailable";
+	}
+}
+
+async function foreignHandoffLockHolderStatus(
+	holder: ForeignHandoffLockHolder,
+): Promise<{ readonly phase: string; readonly acquired: boolean }> {
+	const [phase, acquired] = await Promise.all([
+		foreignHandoffLockHolderPhase(holder),
+		Bun.file(holder.acquiredPath).exists(),
+	]);
+	return { phase, acquired };
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	const { promise: expired, resolve } = Promise.withResolvers<boolean>();
+	const timer = setTimeout(() => resolve(false), timeoutMs);
+	try {
+		return await Promise.race([promise.then(() => true), expired]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function awaitForeignHandoffLockHolder(holder: ForeignHandoffLockHolder): Promise<void> {
 	const abort = new AbortController();
+	const acquisitionTimeout = Promise.withResolvers<{ readonly kind: "timed-out" }>();
+	const timer = setTimeout(
+		() => acquisitionTimeout.resolve({ kind: "timed-out" }),
+		foreignHandoffLockHolderAcquisitionTimeoutMs,
+	);
 	try {
 		const outcome = await Promise.race([
 			waitForFile(holder.acquiredPath, abort.signal).then(() => ({ kind: "acquired" as const })),
 			holder.process.exited.then(async exitCode => ({
 				kind: "exited" as const,
 				exitCode,
+				status: await foreignHandoffLockHolderStatus(holder),
 				failure: bootstrapFailureSummary(await holder.stderr),
 			})),
+			acquisitionTimeout.promise,
 		]);
 		if (outcome.kind === "exited") {
 			throw new Error(
 				`Foreign handoff lock holder exited before acquisition: ${JSON.stringify({
 					exitCode: outcome.exitCode,
+					status: outcome.status,
 					failure: outcome.failure,
 				})}`,
 			);
 		}
+		if (outcome.kind === "timed-out") {
+			throw new Error(
+				`Foreign handoff lock holder did not acquire the lock within ${foreignHandoffLockHolderAcquisitionTimeoutMs}ms: ${JSON.stringify(
+					{
+						status: await foreignHandoffLockHolderStatus(holder),
+					},
+				)}`,
+			);
+		}
 	} finally {
+		clearTimeout(timer);
 		abort.abort();
 	}
 }
@@ -978,7 +1096,28 @@ async function awaitForeignHandoffLockHolder(holder: ForeignHandoffLockHolder): 
 async function stopForeignHandoffLockHolder(holder: ForeignHandoffLockHolder): Promise<void> {
 	try {
 		await Bun.write(holder.releasePath, "release");
+		if (
+			await settlesWithin(
+				Promise.all([holder.process.exited, holder.stderr]),
+				foreignHandoffLockHolderCleanupTimeoutMs,
+			)
+		) {
+			return;
+		}
+		const phase = await foreignHandoffLockHolderPhase(holder);
+		try {
+			holder.process.kill("SIGKILL");
+		} catch {
+			// The process may have exited after the bounded cleanup wait.
+		}
 		await Promise.all([holder.process.exited, holder.stderr]);
+		throw new Error(
+			`Foreign handoff lock holder did not stop after release within ${foreignHandoffLockHolderCleanupTimeoutMs}ms: ${JSON.stringify(
+				{
+					phase,
+				},
+			)}`,
+		);
 	} finally {
 		activeForeignHandoffLockHolders.delete(holder);
 	}
@@ -990,7 +1129,9 @@ async function runtimeEvidence(run: BootstrapRun): Promise<RuntimeEvidence> {
 		await Promise.race([
 			waitForFile(run.evidencePath, abort.signal),
 			run.bootstrap.exited.then(async exitCode => {
-				throw new Error(`Bootstrap exited before its runtime became authenticated (${exitCode}): ${await run.stderr}`);
+				throw new Error(
+					`Bootstrap exited before its runtime became authenticated (${exitCode}): ${await run.stderr}`,
+				);
 			}),
 		]);
 		return JSON.parse(await Bun.file(run.evidencePath).text()) as RuntimeEvidence;
@@ -1101,20 +1242,19 @@ async function releaseBootstrap(run: BootstrapRun): Promise<{ readonly exitCode:
 }
 
 function bootstrapFailureSummary(stderr: string): { readonly category: string; readonly stackFrameCount: number } {
-	const category =
-		stderr.includes("AutoBot control lock")
-			? "lock"
-			: stderr.includes("AutoBot normal exit")
-				? "normal-exit"
-				: stderr.includes("AutoBot promotion")
-					? "promotion"
-					: stderr.includes("AutoBot handoff")
-						? "handoff"
-						: stderr.includes("Error")
-							? "error"
-							: stderr.length === 0
-								? "empty"
-								: "other";
+	const category = stderr.includes("AutoBot control lock")
+		? "lock"
+		: stderr.includes("AutoBot normal exit")
+			? "normal-exit"
+			: stderr.includes("AutoBot promotion")
+				? "promotion"
+				: stderr.includes("AutoBot handoff")
+					? "handoff"
+					: stderr.includes("Error")
+						? "error"
+						: stderr.length === 0
+							? "empty"
+							: "other";
 	return {
 		category,
 		stackFrameCount: stderr.split(/\r?\n/).filter(line => /^\s*at\s/.test(line)).length,
@@ -1386,7 +1526,9 @@ test("returns zero when a promoted runtime exits while a foreign handoff transac
 	}
 	const foreignPendingPresent = await Bun.file(fixture.paths.pendingRestartPath).exists();
 	const foreignPendingDigestMatches =
-		foreignPendingPresent && foreignPendingDigest !== undefined && (await sha256File(fixture.paths.pendingRestartPath)) === foreignPendingDigest;
+		foreignPendingPresent &&
+		foreignPendingDigest !== undefined &&
+		(await sha256File(fixture.paths.pendingRestartPath)) === foreignPendingDigest;
 	const foreignCommittedPresent = await Bun.file(fixture.paths.committedRestartPath).exists();
 	if (
 		bootstrapExitCode !== 0 ||
@@ -1477,7 +1619,9 @@ test("refuses a live owner lease then CAS-reclaims a safely abandoned committed 
 	expect(claimed?.claim).not.toEqual(oldClaim);
 	expect(claimed?.candidateRuntimeProcessId).toBe(evidence.processId);
 	expect(claimed?.recoveryState).toBe("candidate-running");
-	expect(await Bun.file(autoBotSignalPath(fixture.paths, committed.request.nonce, "activation-ack")).exists()).toBeFalse();
+	expect(
+		await Bun.file(autoBotSignalPath(fixture.paths, committed.request.nonce, "activation-ack")).exists(),
+	).toBeFalse();
 
 	const result = await releaseBootstrap(recovered);
 	await waitForFile(recovered.postAcknowledgementPath!);
@@ -1492,49 +1636,46 @@ test("refuses a live owner lease then CAS-reclaims a safely abandoned committed 
 	expect(await readAutoBotCommittedRestart(fixture.paths)).toBeUndefined();
 }, 600_000);
 
-test("refuses a live legacy launcher before publishing a managed bootstrap", async () => {
-	const root = await createPrivateRoot();
-	const keyDirectory = await createTemporaryDirectory("omp-autobot-install-key-");
-	const legacyPath = path.join(root, legacyExecutableName());
-	await fs.copyFile(process.execPath, legacyPath);
-	if (process.platform !== "win32") await fs.chmod(legacyPath, 0o700);
-	const legacyDigest = await sha256File(legacyPath);
-	const trustedKeyPath = await createTrustedPublicKey(keyDirectory);
-	const legacyProcess: LegacyProcess = Bun.spawn(
-		[
-			legacyPath,
-			"-e",
-			legacyProcessProgram,
-		],
-		{
+test(
+	"refuses a live legacy launcher before publishing a managed bootstrap",
+	async () => {
+		const root = await createPrivateRoot();
+		const keyDirectory = await createTemporaryDirectory("omp-autobot-install-key-");
+		const legacyPath = path.join(root, legacyExecutableName());
+		await fs.copyFile(process.execPath, legacyPath);
+		if (process.platform !== "win32") await fs.chmod(legacyPath, 0o700);
+		const legacyDigest = await sha256File(legacyPath);
+		const trustedKeyPath = await createTrustedPublicKey(keyDirectory);
+		const legacyProcess: LegacyProcess = Bun.spawn([legacyPath, "-e", legacyProcessProgram], {
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "ignore",
-		},
-	);
+		});
 
-	try {
-		await awaitLegacyProcessReady(legacyProcess);
-		assertLiveLegacyProcess(await fs.realpath(legacyPath), legacyProcess.pid);
-		const result = await runInstaller([
-			"--root",
-			root,
-			"--migrate-legacy",
-			"--channel-url",
-			"https://releases.example.invalid/envelope.json",
-			"--trusted-key",
-			`current=${trustedKeyPath}`,
-			"--portal-url",
-			"https://collab.example.invalid/live",
-		]);
+		try {
+			await awaitLegacyProcessReady(legacyProcess);
+			assertLiveLegacyProcess(await fs.realpath(legacyPath), legacyProcess.pid);
+			const result = await runInstaller([
+				"--root",
+				root,
+				"--migrate-legacy",
+				"--channel-url",
+				"https://releases.example.invalid/envelope.json",
+				"--trusted-key",
+				`current=${trustedKeyPath}`,
+				"--portal-url",
+				"https://collab.example.invalid/live",
+			]);
 
-		expect(result.exitCode).toBe(1);
-		expect(await sha256File(legacyPath)).toBe(legacyDigest);
-		expect(await fs.readdir(root)).toEqual([legacyExecutableName()]);
-	} finally {
-		await stopProcess(legacyProcess);
-	}
-}, process.platform === "win32" ? 120_000 : undefined);
+			expect(result.exitCode).toBe(1);
+			expect(await sha256File(legacyPath)).toBe(legacyDigest);
+			expect(await fs.readdir(root)).toEqual([legacyExecutableName()]);
+		} finally {
+			await stopProcess(legacyProcess);
+		}
+	},
+	process.platform === "win32" ? 120_000 : undefined,
+);
 
 test("rejects unsafe artifact origins before creating installation state", async () => {
 	const keyDirectory = await createTemporaryDirectory("omp-autobot-install-key-");
@@ -1573,10 +1714,11 @@ test.skipIf(process.platform === "win32")(
 		await fs.copyFile(process.execPath, legacyPath);
 		await fs.chmod(legacyPath, 0o755);
 		const trustedKeyPath = await createTrustedPublicKey(keyDirectory);
-		const legacyProcess: LegacyProcess = Bun.spawn(
-			[legacyPath, "-e", legacyProcessProgram],
-			{ stdin: "pipe", stdout: "pipe", stderr: "ignore" },
-		);
+		const legacyProcess: LegacyProcess = Bun.spawn([legacyPath, "-e", legacyProcessProgram], {
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "ignore",
+		});
 
 		try {
 			await awaitLegacyProcessReady(legacyProcess);

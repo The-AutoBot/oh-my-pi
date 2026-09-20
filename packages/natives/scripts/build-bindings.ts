@@ -7,8 +7,9 @@
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
+ * `OMP_NATIVE_TARGET_VARIANT=baseline` forces the supported Windows x64
+ * baseline release artifact instead of this host's detected ISA variant.
  */
-
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -16,6 +17,16 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { generateEnumExports } from "./gen-enums";
+
+const targetVariant = Bun.env.OMP_NATIVE_TARGET_VARIANT?.trim();
+const forcedBaseline = targetVariant === "baseline";
+const localAddon = resolveLocalHostAddon({
+	platform: process.platform,
+	arch: process.arch,
+	avx2: targetVariant ? false : detectHostAvx2Support(),
+});
+const effectiveVariant = localAddon.x64Variant;
+const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
 // pcre2-sys prefers a system libpcre2 when pkg-config finds one. Keep the
 // static build so the local addon never retains host Homebrew paths.
@@ -59,21 +70,20 @@ const rustDir = path.join(repoRoot, "crates/pi-natives");
 const nativeDir = path.join(import.meta.dir, "../native");
 const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
-const localAddon = resolveLocalHostAddon({
-	platform: process.platform,
-	arch: process.arch,
-	avx2: detectHostAvx2Support(),
-});
-const effectiveVariant = localAddon.x64Variant;
-const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
-
 // Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
 // instead of inheriting the host CPU when RUSTFLAGS is unset. Non-x64 builds keep
 // the target's default CPU features: `-C target-cpu=native` would bake the build
 // host's CPU features into the addon and trips ring 0.17's aarch64-apple
 // const assertion (CAPS_STATIC == MIN_STATIC_FEATURES). Shipping Windows addons
 // also link the MSVC CRT statically so clean systems need no VC++ Redistributable.
-if (!Bun.env.RUSTFLAGS) {
+if (forcedBaseline) {
+	// Cargo gives CARGO_ENCODED_RUSTFLAGS precedence over RUSTFLAGS. Replace an
+	// inherited encoded value rather than append to it: build.rs forwards these
+	// flags to the OAuth relay too, so every binary must share this ISA floor.
+	const rustFlags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v2"];
+	Bun.env.RUSTFLAGS = rustFlags.join(" ");
+	Bun.env.CARGO_ENCODED_RUSTFLAGS = rustFlags.join("\x1f");
+} else if (!Bun.env.RUSTFLAGS) {
 	const rustFlags: string[] = [];
 	if (process.platform === "win32") {
 		rustFlags.push("-C", "target-feature=+crt-static");
