@@ -6,6 +6,7 @@ use pi_edit::{
 		HashlineEngine,
 		patcher::{no_change_diagnostic, no_change_loop_diagnostic},
 	},
+	path_policy::canonical_key,
 	stream_json::ArgSnapshot,
 };
 use serde_json::json;
@@ -70,6 +71,48 @@ async fn identical_noop_escalates_on_third_attempt() {
 			.to_string()
 			.starts_with("STOP. Edits to a.txt have been a byte-identical no-op 3 times in a row")
 	);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn tag_recovery_refuses_outside_and_ambiguous_matches_without_writes() {
+	let workspace = common::Workspace::new(EditMode::Hashline);
+	let outside = tempfile::tempdir().expect("outside tempdir");
+	let outside_path = outside.path().join("a.txt");
+	std::fs::write(&outside_path, "before\n").expect("outside fixture");
+	let outside_tag = workspace
+		.store
+		.record(&canonical_key(&outside_path), "before\n", None);
+	let writer = common::DiskWriter::default();
+	let error = workspace
+		.apply_json(
+			&json!({
+				"input": format!("[a.txt#{outside_tag}]\nPUT 1.=1:\n+outside")
+			}),
+			&writer,
+		)
+		.await
+		.expect_err("outside recovery must be refused");
+	assert!(error.to_string().contains("not found"));
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), "before\n");
+	assert!(!workspace.cwd().join("a.txt").exists());
+
+	let workspace = common::Workspace::new(EditMode::Hashline);
+	workspace.write("one/a.txt", "same\n");
+	workspace.write("two/a.txt", "same\n");
+	let tag = workspace.snapshot("one/a.txt", "same\n", None);
+	assert_eq!(workspace.snapshot("two/a.txt", "same\n", None), tag);
+	let writer = common::DiskWriter::default();
+	let error = workspace
+		.apply_json(&json!({ "input": format!("[a.txt#{tag}]\nPUT 1.=1:\n+ambiguous") }), &writer)
+		.await
+		.expect_err("ambiguous recovery must be refused");
+	assert!(error.to_string().contains("not found"));
+	assert!(writer.requests.lock().is_empty());
+	assert_eq!(workspace.read("one/a.txt").as_deref(), Some("same\n"));
+	assert_eq!(workspace.read("two/a.txt").as_deref(), Some("same\n"));
+	assert!(!workspace.cwd().join("a.txt").exists());
 }
 
 #[test]

@@ -75,7 +75,7 @@ impl PathPolicy {
 			if expanded.chars().all(|c| c == '/') {
 				self.cwd.clone()
 			} else {
-				let path = PathBuf::from(strip_windows_verbatim(&expanded));
+				let path = PathBuf::from(expanded);
 				if path.is_absolute() {
 					path
 				} else {
@@ -263,7 +263,7 @@ pub fn canonical_key(absolute: &Path) -> PathBuf {
 			std::fs::canonicalize(parent).map(|parent| parent.join(name))
 		})
 		.unwrap_or_else(|_| absolute.to_path_buf());
-	strip_windows_verbatim_path(resolved)
+	normalize_windows_verbatim_path(resolved)
 }
 
 fn normalize_local_scheme(value: &str) -> String {
@@ -322,9 +322,7 @@ fn expand_path(value: &str, home: &Path) -> String {
 	{
 		value = percent_decode(value.get(7..).unwrap_or_default()).unwrap_or(value);
 	}
-	if value.starts_with(r"\\?\") {
-		value.drain(..4);
-	}
+	value = normalize_windows_verbatim_string(value);
 	if value == "~" {
 		return home.to_string_lossy().into_owned();
 	}
@@ -348,12 +346,52 @@ fn is_windows_drive(value: &str) -> bool {
 		&& value.as_bytes().get(1) == Some(&b':')
 }
 
-fn strip_windows_verbatim(value: &str) -> &str {
-	value.strip_prefix(r"\\?\").unwrap_or(value)
+fn normalize_windows_verbatim_string(value: String) -> String {
+	#[cfg(windows)]
+	{
+		if value.starts_with(r"\\?\") {
+			let normalized = normalize_windows_verbatim_path(PathBuf::from(&value));
+			return normalized.into_os_string().into_string().unwrap_or(value);
+		}
+	}
+	value
 }
 
-fn strip_windows_verbatim_path(path: PathBuf) -> PathBuf {
-	PathBuf::from(strip_windows_verbatim(&path.to_string_lossy()))
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+	#[cfg(windows)]
+	{
+		use std::{
+			os::windows::ffi::{OsStrExt, OsStringExt},
+			path::Prefix,
+		};
+
+		let skip = {
+			let mut components = path.components();
+			match components.next() {
+				Some(Component::Prefix(prefix)) => match prefix.kind() {
+					Prefix::VerbatimDisk(_) => 4,
+					Prefix::VerbatimUNC(..) => 8,
+					_ => 0,
+				},
+				_ => 0,
+			}
+		};
+		if skip == 0 {
+			return path;
+		}
+		let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+		if skip == 4 {
+			return std::ffi::OsString::from_wide(&encoded[skip..]).into();
+		}
+		let mut normalized = Vec::with_capacity(encoded.len() - 6);
+		normalized.extend([b'\\' as u16, b'\\' as u16]);
+		normalized.extend_from_slice(&encoded[skip..]);
+		std::ffi::OsString::from_wide(&normalized).into()
+	}
+	#[cfg(not(windows))]
+	{
+		path
+	}
 }
 
 fn split_url_authority(rest: &str) -> EditResult<(String, String)> {
@@ -423,7 +461,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 			other => out.push(other.as_os_str()),
 		}
 	}
-	out
+	normalize_windows_verbatim_path(out)
 }
 
 fn is_within(path: &Path, root: &Path) -> bool {
@@ -706,11 +744,40 @@ mod tests {
 	fn canonicalizes_existing_parent() {
 		let tmp = tempfile::tempdir().unwrap();
 		let missing = tmp.path().join("missing.txt");
+		assert_eq!(canonical_key(&missing), canonical_key(tmp.path()).join("missing.txt"));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn normalizes_only_filesystem_verbatim_namespaces() {
 		assert_eq!(
-			canonical_key(&missing),
-			std::fs::canonicalize(tmp.path())
-				.unwrap()
-				.join("missing.txt")
+			normalize_windows_verbatim_path(PathBuf::from(r"\\?\C:\work\a.txt")),
+			PathBuf::from(r"C:\work\a.txt")
 		);
+		assert_eq!(
+			normalize_windows_verbatim_path(PathBuf::from(r"\\?\UNC\server\share\work\a.txt")),
+			PathBuf::from(r"\\server\share\work\a.txt")
+		);
+		for opaque in [r"\\?\Volume{1234}\a.txt", r"\\.\PhysicalDrive0"] {
+			assert_eq!(normalize_windows_verbatim_path(PathBuf::from(opaque)), PathBuf::from(opaque));
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn tag_recovery_normalizes_namespaces_without_weakening_containment() {
+		let drive = policy(Path::new(r"\\?\C:\workspace"));
+		assert!(drive.allow_tag_path_recovery("a.txt", Path::new(r"C:\workspace\nested\a.txt")));
+		assert!(!drive.allow_tag_path_recovery("a.txt", Path::new(r"C:\outside\a.txt")));
+		assert!(
+			!drive.allow_tag_path_recovery("agent://a.txt", Path::new(r"C:\workspace\nested\a.txt"))
+		);
+
+		let mut unc = policy(Path::new(r"\\?\UNC\server\share\workspace"));
+		unc.local_sandbox_root = None;
+		assert!(
+			unc.allow_tag_path_recovery("a.txt", Path::new(r"\\server\share\workspace\nested\a.txt"))
+		);
+		assert!(!unc.allow_tag_path_recovery("a.txt", Path::new(r"\\server\share\outside\a.txt")));
 	}
 }
