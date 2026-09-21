@@ -346,52 +346,54 @@ fn is_windows_drive(value: &str) -> bool {
 		&& value.as_bytes().get(1) == Some(&b':')
 }
 
+#[cfg(windows)]
 fn normalize_windows_verbatim_string(value: String) -> String {
-	#[cfg(windows)]
-	{
-		if value.starts_with(r"\\?\") {
-			let normalized = normalize_windows_verbatim_path(PathBuf::from(&value));
-			return normalized.into_os_string().into_string().unwrap_or(value);
-		}
+	if value.starts_with(r"\\?\") {
+		let normalized = normalize_windows_verbatim_path(PathBuf::from(&value));
+		return normalized.into_os_string().into_string().unwrap_or(value);
 	}
 	value
 }
 
-fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
-	#[cfg(windows)]
-	{
-		use std::{
-			os::windows::ffi::{OsStrExt, OsStringExt},
-			path::Prefix,
-		};
+#[cfg(not(windows))]
+const fn normalize_windows_verbatim_string(value: String) -> String {
+	value
+}
 
-		let skip = {
-			let mut components = path.components();
-			match components.next() {
-				Some(Component::Prefix(prefix)) => match prefix.kind() {
-					Prefix::VerbatimDisk(_) => 4,
-					Prefix::VerbatimUNC(..) => 8,
-					_ => 0,
-				},
+#[cfg(windows)]
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+	use std::{
+		os::windows::ffi::{OsStrExt, OsStringExt},
+		path::Prefix,
+	};
+
+	let skip = {
+		let mut components = path.components();
+		match components.next() {
+			Some(Component::Prefix(prefix)) => match prefix.kind() {
+				Prefix::VerbatimDisk(_) => 4,
+				Prefix::VerbatimUNC(..) => 8,
 				_ => 0,
-			}
-		};
-		if skip == 0 {
-			return path;
+			},
+			_ => 0,
 		}
-		let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-		if skip == 4 {
-			return std::ffi::OsString::from_wide(&encoded[skip..]).into();
-		}
-		let mut normalized = Vec::with_capacity(encoded.len() - 6);
-		normalized.extend([b'\\' as u16, b'\\' as u16]);
-		normalized.extend_from_slice(&encoded[skip..]);
-		std::ffi::OsString::from_wide(&normalized).into()
+	};
+	if skip == 0 {
+		return path;
 	}
-	#[cfg(not(windows))]
-	{
-		path
+	let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+	if skip == 4 {
+		return std::ffi::OsString::from_wide(&encoded[skip..]).into();
 	}
+	let mut normalized = Vec::with_capacity(encoded.len() - 6);
+	normalized.extend([b'\\' as u16, b'\\' as u16]);
+	normalized.extend_from_slice(&encoded[skip..]);
+	std::ffi::OsString::from_wide(&normalized).into()
+}
+
+#[cfg(not(windows))]
+const fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+	path
 }
 
 fn split_url_authority(rest: &str) -> EditResult<(String, String)> {
