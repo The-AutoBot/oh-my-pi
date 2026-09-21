@@ -10,12 +10,12 @@
  */
 
 /**
- * Return the version sentinel exported by an addon built for `packageVersion`.
- * @param {string} packageVersion
+ * Return the version sentinel exported by an addon built for `nativeCompatibilityVersion`.
+ * @param {string} nativeCompatibilityVersion
  * @returns {string}
  */
-export function versionSentinelFor(packageVersion) {
-	return `__piNativesV${packageVersion.replace(/[^A-Za-z0-9]/g, "_")}`;
+export function versionSentinelFor(nativeCompatibilityVersion) {
+	return `__piNativesV${nativeCompatibilityVersion.replace(/[^A-Za-z0-9]/g, "_")}`;
 }
 
 /**

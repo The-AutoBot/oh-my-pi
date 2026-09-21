@@ -436,6 +436,7 @@ try {
 		compilerBun: process.execPath,
 		compilerBunVersion: Bun.version,
 		nativeAddonDirectory,
+		nativeAddonProvenanceSha256: "a".repeat(64),
 		ompExecutable: process.execPath,
 		coordinatorRoot: coordinator,
 		keyId: "fixture",

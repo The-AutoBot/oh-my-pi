@@ -646,23 +646,30 @@ directory plus build provenance is wanted:
 & 'D:\Projects\omp-session-coordinator\Build-LocalOmp.ps1' `
   -OmpRoot 'D:\Projects\The-AutoBot-oh-my-pi' `
   -BunPath 'C:\tools\bun\bun.exe' `
-  -OutputDirectory 'D:\builds\omp-local'
+  -OutputDirectory 'D:\builds\omp-local' `
+  -NativeAddonProvenanceSha256 '<lowercase-64-hex-digest>'
 ```
 
-The wrapper accepts only those three inputs. It does not install dependencies,
-build Rust/Cargo code, or build the coordinator. It reuses
-`OmpRoot\packages\natives\native`, requires
-`pi_natives.win32-x64-baseline.node`, accepts the compatible modern sibling
-when present, and fails rather than repairing missing or incompatible native
-inputs. Reused native files are validated against the exact
-`packages/natives` version sentinel and recorded by filename, version, variant,
-size, and SHA-256 with origin `local-reuse` and `producerSourceCommit: null`;
-a matching package version must never be described as proof that the native
-bytes came from the current source.
+The wrapper accepts only those four inputs. It does not install dependencies,
+build Rust/Cargo code, or build the coordinator. It validates the configured
+pin against `OmpRoot\packages\natives\native\native-build-provenance.json`,
+recomputes the current conservative native-input fingerprint, and requires the
+recorded `pi_natives.win32-x64-baseline.node` (plus its optional compatible
+modern sibling) to retain its exact size, hash, and native compatibility
+sentinel under canonical variants `win32-x64-baseline` and
+`win32-x64-modern`. Its build target is the actual Cargo target
+`x86_64-pc-windows-msvc`; the profile and toolchain fields remain producer
+evidence and are not claimed as reproduced by this application-only build.
+Missing, changed, or unpinned native inputs fail closed rather than
+being guessed or repaired. The resulting reuse evidence records the independent
+native compatibility version, input fingerprint, pinned record digest, build
+identity, and artifact hashes; application package version equality is neither
+required nor treated as native source proof.
 
 The output directory must not already exist and is created only after every
-check succeeds. It contains only `omp.exe` and `build-provenance.json`; the
-provenance records the executable SHA-256 fingerprint and source provenance.
+check succeeds. It contains only `omp.exe` and schema-3
+`build-provenance.json`; the provenance binds the executable SHA-256 fingerprint,
+source provenance, and pinned native record evidence.
 The standalone smoke checks the copied executable's exact `--version`,
 `--help`, and `--smoke-test` in a fresh isolated profile with
 `PI_NATIVE_VARIANT=baseline`. It does not claim or validate the managed
@@ -680,11 +687,13 @@ protocol changes.
 
 Installation is a separate, explicit legacy-only operation. The coordinator
 installer accepts only the fresh two-file output above: `omp.exe` plus the
-schema-2 `build-provenance.json` with kind
-`local-omp-application-build`. It validates the exact application-build
-provenance shape, including source and reused-native provenance, and verifies
-the executable's declared filename, version, size, and SHA-256 against its
-actual bytes before touching the destination.
+schema-3 `build-provenance.json` with kind
+`local-omp-application-build`. It strictly validates the exact
+application-build provenance shape, including the independent native
+compatibility version, source-input fingerprint, pinned record digest, build
+identity, and artifact hashes, then verifies the executable's declared
+filename, application version, size, and SHA-256 against its actual bytes
+before touching the destination.
 
 ```powershell
 & 'D:\Projects\omp-session-coordinator\Install-LocalOmp.ps1' `
@@ -756,16 +765,29 @@ fields are rejected):
   existing absolute `ompExecutable`. Both configured Bun executables are
   checked against their pins on each run.
 - Native, coordinator, and signing inputs: set required
-  `nativeAddonDirectory` to an existing absolute directory of
-  operator-trusted add-on files. The compatible
-  `pi_natives.win32-x64-baseline.node` is required and its modern sibling is
-  optional. The publisher validates the exact `packages/natives` version
-  sentinel and canonical regular, non-reparse inputs, stages them into the
-  isolated candidate `native` directory, verifies copied-byte hash equality,
-  and records filename, version, variant, size, SHA-256, origin `local-reuse`,
-  and `producerSourceCommit: null`. Source-commit equivalence is unknown and is
-  never inferred from a matching version. Missing or incompatible inputs fail
-  the run and are not offered to OMP as a source repair.
+  `nativeAddonDirectory` to an existing absolute directory containing
+  `native-build-provenance.json` and its operator-adopted Windows add-on files,
+  and set `nativeAddonProvenanceSha256` to the lowercase SHA-256 of that exact
+  record. The compatible `pi_natives.win32-x64-baseline.node` is required and
+  its modern sibling is optional. Before any application build, the publisher
+  validates the configured record pin, its strict schema, the candidate's
+  conservative Cargo/N-API native-input fingerprint, each exact artifact hash
+  and size, and the compatibility-version sentinel. The record must name actual
+  Cargo target `x86_64-pc-windows-msvc`; its canonical artifact variants are
+  `win32-x64-baseline` and, when present, `win32-x64-modern`. Profile and
+  toolchain remain facts about the producing native build, not claims about the
+  application-only publisher. It then stages the canonical regular,
+  non-reparse artifacts with copied-byte integrity checks.
+  Local reuse evidence records the independent native compatibility identity,
+  source-input fingerprint, pinned record digest, build identity, and artifact
+  hashes. An application-only version bump can therefore reuse a matching
+  native generation without claiming that the application and native package
+  versions are equal. Missing records, changed native inputs, pin mismatches,
+  and incompatible artifacts fail closed with a bounded diagnostic code and
+  are never offered to OMP as source repair. The publisher never guesses a
+  source match or automatically runs Cargo: an existing binary needs a
+  provenance record produced or explicitly adopted from its actual qualified
+  native build before it can be configured.
   `coordinatorRoot` names a distinct clean, committed coordinator
   checkout with a credential-free HTTPS origin. `keyId`, `privateKeyPath`, and
   `publicKeyPath` identify existing signing material. Keep the private-key path
@@ -849,16 +871,20 @@ restart failed runs. It refuses to overwrite a task with a different action.
 
 Each run pins the protected canonical branch and upstream input, then updates
 only its owned persistent integration worktree. It retains the committed
-producer, canonical, and upstream ancestry in a candidate merge before
-pushing the dedicated integration branch. OMP is invoked only to resolve an
-integration conflict or review a sensitive compatibility change; missing or
-incompatible reused native inputs and application-build failures are not
-treated as source-repair loops. OMP's zero exit is not trusted alone:
-afterward the controller independently checks the worktree, ancestry, refs,
-and remote snapshot. Added remotes or unexpected ref changes fail validation;
-the controller commits accepted fixes while retaining candidate ancestry.
-Failures outside the explicitly reviewable integration cases block the run
-rather than being repaired or retried.
+producer, canonical, and upstream ancestry in a candidate merge. After source
+integration and before candidate identity or compatibility review, it performs
+the narrowly scoped native release-metadata synchronization and commits only
+the exact changed Cargo workspace/lock and generated marker paths. This keeps
+the native compatibility generation stable across application-only releases
+without normalizing unrelated Rust or third-party metadata. OMP is invoked only
+to resolve an integration conflict, review a sensitive compatibility change,
+or repair an application build failure; missing, unpinned, or incompatible
+reused native inputs are never treated as a source-repair loop. OMP's zero exit
+is not trusted alone: afterward the controller independently checks the
+worktree, ancestry, refs, and remote snapshot. Added remotes or unexpected ref
+changes fail validation; the controller commits accepted fixes while retaining
+candidate ancestry. Failures outside the explicitly reviewable integration and
+application-build cases block the run rather than being repaired or retried.
 
 After an interrupted or separately completed publication, a stale integration
 checkpoint can recover automatically only when the current signed channel,
@@ -872,14 +898,15 @@ source identity is retained separately from an in-progress next candidate so
 an interrupted preparation cannot invalidate the previous published checkpoint.
 
 The publisher validates the clean committed candidate, exact pinned tools,
-trusted reused native inputs, and the signed predecessor before compiling the
-Windows x64 application only. It does not run Cargo or rebuild native add-ons.
-It also builds the immutable bootstrap, relay/collab web bundle, and matching
+pinned native provenance record, current native source-input fingerprint,
+artifact bytes, and the signed predecessor before compiling the Windows x64
+application only. It does not run Cargo or rebuild native add-ons. It also
+builds the immutable bootstrap, relay/collab web bundle, and matching
 coordinator SDK/client JavaScript required by the existing four-asset signed
 topology. Broad lint, type, and test suites belong to normal CI, not every
-local publication build. The publisher retains focused exact-version,
-managed `--autobot-build-identity`, help, fresh-profile, and baseline-native
-smokes, then signs and
+local publication build. The publisher retains focused application-version,
+managed `--autobot-build-identity`, help, fresh-profile, loader, and
+baseline-native smokes, then signs and
 verifies the local quartet and creates or confirms the exact candidate tag
 without force before creating a draft. It independently downloads and verifies
 uploaded bytes, publishes only that verified draft, and advances the signed

@@ -11,6 +11,7 @@ export interface LocalAutomationConfig {
 	readonly compilerBun: string;
 	readonly compilerBunVersion: string;
 	readonly nativeAddonDirectory: string;
+	readonly nativeAddonProvenanceSha256: string;
 	readonly ompExecutable: string;
 	readonly coordinatorRoot: string;
 	readonly keyId: string;

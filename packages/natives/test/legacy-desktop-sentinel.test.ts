@@ -15,11 +15,12 @@ async function withCandidate(contents: string, test: (candidate: string) => void
 	}
 }
 
-function ctxFor(version: string) {
+function ctxFor(nativeCompatibilityVersion: string) {
 	return {
 		isWorkspaceLoad: false,
-		packageVersion: version,
-		versionSentinelExport: `__piNativesV${version.replace(/[^A-Za-z0-9]/g, "_")}`,
+		packageVersion: "99.4.1",
+		nativeCompatibilityVersion,
+		versionSentinelExport: `__piNativesV${nativeCompatibilityVersion.replace(/[^A-Za-z0-9]/g, "_")}`,
 	};
 }
 
@@ -36,26 +37,11 @@ const legacyCoreBindings = {
 };
 
 describe("legacy native addon loading", () => {
-	it("accepts a compatible pre-sentinel addon from disk", async () => {
+	it("rejects pre-sentinel addons even when their legacy ABI shape looks compatible", async () => {
 		const ctx = ctxFor("17.2.8");
 		const bindings = { ...legacyCoreBindings, DesktopSession: LegacyDesktopSession };
 		await withCandidate("legacy native addon", candidate => {
-			expect(() => validateLoadedBindings(ctx, bindings, candidate)).not.toThrow();
-		});
-	});
-
-	it("rejects a pre-sentinel addon without the compatible core ABI", async () => {
-		const ctx = ctxFor("17.2.8");
-		await withCandidate("legacy native addon", candidate => {
-			expect(() => validateLoadedBindings(ctx, { DesktopSession: LegacyDesktopSession }, candidate)).toThrow(
-				"reinstall to re-sync",
-			);
-		});
-	});
-	it("rejects a pre-sentinel core without the legacy desktop ABI", async () => {
-		const ctx = ctxFor("17.2.8");
-		await withCandidate("legacy native addon", candidate => {
-			expect(() => validateLoadedBindings(ctx, legacyCoreBindings, candidate)).toThrow("reinstall to re-sync");
+			expect(() => validateLoadedBindings(ctx, bindings, candidate)).toThrow("different native generation");
 		});
 	});
 

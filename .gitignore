@@ -11,6 +11,7 @@ target/
 .xwin-cache/
 *.tsbuildinfo
 *.node
+/packages/natives/native/native-build-provenance.json
 *.b64.js
 /result
 /result-*

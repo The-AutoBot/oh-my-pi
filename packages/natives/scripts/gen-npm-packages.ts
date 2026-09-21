@@ -12,11 +12,13 @@ export interface LeafTarget {
 export interface BuildLeafManifestInput extends LeafTarget {
 	files: readonly string[];
 	version: string;
+	nativeCompatibilityVersion: string;
 }
 
 export interface LeafManifest {
 	name: string;
 	version: string;
+	nativeCompatibilityVersion: string;
 	author: string;
 	os: string[];
 	cpu: string[];
@@ -82,7 +84,14 @@ function selectPrimaryAddonFile(tag: string, files: readonly string[]): string {
 	return files[0];
 }
 
-export function buildLeafManifest({ tag, os, cpu, files, version }: BuildLeafManifestInput): LeafManifest {
+export function buildLeafManifest({
+	tag,
+	os,
+	cpu,
+	files,
+	version,
+	nativeCompatibilityVersion,
+}: BuildLeafManifestInput): LeafManifest {
 	const addonFiles = [...new Set(files.map(file => path.basename(file)))];
 	if (addonFiles.length === 0) throw new Error(`No native addon files found for ${tag}`);
 	for (const file of addonFiles) {
@@ -92,6 +101,7 @@ export function buildLeafManifest({ tag, os, cpu, files, version }: BuildLeafMan
 	return {
 		name: `@oh-my-pi/pi-natives-${tag}`,
 		version,
+		nativeCompatibilityVersion,
 		author: "Stencil Labs, Inc.",
 		os: [os],
 		cpu: [cpu],
@@ -138,8 +148,15 @@ export async function generateNpmPackages({
 	version,
 	tags,
 }: GenerateNpmPackagesInput = {}): Promise<GeneratedLeafPackage[]> {
-	const manifestVersion =
-		version ?? ((await Bun.file(path.join(packageDir, "package.json")).json()) as { version: string }).version;
+	const sourceManifest = (await Bun.file(path.join(packageDir, "package.json")).json()) as {
+		version: string;
+		nativeCompatibilityVersion: string;
+	};
+	const manifestVersion = version ?? sourceManifest.version;
+	if (typeof sourceManifest.nativeCompatibilityVersion !== "string") {
+		throw new Error("Native package manifest is missing nativeCompatibilityVersion");
+	}
+	const nativeCompatibilityVersion = sourceManifest.nativeCompatibilityVersion;
 	const nativeDir = path.join(packageDir, "native");
 	const npmDir = path.join(packageDir, "npm");
 	const leaves: GeneratedLeafPackage[] = [];
@@ -147,7 +164,12 @@ export async function generateNpmPackages({
 	for (const target of selectTargets(tags)) {
 		const files = await discoverAddonFiles(nativeDir, target.tag);
 		const manifestFiles = files.length > 0 ? files : [expectedAddonFilenames(target.tag)[0]];
-		const manifest = buildLeafManifest({ ...target, files: manifestFiles, version: manifestVersion });
+		const manifest = buildLeafManifest({
+			...target,
+			files: manifestFiles,
+			version: manifestVersion,
+			nativeCompatibilityVersion,
+		});
 		const leafDir = path.join(npmDir, target.tag);
 		const missing = files.length === 0;
 		leaves.push({ tag: target.tag, dir: leafDir, files, manifest, missing });
