@@ -10,13 +10,15 @@
 
 ### Changed
 
-- Maintained custom 18.2.3 collaboration builds use repository-pinned Bun 1.4.0 with a matching source-built native addon through the maintained build scripts, preserving compiled `import.meta` startup.
+- Local Windows builds now compile the application with existing, exact-version native addons, record their hashes and unknown producing source commit, and smoke-test the output in an isolated profile without rebuilding native code or running broad per-build qualification suites.
+- Signed local producers now require `nativeAddonDirectory`; application asset compilation, executable identity checks, signing, immutable prepared publication, and update/recovery safeguards remain separate from native rebuilding.
 - Managed AutoBot updates now run serially at safe idle and resume the exact persisted session/profile/cwd/current model without replaying the original prompt. The broker reservation is 390 seconds (270-second execution floor plus 120-second pre-commit margin); candidates have a 60-second ready deadline.
 
 ### Fixed
 
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
+- Fixed Windows session enumeration in indexed and in-memory storage when journal paths use native backslash separators.
 ## [18.2.6] - 2026-09-18
 
 ### Fixed

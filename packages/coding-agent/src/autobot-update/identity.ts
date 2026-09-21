@@ -3,11 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { withAutoBotFileLock } from "./lock";
-import {
-	parseAutoBotLaunchRelease,
-	parseAutoBotReleaseManifest,
-	type AutoBotLaunchRelease,
-} from "./contract";
+import { parseAutoBotLaunchRelease, parseAutoBotReleaseManifest, type AutoBotLaunchRelease } from "./contract";
 import { autoBotPaths, pathIsInside, type AutoBotPaths } from "./paths";
 import { equalSecret, ensurePrivateDirectory, readJsonIfPresent, writeJsonAtomically } from "./storage";
 
@@ -54,7 +50,8 @@ const InstallationIdentitySchema = type({
 function parseInstallationIdentity(value: unknown): AutoBotInstallationIdentity {
 	const identity = InstallationIdentitySchema.assert(value);
 	if (!/^[A-Za-z0-9_-]{16,128}$/.test(identity.installId)) throw new Error("Invalid AutoBot installation identity");
-	if (!/^[A-Za-z0-9_-]{32,128}$/.test(identity.supervisorSecret)) throw new Error("Invalid AutoBot installation secret");
+	if (!/^[A-Za-z0-9_-]{32,128}$/.test(identity.supervisorSecret))
+		throw new Error("Invalid AutoBot installation secret");
 	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(identity.createdAt)) {
 		throw new Error("Invalid AutoBot installation timestamp");
 	}
@@ -70,7 +67,9 @@ function makeInstallationIdentity(): AutoBotInstallationIdentity {
 	};
 }
 
-export async function readAutoBotInstallationIdentity(paths: AutoBotPaths): Promise<AutoBotInstallationIdentity | undefined> {
+export async function readAutoBotInstallationIdentity(
+	paths: AutoBotPaths,
+): Promise<AutoBotInstallationIdentity | undefined> {
 	const raw = await readJsonIfPresent(paths.identityPath);
 	return raw === undefined ? undefined : parseInstallationIdentity(raw);
 }
@@ -208,14 +207,16 @@ export function readAuthenticatedAutoBotEnvironment(): AuthenticatedAutoBotEnvir
 	}
 
 	const paths = autoBotPaths(root);
-	if (!pathIsInside(paths.root, runtimePath) || path.resolve(runtimePath) !== path.resolve(process.execPath)) return undefined;
+	if (!pathIsInside(paths.root, runtimePath) || path.resolve(runtimePath) !== path.resolve(process.execPath))
+		return undefined;
 	let identity: AutoBotInstallationIdentity | undefined;
 	try {
 		identity = readAutoBotInstallationIdentitySync(paths);
 	} catch {
 		return undefined;
 	}
-	if (!identity || identity.installId !== installId || !equalSecret(identity.supervisorSecret, supervisorSecret)) return undefined;
+	if (!identity || identity.installId !== installId || !equalSecret(identity.supervisorSecret, supervisorSecret))
+		return undefined;
 	const launchRelease = readAuthenticatedLaunchRelease();
 	if (!launchRelease) return undefined;
 	if (!launchReleaseMatchesPinnedRuntime(launchRelease, path.resolve(runtimePath))) return undefined;
@@ -229,7 +230,9 @@ export function readAuthenticatedAutoBotEnvironment(): AuthenticatedAutoBotEnvir
 		!handoffFile ||
 		!handoffNonce ||
 		!pathIsInside(paths.handoffDir, handoffFile) ||
-		!new RegExp(`^${handoffNonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.(?:candidate|fallback)\\.json$`).test(path.basename(handoffFile))
+		!new RegExp(`^${handoffNonce.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.(?:candidate|fallback)\\.json$`).test(
+			path.basename(handoffFile),
+		)
 	) {
 		return undefined;
 	}

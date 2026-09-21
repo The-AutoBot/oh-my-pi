@@ -210,7 +210,6 @@ export class InputController {
 	#expandToolsListenerInstalled = false;
 	#inlineMouseListenerInstalled = false;
 
-
 	/** True while the terminal is released to an external editor process. */
 	#externalEditorActive = false;
 

@@ -59,7 +59,8 @@ async function ensurePrivateLockDatabase(databasePath: string): Promise<void> {
 		const handle = await fs.open(databasePath, "wx", 0o600);
 		await handle.close();
 	} catch (error) {
-		if (errorCode(error) !== "EEXIST") throw new Error("Cannot create the AutoBot control lock database", { cause: error });
+		if (errorCode(error) !== "EEXIST")
+			throw new Error("Cannot create the AutoBot control lock database", { cause: error });
 	}
 	await assertPrivateRegularFileIfPresent(databasePath);
 }

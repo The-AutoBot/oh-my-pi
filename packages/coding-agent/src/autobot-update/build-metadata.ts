@@ -64,7 +64,10 @@ export function getAutoBotBuildIdentity(): AutoBotBuildIdentity | undefined {
 	return identity;
 }
 
-export function assertAutoBotBuildIdentityMatches(identity: AutoBotBuildIdentity, manifest: AutoBotReleaseManifest): void {
+export function assertAutoBotBuildIdentityMatches(
+	identity: AutoBotBuildIdentity,
+	manifest: AutoBotReleaseManifest,
+): void {
 	if (
 		identity.releaseSequence !== manifest.releaseSequence ||
 		identity.upstreamVersion !== manifest.upstreamVersion ||

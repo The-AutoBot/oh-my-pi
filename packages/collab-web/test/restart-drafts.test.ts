@@ -91,7 +91,11 @@ describe("restart draft registry", () => {
 	it("allows a focused-but-idle draft to reload after the bounded input quiet period", () => {
 		const storage = new MemoryStorage();
 		let monotonicNow = 0;
-		const drafts = new RestartDraftRegistry(storage, () => 0, () => monotonicNow);
+		const drafts = new RestartDraftRegistry(
+			storage,
+			() => 0,
+			() => monotonicNow,
+		);
 		drafts.setScope(scopeA);
 		drafts.noteInput({ kind: "composer" });
 		drafts.set({ kind: "composer" }, "saved");
@@ -104,7 +108,11 @@ describe("restart draft registry", () => {
 	it("does not acknowledge a restart while IME input may still commit", () => {
 		const storage = new MemoryStorage();
 		let monotonicNow = 0;
-		const drafts = new RestartDraftRegistry(storage, () => 0, () => monotonicNow);
+		const drafts = new RestartDraftRegistry(
+			storage,
+			() => 0,
+			() => monotonicNow,
+		);
 		const surface = { kind: "composer" } as const;
 		drafts.setScope(scopeA);
 		drafts.setComposing(surface, true);

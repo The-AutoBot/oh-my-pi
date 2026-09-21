@@ -22,18 +22,18 @@ import {
 	type JsonValue,
 	type PreparedAutoBotRestart,
 } from "./autobot-update/contract";
+import { AUTO_BOT_FINAL_GUEST_ACK_LEASE_MS, AUTO_BOT_SESSION_DISPOSE_TIMEOUT_MS } from "./autobot-update/supervisor";
 import {
-	AUTO_BOT_FINAL_GUEST_ACK_LEASE_MS,
-	AUTO_BOT_SESSION_DISPOSE_TIMEOUT_MS,
-} from "./autobot-update/supervisor";
-import { authorizeAutoBotRestartExit, getAutoBotStartupHandoff, requestAutoBotNormalExit } from "./autobot-update/handoff";
+	authorizeAutoBotRestartExit,
+	getAutoBotStartupHandoff,
+	requestAutoBotNormalExit,
+} from "./autobot-update/handoff";
 import { readAuthenticatedAutoBotEnvironment } from "./autobot-update/identity";
 import { pathIsInside } from "./autobot-update/paths";
 
 const AUTO_BOT_RESTART_CONTEXT_VERSION = 1;
 const POSTMORTEM_CLEANUP_TIMEOUT_MS = 10_000;
 const STDOUT_DRAIN_TIMEOUT_MS = 5_000;
-
 
 type SafeLaunchFlags = Readonly<{
 	autoApprove: boolean;
@@ -119,7 +119,9 @@ type PreparedRuntimeRestart = Readonly<{
 	predecessorTarget: AutoBotRestartTarget;
 }>;
 
-function primitiveRecord(value: JsonValue | AutoBotRestartLaunchContext | undefined): Record<string, JsonValue> | undefined {
+function primitiveRecord(
+	value: JsonValue | AutoBotRestartLaunchContext | undefined,
+): Record<string, JsonValue> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	return value as Record<string, JsonValue>;
 }
@@ -259,16 +261,24 @@ function safeCollabFallbackState(value: JsonValue | undefined): CollabAutoBotFal
 
 function unsafeLaunchOverride(args: Args): string | undefined {
 	if (args.apiKey !== undefined) return "a runtime API key override is active";
-	if (args.systemPrompt !== undefined || args.appendSystemPrompt !== undefined) return "a custom system prompt override is active";
-	if (args.provider !== undefined || args.model !== undefined || args.models?.length) return "a model launch override is active";
+	if (args.systemPrompt !== undefined || args.appendSystemPrompt !== undefined)
+		return "a custom system prompt override is active";
+	if (args.provider !== undefined || args.model !== undefined || args.models?.length)
+		return "a model launch override is active";
 	if (args.smol !== undefined || args.slow !== undefined || args.plan !== undefined || args.thinking !== undefined) {
 		return "a model-role launch override is active";
 	}
-	if (args.providerSessionId !== undefined || args.providerPromptCacheKey !== undefined) return "a provider session override is active";
+	if (args.providerSessionId !== undefined || args.providerPromptCacheKey !== undefined)
+		return "a provider session override is active";
 	if (args.extensions?.length || args.hooks?.length || args.trustedExtensions?.length || args.pluginDirs?.length) {
 		return "a custom extension launch override is active";
 	}
-	if (args.skills?.length || args.prewalkInto !== undefined || args.planYoloInto !== undefined || args.maxTime !== undefined) {
+	if (
+		args.skills?.length ||
+		args.prewalkInto !== undefined ||
+		args.planYoloInto !== undefined ||
+		args.maxTime !== undefined
+	) {
 		return "a nonpersistent startup override is active";
 	}
 	return undefined;
@@ -325,7 +335,19 @@ export function parseAutoBotRestartLaunchContext(
 	const flags = primitiveRecord(root.flags);
 	if (!configFiles || !flags) return undefined;
 	const boolNames = [
-		"autoApprove", "advisor", "externalThinking", "hideThinking", "noExtensions", "noLsp", "noPrewalk", "noPty", "noRules", "noSkills", "noTitle", "noTools", "prewalk",
+		"autoApprove",
+		"advisor",
+		"externalThinking",
+		"hideThinking",
+		"noExtensions",
+		"noLsp",
+		"noPrewalk",
+		"noPty",
+		"noRules",
+		"noSkills",
+		"noTitle",
+		"noTools",
+		"prewalk",
 	] as const;
 	const parsedFlags: Record<string, boolean | string | undefined> = {};
 	for (const name of boolNames) {
@@ -334,32 +356,40 @@ export function parseAutoBotRestartLaunchContext(
 		parsedFlags[name] = parsed;
 	}
 	const approvalMode = stringField(flags, "approvalMode");
-	if (approvalMode !== undefined && approvalMode !== "always-ask" && approvalMode !== "write" && approvalMode !== "yolo") return undefined;
+	if (
+		approvalMode !== undefined &&
+		approvalMode !== "always-ask" &&
+		approvalMode !== "write" &&
+		approvalMode !== "yolo"
+	)
+		return undefined;
 	const serviceTier = stringField(flags, "serviceTier");
-	const coordinator = root.coordinator === undefined
-		? undefined
-		: safeCoordinatorPreparation(
-				root.coordinator,
-				expectedCoordinator?.target ?? target,
-				expectedCoordinator?.predecessorTarget ?? target,
-			);
+	const coordinator =
+		root.coordinator === undefined
+			? undefined
+			: safeCoordinatorPreparation(
+					root.coordinator,
+					expectedCoordinator?.target ?? target,
+					expectedCoordinator?.predecessorTarget ?? target,
+				);
 	const collab = root.collab === undefined ? undefined : safeCollabFallbackState(root.collab);
 	if (root.coordinator !== undefined && coordinator === undefined) return undefined;
 	if (root.collab !== undefined && collab === undefined) return undefined;
 	return {
 		schemaVersion: AUTO_BOT_RESTART_CONTEXT_VERSION,
 		configFiles,
-		flags: { ...(parsedFlags as SafeLaunchFlags), ...(approvalMode === undefined ? {} : { approvalMode }), ...(serviceTier === undefined ? {} : { serviceTier: serviceTier as Args["serviceTier"] }) },
+		flags: {
+			...(parsedFlags as SafeLaunchFlags),
+			...(approvalMode === undefined ? {} : { approvalMode }),
+			...(serviceTier === undefined ? {} : { serviceTier: serviceTier as Args["serviceTier"] }),
+		},
 		...(coordinator === undefined ? {} : { coordinator }),
 		...(collab === undefined ? {} : { collab }),
 	};
 }
 
 /** Build a fresh candidate Args object; no original argv, prompt, model, or credential is replayed. */
-export function createAutoBotCandidateArgs(
-	request: AutoBotRestartRequest,
-	context: AutoBotRestartLaunchContext,
-): Args {
+export function createAutoBotCandidateArgs(request: AutoBotRestartRequest, context: AutoBotRestartLaunchContext): Args {
 	return {
 		cwd: request.cwd,
 		...(request.profile === undefined ? {} : { profile: request.profile }),
@@ -394,7 +424,8 @@ async function liveResourceReason(session: AgentSession, mode: InteractiveMode):
 	if (hasLiveComputerSessionForOwner(evaluatorOwnerId)) return "a computer session is still owned by this session";
 	if (hasVmContextsForOwner(evaluatorOwnerId)) return "a JavaScript evaluation context is still owned by this session";
 	if (hasPythonKernelSessionForOwner(evaluatorOwnerId)) return "a Python kernel is still owned by this session";
-	if (dapSessionManager.listSessions().some(item => item.status !== "terminated")) return "a DAP debugger session is still live";
+	if (dapSessionManager.listSessions().some(item => item.status !== "terminated"))
+		return "a DAP debugger session is still live";
 
 	for (const name of mode.mcpManager?.getConnectedServers() ?? []) {
 		const transport = mode.mcpManager?.getConnection(name)?.transport;
@@ -407,7 +438,9 @@ async function liveResourceReason(session: AgentSession, mode: InteractiveMode):
 	if (!sessionId) return undefined;
 	try {
 		const daemons = await listKnownProjectDaemons(session.sessionManager.getCwd());
-		if (daemons?.some(daemon => daemon.owner === sessionId && daemon.state !== "exited" && daemon.state !== "failed")) {
+		if (
+			daemons?.some(daemon => daemon.owner === sessionId && daemon.state !== "exited" && daemon.state !== "failed")
+		) {
 			return "a user-owned hub service is still running";
 		}
 	} catch (error) {
@@ -459,7 +492,10 @@ async function abandonAutoBotCoordinatorReservation(
 			firstError ??= error;
 		}
 	}
-	throw new AggregateError([firstError], "AutoBot coordinator reservation could not be abandoned for an explicit user exit");
+	throw new AggregateError(
+		[firstError],
+		"AutoBot coordinator reservation could not be abandoned for an explicit user exit",
+	);
 }
 
 function canonicalExpiry(value: string | undefined): string | undefined {
@@ -560,7 +596,6 @@ export function getAutoBotCoordinatorStartupRegistration(): AutoBotCoordinatorSt
 	};
 }
 
-
 /** Runtime-owned hourly update hooks for one already-running interactive session. */
 export class AutoBotRuntime {
 	#prepared: PreparedRuntimeRestart | undefined;
@@ -588,16 +623,12 @@ export class AutoBotRuntime {
 		};
 	}
 
-
 	/**
 	 * Read-only early admission gate for a shared managed installation. It must
 	 * not freeze input, flush state, or reserve broker/browser ownership: the
 	 * later prepareRestart call repeats these checks at its mutation boundary.
 	 */
-	async canPrepareRestart(
-		target: AutoBotRestartTarget,
-		predecessorTarget: AutoBotRestartTarget,
-	): Promise<boolean> {
+	async canPrepareRestart(target: AutoBotRestartTarget, predecessorTarget: AutoBotRestartTarget): Promise<boolean> {
 		try {
 			if (
 				target.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH ||
@@ -700,7 +731,8 @@ export class AutoBotRuntime {
 			const collabSafety = this.mode.collabController.canPrepareUpdate(target);
 			if (!collabSafety.safe) return await cancel();
 			const coordinatorSafety = await service.canPrepare(target);
-			if (!coordinatorSafety.canPrepare || !this.mode.isAutoBotUpdateAdmissionValid(admission)) return await cancel();
+			if (!coordinatorSafety.canPrepare || !this.mode.isAutoBotUpdateAdmissionValid(admission))
+				return await cancel();
 			coordinator = await service.prepare({
 				successorInstanceId: randomUUID(),
 				target,
@@ -900,7 +932,8 @@ export class AutoBotRuntime {
 			!prepared ||
 			!sameTarget(prepared.target, request.target) ||
 			!sameTarget(prepared.predecessorTarget, request.predecessorTarget) ||
-			(prepared.coordinator !== undefined && request.fallbackInstanceId !== prepared.coordinator.fallbackInstanceId) ||
+			(prepared.coordinator !== undefined &&
+				request.fallbackInstanceId !== prepared.coordinator.fallbackInstanceId) ||
 			!this.mode.isAutoBotUpdateAdmissionValid(prepared.admission) ||
 			(await liveResourceReason(this.session, this.mode)) !== undefined
 		) {
@@ -986,7 +1019,11 @@ export class AutoBotRuntime {
 				AUTO_BOT_SESSION_DISPOSE_TIMEOUT_MS,
 				"Timed out disposing predecessor for AutoBot update",
 			);
-			await withTimeout(postmortem.cleanup(), POSTMORTEM_CLEANUP_TIMEOUT_MS, "Timed out running AutoBot postmortem cleanup");
+			await withTimeout(
+				postmortem.cleanup(),
+				POSTMORTEM_CLEANUP_TIMEOUT_MS,
+				"Timed out running AutoBot postmortem cleanup",
+			);
 			await withTimeout(postmortem.drainStdout(), STDOUT_DRAIN_TIMEOUT_MS, "Timed out draining AutoBot stdout");
 			if (this.mode.isAutoBotUpdateExitRequested(prepared.admission)) {
 				await abandonCoordinatorForExplicitExit();

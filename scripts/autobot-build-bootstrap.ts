@@ -51,7 +51,7 @@ function compileTarget(target: string): Bun.Build.CompileTarget {
 		case "linux-musl-arm64":
 			return "bun-linux-arm64-musl";
 		case "linux-musl-x64":
-			return "bun-linux-x64-musl-baseline";
+			return "bun-linux-x64-baseline-musl";
 		case "linux-x64":
 			return "bun-linux-x64-baseline";
 		case "win32-arm64":
@@ -84,7 +84,8 @@ async function requireRegularFile(filePath: string, label: string): Promise<void
 		if (isEnoent(error)) throw new AutoBotReleaseError(`${label} does not exist: ${filePath}`);
 		throw error;
 	}
-	if (!stat.isFile() || stat.isSymbolicLink()) throw new AutoBotReleaseError(`${label} must be a regular file: ${filePath}`);
+	if (!stat.isFile() || stat.isSymbolicLink())
+		throw new AutoBotReleaseError(`${label} must be a regular file: ${filePath}`);
 }
 
 async function prepareOutput(target: string, requestedOutput: string): Promise<string> {
@@ -167,7 +168,9 @@ async function main(): Promise<void> {
 		throw: false,
 	});
 	if (!build.success) {
-		throw new AutoBotReleaseError(`AutoBot bootstrap compilation failed:\n${build.logs.map(log => log.message).join("\n")}`);
+		throw new AutoBotReleaseError(
+			`AutoBot bootstrap compilation failed:\n${build.logs.map(log => log.message).join("\n")}`,
+		);
 	}
 	await requireRegularFile(output, "Compiled AutoBot bootstrap");
 	process.stdout.write(`Built AutoBot bootstrap ${target} at ${output}\n`);

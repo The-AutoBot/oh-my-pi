@@ -113,7 +113,8 @@ export function hasOption(args: ParsedCliArgs, name: string): boolean {
 }
 
 export function requireString(value: unknown, label: string): string {
-	if (typeof value !== "string" || value.length === 0) throw new AutoBotReleaseError(`${label} must be a non-empty string`);
+	if (typeof value !== "string" || value.length === 0)
+		throw new AutoBotReleaseError(`${label} must be a non-empty string`);
 	return value;
 }
 
@@ -211,7 +212,8 @@ export async function hashFile(pathname: string): Promise<{ readonly size: numbe
 }
 
 export function relativeAssetPath(value: string): string {
-	if (!SAFE_RELATIVE_FILE.test(value)) throw new AutoBotReleaseError(`Asset index path is not a safe relative file path: ${value}`);
+	if (!SAFE_RELATIVE_FILE.test(value))
+		throw new AutoBotReleaseError(`Asset index path is not a safe relative file path: ${value}`);
 	return value;
 }
 
@@ -284,7 +286,8 @@ function parseAssetInput(value: unknown, index: number): AssetInput {
 
 export async function readAssetInputs(pathname: string): Promise<readonly AssetInput[]> {
 	const parsed = await readJson(pathname, "asset list");
-	if (!Array.isArray(parsed) || parsed.length === 0) throw new AutoBotReleaseError("Asset list must be a non-empty JSON array");
+	if (!Array.isArray(parsed) || parsed.length === 0)
+		throw new AutoBotReleaseError("Asset list must be a non-empty JSON array");
 	return parsed.map(parseAssetInput);
 }
 
@@ -318,7 +321,8 @@ function parseAssetIndexEntry(value: unknown, index: number): AssetIndexEntry {
 export function parseAssetIndex(value: unknown): AssetIndex {
 	if (!isRecord(value)) throw new AutoBotReleaseError("Asset index must be an object");
 	for (const key of Object.keys(value)) {
-		if (!["schemaVersion", "assets"].includes(key)) throw new AutoBotReleaseError(`Asset index has an unsupported field: ${key}`);
+		if (!["schemaVersion", "assets"].includes(key))
+			throw new AutoBotReleaseError(`Asset index has an unsupported field: ${key}`);
 	}
 	if (value.schemaVersion !== 1) throw new AutoBotReleaseError("Asset index schemaVersion must be 1");
 	if (!Array.isArray(value.assets) || value.assets.length === 0) {
@@ -329,7 +333,8 @@ export function parseAssetIndex(value: unknown): AssetIndex {
 	const files = new Set<string>();
 	for (const asset of assets) {
 		const identity = `${asset.kind}\u0000${asset.target}`;
-		if (identities.has(identity)) throw new AutoBotReleaseError(`Asset index duplicates ${asset.kind}/${asset.target}`);
+		if (identities.has(identity))
+			throw new AutoBotReleaseError(`Asset index duplicates ${asset.kind}/${asset.target}`);
 		if (files.has(asset.file)) throw new AutoBotReleaseError(`Asset index reuses staged file ${asset.file}`);
 		identities.add(identity);
 		files.add(asset.file);
@@ -337,10 +342,7 @@ export function parseAssetIndex(value: unknown): AssetIndex {
 	return { schemaVersion: 1, assets };
 }
 
-export async function verifyIndexedAssets(
-	manifest: AutoBotReleaseManifest,
-	assetIndexPath: string,
-): Promise<void> {
+export async function verifyIndexedAssets(manifest: AutoBotReleaseManifest, assetIndexPath: string): Promise<void> {
 	const indexPath = path.resolve(assetIndexPath);
 	const index = parseAssetIndex(await readJson(indexPath, "asset index"));
 	const indexed = new Map(index.assets.map(asset => [`${asset.kind}\u0000${asset.target}`, asset]));
@@ -358,9 +360,9 @@ export async function verifyIndexedAssets(
 	}
 }
 
-function decodePemOrDer(bytes: Uint8Array, label: string): Uint8Array {
+function decodePemOrDer(bytes: Uint8Array, label: string): Uint8Array<ArrayBuffer> {
 	const text = new TextDecoder().decode(bytes).trim();
-	if (!text.startsWith("-----BEGIN")) return bytes;
+	if (!text.startsWith("-----BEGIN")) return Uint8Array.from(bytes);
 	const match = /^-----BEGIN ([A-Z0-9 ]+)-----\s*([A-Za-z0-9+/=\r\n]+)\s*-----END \1-----$/u.exec(text);
 	if (!match) throw new AutoBotReleaseError(`${label} is not a supported PEM key`);
 	try {
@@ -388,10 +390,15 @@ export async function importEd25519PublicKey(pathname: string): Promise<CryptoKe
 	}
 }
 
-export async function signManifest(manifest: AutoBotReleaseManifest, keyId: string, privateKey: CryptoKey): Promise<SignedAutoBotReleaseEnvelope> {
+export async function signManifest(
+	manifest: AutoBotReleaseManifest,
+	keyId: string,
+	privateKey: CryptoKey,
+): Promise<SignedAutoBotReleaseEnvelope> {
 	const payload = serializeAutoBotReleaseManifest(manifest);
 	const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, new TextEncoder().encode(payload)));
-	if (signature.byteLength !== 64) throw new AutoBotReleaseError("Ed25519 signing produced an unexpected signature length");
+	if (signature.byteLength !== 64)
+		throw new AutoBotReleaseError("Ed25519 signing produced an unexpected signature length");
 	return { payload, signature: Buffer.from(signature).toString("base64"), keyId: requireKeyId(keyId) };
 }
 
@@ -422,11 +429,15 @@ export interface VerifiedReleaseEnvelope {
 	readonly manifest: AutoBotReleaseManifest;
 }
 
-export async function verifySignedEnvelope(value: unknown, trustedKeys: TrustedKeySet): Promise<VerifiedReleaseEnvelope> {
+export async function verifySignedEnvelope(
+	value: unknown,
+	trustedKeys: TrustedKeySet,
+): Promise<VerifiedReleaseEnvelope> {
 	const envelope = parseSignedAutoBotReleaseEnvelope(value);
 	const key = trustedKeys.keys.get(envelope.keyId);
-	if (!key) throw new AutoBotReleaseError(`No locally configured trusted key matches envelope keyId ${envelope.keyId}`);
-	let signature: Uint8Array;
+	if (!key)
+		throw new AutoBotReleaseError(`No locally configured trusted key matches envelope keyId ${envelope.keyId}`);
+	let signature: Uint8Array<ArrayBuffer>;
 	try {
 		signature = Uint8Array.from(Buffer.from(envelope.signature, "base64"));
 	} catch (error) {
@@ -437,7 +448,10 @@ export async function verifySignedEnvelope(value: unknown, trustedKeys: TrustedK
 	return { envelope, manifest: parseAutoBotReleasePayload(envelope.payload) };
 }
 
-export async function readVerifiedEnvelope(pathname: string, trustedKeys: TrustedKeySet): Promise<VerifiedReleaseEnvelope> {
+export async function readVerifiedEnvelope(
+	pathname: string,
+	trustedKeys: TrustedKeySet,
+): Promise<VerifiedReleaseEnvelope> {
 	return verifySignedEnvelope(await readJson(pathname, "signed release envelope"), trustedKeys);
 }
 

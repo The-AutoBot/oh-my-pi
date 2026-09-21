@@ -250,11 +250,16 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
-		const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+		const trailingSeparator = dir.endsWith("/") || dir.endsWith("\\");
+		const prefixLength = dir.length + (trailingSeparator ? 0 : 1);
 		const out: string[] = [];
 		for (const path of this.#index.keys()) {
-			if (!path.startsWith(prefix)) continue;
-			const name = path.slice(prefix.length);
+			if (!path.startsWith(dir)) continue;
+			if (!trailingSeparator) {
+				const separator = path[dir.length];
+				if (separator !== "/" && separator !== "\\") continue;
+			}
+			const name = path.slice(prefixLength);
 			if (name.includes("/") || name.includes("\\")) continue;
 			if (!matchesGlob(name, pattern)) continue;
 			out.push(path);

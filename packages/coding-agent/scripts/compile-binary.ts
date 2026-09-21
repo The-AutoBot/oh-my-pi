@@ -55,7 +55,9 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 		Bun.env.BUN_NO_CODESIGN_MACHO_BINARY = "1";
 	}
 	const autoBotBuildIdentityDefine: string =
-		options.autoBotBuildIdentity === undefined ? "undefined" : JSON.stringify(JSON.stringify(options.autoBotBuildIdentity)!)!;
+		options.autoBotBuildIdentity === undefined
+			? "undefined"
+			: JSON.stringify(JSON.stringify(options.autoBotBuildIdentity)!)!;
 	try {
 		const output = await Bun.build({
 			entrypoints: [options.entrypoint],

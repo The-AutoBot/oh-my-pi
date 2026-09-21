@@ -13,6 +13,7 @@ import {
 	AUTO_BOT_RELEASE_SCHEMA_VERSION,
 	AUTO_BOT_SESSION_FORMAT_VERSION,
 } from "../packages/coding-agent/src/autobot-update/contract.ts";
+import { AUTO_BOT_ACTIVATION_ACK_TIMEOUT_MS } from "../packages/coding-agent/src/autobot-update/timing.ts";
 import type {
 	AutoBotHandoffClaim,
 	AutoBotHandoffOwner,
@@ -102,9 +103,20 @@ async function createPosixInheritedRoot(): Promise<string> {
 	return root;
 }
 
+function isCryptoKeyPair(value: unknown): value is CryptoKeyPair {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"publicKey" in value &&
+		value.publicKey instanceof CryptoKey &&
+		"privateKey" in value &&
+		value.privateKey instanceof CryptoKey
+	);
+}
+
 async function createTrustedPublicKey(directory: string): Promise<string> {
 	const generated = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
-	if (!("publicKey" in generated)) throw new Error("Ed25519 key generation did not return a key pair");
+	if (!isCryptoKeyPair(generated)) throw new Error("Ed25519 key generation did not return a key pair");
 	const keyPath = path.join(directory, "release-public.spki");
 	await Bun.write(keyPath, new Uint8Array(await crypto.subtle.exportKey("spki", generated.publicKey)));
 	return keyPath;
@@ -183,7 +195,8 @@ const pathsModulePath = path
 const fixtureRuntimeProgramEnvironment = "OMP_TEST_AUTOBOT_RUNTIME_PROGRAM";
 // These are integration guards around separately scheduled child processes;
 // fake timers cannot bound filesystem-lock acquisition or child termination.
-const foreignHandoffLockHolderAcquisitionTimeoutMs = 15_000;
+// Readiness includes protected journal creation and Windows ACL subprocesses.
+const foreignHandoffLockHolderAcquisitionTimeoutMs = 60_000;
 const foreignHandoffLockHolderCleanupTimeoutMs = 5_000;
 const foreignHandoffLockHolderPhases: Record<string, true> = {
 	"modules-loaded": true,
@@ -1432,7 +1445,52 @@ test("does not clear foreign pending or committed restart journals after an unre
 	}
 }, 600_000);
 
-test("returns zero when a promoted runtime exits while a foreign handoff transaction holds the lock", async () => {
+test("keeps supervising the committed candidate after activation acknowledgement becomes ambiguous", async () => {
+	const fixture = await createBootstrapFixture();
+	const run = await startBootstrap(fixture, { promoteAndQuit: true });
+	const active = await runtimeEvidence(run);
+	const owner: AutoBotHandoffOwner = {
+		launchId: active.launchId,
+		bootstrapProcessId: run.bootstrap.pid,
+		predecessorRuntimeProcessId: active.processId,
+	};
+	const claim: AutoBotHandoffClaim = {
+		launchId: active.launchId,
+		bootstrapProcessId: run.bootstrap.pid,
+	};
+	const request = restartRequest(fixture);
+	const pending = pendingRestart(fixture, request, owner, claim);
+	await createAutoBotHandoff(fixture.paths, {
+		...request,
+		protocolVersion: AUTO_BOT_HANDOFF_PROTOCOL_VERSION,
+		owner,
+		role: "candidate",
+		runtimePath: fixture.candidateRuntimePath,
+		previousRuntimePath: fixture.activeRuntimePath,
+		createdAt: fixtureTimestamp,
+	});
+	await withAutoBotHandoffLock(fixture.paths, async () => {
+		expect(await createAutoBotPendingRestart(fixture.paths, pending)).toBe(true);
+	});
+
+	await Bun.write(run.restartGatePath!, "restart");
+	await waitForBootstrapFile(run, run.activationObservedPath!, "candidate activation");
+	// Activation is irreversible. Once the acknowledgement deadline passes, the
+	// bootstrap must retain the live candidate and durable committed identity
+	// rather than guessing failure and launching the predecessor.
+	await Bun.sleep(AUTO_BOT_ACTIVATION_ACK_TIMEOUT_MS + 2_000);
+	const ambiguousCandidate = JSON.parse(await Bun.file(run.evidencePath).text()) as RuntimeEvidence;
+	expect(ambiguousCandidate.role).toBe("candidate");
+	expect(ambiguousCandidate.processId).not.toBe(active.processId);
+	assertLiveLegacyProcess(await fs.realpath(fixture.candidateRuntimePath), ambiguousCandidate.processId);
+	expect((await readAutoBotActivePointer(fixture.paths))?.runtimePath).toBe(fixture.activeRuntimePath);
+	expect((await readAutoBotCommittedRestart(fixture.paths))?.candidateRuntimeProcessId).toBe(
+		ambiguousCandidate.processId,
+	);
+	await stopBootstrap(run);
+}, 600_000);
+
+test("returns zero when the promoted runtime exits under a foreign handoff lock", async () => {
 	const fixture = await createBootstrapFixture();
 	const run = await startBootstrap(fixture, { promoteAndQuit: true });
 	const active = await runtimeEvidence(run);
@@ -1489,6 +1547,8 @@ test("returns zero when a promoted runtime exits while a foreign handoff transac
 	};
 	const foreignRequest = restartRequest(fixture);
 	const foreignPending = pendingRestart(fixture, foreignRequest, foreignOwner, foreignClaim);
+	await Bun.write(run.promotedExitGatePath!, "request normal exit");
+	await waitForBootstrapFile(run, run.promotedExitIntentPath!, "promoted normal-exit intent");
 	await createAutoBotHandoff(fixture.paths, {
 		...foreignRequest,
 		protocolVersion: AUTO_BOT_HANDOFF_PROTOCOL_VERSION,
@@ -1498,8 +1558,6 @@ test("returns zero when a promoted runtime exits while a foreign handoff transac
 		previousRuntimePath: fixture.activeRuntimePath,
 		createdAt: fixtureTimestamp,
 	});
-	await Bun.write(run.promotedExitGatePath!, "request normal exit");
-	await waitForBootstrapFile(run, run.promotedExitIntentPath!, "promoted normal-exit intent");
 	const holder = await startForeignHandoffLockHolder(fixture, foreignPending);
 	let bootstrapExitCode: number | undefined;
 	let bootstrapStderr = "";

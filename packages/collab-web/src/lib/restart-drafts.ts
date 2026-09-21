@@ -67,10 +67,7 @@ export async function createManualDraftScope(link: string, sessionId: string): P
 }
 
 /** Only call this after authenticated managed-session discovery confirmed the route and capability. */
-export async function createManagedDraftScope(
-	pcId: string,
-	sessionId: string,
-): Promise<RestartDraftScope | null> {
+export async function createManagedDraftScope(pcId: string, sessionId: string): Promise<RestartDraftScope | null> {
 	if (!/^[a-z0-9][a-z0-9-]{0,62}$/u.test(pcId) || !validSessionId(sessionId)) return null;
 	const fingerprint = await sha256Fingerprint(`managed\u0000${pcId}\u0000${sessionId}`);
 	return fingerprint ? { fingerprint, sessionId } : null;
@@ -124,11 +121,7 @@ export class RestartDraftRegistry {
 	}
 
 	setScope(scope: RestartDraftScope | undefined): void {
-		if (
-			this.#scope?.fingerprint === scope?.fingerprint &&
-			this.#scope?.sessionId === scope?.sessionId
-		)
-			return;
+		if (this.#scope?.fingerprint === scope?.fingerprint && this.#scope?.sessionId === scope?.sessionId) return;
 		this.#scope = scope;
 		this.#drafts.clear();
 		this.#composing.clear();
@@ -185,16 +178,18 @@ export class RestartDraftRegistry {
 				return false;
 			}
 			const record = parseRecord(storage.getItem(recordKey(scope, index.recordId)));
-			if (!record || !matchesScope(record, scope) || record.recordId !== index.recordId || record.recoverUntilMs <= this.#now()) {
+			if (
+				!record ||
+				!matchesScope(record, scope) ||
+				record.recordId !== index.recordId ||
+				record.recoverUntilMs <= this.#now()
+			) {
 				this.#removeScopeRecord(index, scope);
 				return false;
 			}
 			this.#drafts.clear();
 			for (const draft of record.drafts) {
-				if (
-					draft.surface.kind === "editor" &&
-					draft.surface.capabilityFingerprint !== editorCapabilityFingerprint
-				)
+				if (draft.surface.kind === "editor" && draft.surface.capabilityFingerprint !== editorCapabilityFingerprint)
 					continue;
 				this.#drafts.set(surfaceKey(draft.surface), draft);
 			}

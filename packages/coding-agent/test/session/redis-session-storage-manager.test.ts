@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import {
 	RedisSessionStorage,
@@ -155,13 +156,18 @@ function fakeUsage(input: number, output: number): Usage {
 	};
 }
 
+function fixturePath(...segments: string[]): string {
+	return path.resolve(path.parse(process.cwd()).root, ...segments);
+}
+
 describe("SessionManager + RedisSessionStorage", () => {
 	it("persists appended assistant messages into Redis and reloads them via open()", async () => {
 		const redis = createFakeRedis();
 		const storage = await RedisSessionStorage.create({ client: redis });
-		const sessionDir = "/sessions/proj";
+		const cwd = fixturePath("cwd");
+		const sessionDir = fixturePath("sessions", "proj");
 
-		const manager = SessionManager.create("/cwd", sessionDir, storage);
+		const manager = SessionManager.create(cwd, sessionDir, storage);
 		manager.appendMessage({
 			role: "assistant",
 			provider: "anthropic",
@@ -176,7 +182,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 		const sessionFilePath = sessionFile as string;
-		expect(sessionFilePath.startsWith(sessionDir)).toBe(true);
+		expect(path.dirname(sessionFilePath)).toBe(sessionDir);
 
 		// `appendMessage` queues the cold-path rewrite onto SessionManager's
 		// internal persist chain via a fire-and-forget call. `flush()` awaits
@@ -210,9 +216,10 @@ describe("SessionManager + RedisSessionStorage", () => {
 	it("SessionManager.list returns Redis-backed sessions for the cwd", async () => {
 		const redis = createFakeRedis();
 		const storage = await RedisSessionStorage.create({ client: redis });
-		const sessionDir = "/sessions/list-proj";
+		const cwd = fixturePath("cwd");
+		const sessionDir = fixturePath("sessions", "list-proj");
 
-		const a = SessionManager.create("/cwd", sessionDir, storage);
+		const a = SessionManager.create(cwd, sessionDir, storage);
 		a.appendMessage({
 			role: "assistant",
 			provider: "anthropic",
@@ -227,7 +234,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 		await storage.drain();
 		await a.close();
 
-		const b = SessionManager.create("/cwd", sessionDir, storage);
+		const b = SessionManager.create(cwd, sessionDir, storage);
 		b.appendMessage({
 			role: "assistant",
 			provider: "anthropic",
@@ -247,7 +254,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 		expect(aFile).toBeDefined();
 		expect(bFile).toBeDefined();
 
-		const sessions = await SessionManager.list("/cwd", sessionDir, storage);
+		const sessions = await SessionManager.list(cwd, sessionDir, storage);
 		const sessionFiles = sessions.map(s => s.path).sort();
 		expect(sessionFiles).toContain(aFile as string);
 		expect(sessionFiles).toContain(bFile as string);
@@ -256,13 +263,15 @@ describe("SessionManager + RedisSessionStorage", () => {
 	it("rejects a stale rewrite after another Redis storage appends", async () => {
 		const redis = createFakeRedis();
 		const firstStorage = await RedisSessionStorage.create({ client: redis });
-		const first = SessionManager.create("/cwd", "/sessions/shared", firstStorage);
+		const cwd = fixturePath("cwd");
+		const sessionDir = fixturePath("sessions", "shared");
+		const first = SessionManager.create(cwd, sessionDir, firstStorage);
 		await first.ensureOnDisk();
 		const sessionFile = first.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 
 		const secondStorage = await RedisSessionStorage.create({ client: redis });
-		const second = await SessionManager.open(sessionFile, "/sessions/shared", secondStorage);
+		const second = await SessionManager.open(sessionFile, sessionDir, secondStorage);
 		second.appendMessage({ role: "user", content: "durable Redis peer turn", timestamp: Date.now() });
 		await second.close();
 

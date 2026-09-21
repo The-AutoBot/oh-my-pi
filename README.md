@@ -629,6 +629,83 @@ bun dev -- --version
 
 For architecture and contribution guidelines, see [packages/coding-agent/DEVELOPMENT.md](packages/coding-agent/DEVELOPMENT.md).
 
+#### Plain local Windows application rebuild
+
+A plain local rebuild is separate from signed publication, scheduling, installation,
+PATH changes, and deployment. From the maintained OMP checkout, compile only the
+Windows x64 application with the pinned Bun executable:
+
+```powershell
+& 'C:\tools\bun\bun.exe' --no-env-file scripts/ci-release-build-binaries.ts --targets win32-x64
+```
+
+The coordinator checkout provides a wrapper when a fresh external output
+directory plus build provenance is wanted:
+
+```powershell
+& 'D:\Projects\omp-session-coordinator\Build-LocalOmp.ps1' `
+  -OmpRoot 'D:\Projects\The-AutoBot-oh-my-pi' `
+  -BunPath 'C:\tools\bun\bun.exe' `
+  -OutputDirectory 'D:\builds\omp-local'
+```
+
+The wrapper accepts only those three inputs. It does not install dependencies,
+build Rust/Cargo code, or build the coordinator. It reuses
+`OmpRoot\packages\natives\native`, requires
+`pi_natives.win32-x64-baseline.node`, accepts the compatible modern sibling
+when present, and fails rather than repairing missing or incompatible native
+inputs. Reused native files are validated against the exact
+`packages/natives` version sentinel and recorded by filename, version, variant,
+size, and SHA-256 with origin `local-reuse` and `producerSourceCommit: null`;
+a matching package version must never be described as proof that the native
+bytes came from the current source.
+
+The output directory must not already exist and is created only after every
+check succeeds. It contains only `omp.exe` and `build-provenance.json`; the
+provenance records the executable SHA-256 fingerprint and source provenance.
+The standalone smoke checks the copied executable's exact `--version`,
+`--help`, and `--smoke-test` in a fresh isolated profile with
+`PI_NATIVE_VARIANT=baseline`. It does not claim or validate the managed
+`--autobot-build-identity` used by signed releases, and it does not install or
+activate the executable. Broad lint, type, and test suites remain normal CI
+responsibilities rather than per-build prerequisites.
+
+When Rust/native implementation, native ABI, or the runtime/SDK/broker protocol
+contract actually changes, use a clean matching-source native rebuild and the
+project's normal CI qualification. Reusing native inputs is only the
+application-only path; it does not relax maintenance requirements for native or
+protocol changes.
+
+#### Install an application-only build into a plain legacy runtime
+
+Installation is a separate, explicit legacy-only operation. The coordinator
+installer accepts only the fresh two-file output above: `omp.exe` plus the
+schema-2 `build-provenance.json` with kind
+`local-omp-application-build`. It validates the exact application-build
+provenance shape, including source and reused-native provenance, and verifies
+the executable's declared filename, version, size, and SHA-256 against its
+actual bytes before touching the destination.
+
+```powershell
+& 'D:\Projects\omp-session-coordinator\Install-LocalOmp.ps1' `
+  -BuildDirectory 'D:\builds\omp-local' `
+  -Destination 'C:\Users\you\AppData\Local\omp\omp.exe'
+```
+
+The destination must already be a plain, regular legacy `omp.exe`. The
+installer refuses reparse paths and every destination beneath a managed
+`.autobot` marker, stages on the destination volume, rechecks the destination
+at the replacement boundary, and retains the original executable as a unique
+same-directory backup. It installs only `omp.exe`; it does not alter `PATH`,
+touch running processes, or install coordinator extension or SDK assets.
+Fully exit and restart the legacy CLI separately.
+
+This route is not a substitute for the signed managed installer below. Managed
+runtimes, immutable bootstrap state, and matching coordinator extension/SDK
+compatibility remain part of the signed release topology and must be installed
+or migrated through that reviewed managed path.
+
+
 ### AutoBot managed operations
 
 AutoBot is a separate, operator-managed distribution path for a signed `omp`
@@ -651,19 +728,45 @@ fields in [`scripts/autobot-local-types.ts`](scripts/autobot-local-types.ts)'s
 fields are rejected):
 
 - Source inputs: `repository` is `The-AutoBot/oh-my-pi`; set distinct
-  `canonicalBranch` and `integrationBranch`, plus credential-free HTTPS
-  `upstreamRepository` and a fully qualified `upstreamRef`. The controller
-  keeps an owned persistent repository and worktree under the private,
+  `canonicalBranch` and `integrationBranch`, plus a credential-free
+  `https://github.com/<owner>/<repository>.git` `upstreamRepository`.
+  `upstreamRef` is either `latest-release` (resolved once per run to the latest
+  published, non-draft, non-prerelease GitHub release) or an exact
+  `refs/tags/<tag>` whose GitHub release is published and stable. Branch refs,
+  including `refs/heads/main`, are rejected. The controller pins and
+  revalidates that exact selected tag's peeled commit and coding-agent package
+  version; a newer release appearing during the run does not move the pin.
+  If the retained upstream commit is ahead of or incomparable with that
+  official release, the run fails closed until a published descendant exists;
+  it never relabels newer maintained ancestry as an older release.
+  It keeps an owned persistent repository and worktree under the private,
   absolute `workRoot`; it must be separate from the trusted producer checkout.
+  Prefer a short directory directly under your user profile: deeply nested
+  paths can exceed the Windows runtime smoke test's local socket-path limit
+  even when ordinary file paths are valid.
+  The controller no longer owns or permits the retired `workRoot\cargo-target`
+  cache. An existing work root that still contains it fails ownership
+  validation until the operator removes or migrates that obsolete cache; there
+  is no compatibility mode.
 - Pinned executables: set existing absolute `runnerBun` and `compilerBun`
   paths and their exact `runnerBunVersion` and `compilerBunVersion`, plus the
   existing absolute `ompExecutable`. Both configured Bun executables are
   checked against their pins on each run.
-- Coordinator and signing inputs: `coordinatorRoot` names a distinct clean,
-  committed coordinator checkout with a credential-free HTTPS origin.
-  `keyId`, `privateKeyPath`, and `publicKeyPath` identify existing signing
-  material. Keep the private-key path and this configuration private; do not
-  put key bytes in the file.
+- Native, coordinator, and signing inputs: set required
+  `nativeAddonDirectory` to an existing absolute directory of
+  operator-trusted add-on files. The compatible
+  `pi_natives.win32-x64-baseline.node` is required and its modern sibling is
+  optional. The publisher validates the exact `packages/natives` version
+  sentinel and canonical regular, non-reparse inputs, stages them into the
+  isolated candidate `native` directory, verifies copied-byte hash equality,
+  and records filename, version, variant, size, SHA-256, origin `local-reuse`,
+  and `producerSourceCommit: null`. Source-commit equivalence is unknown and is
+  never inferred from a matching version. Missing or incompatible inputs fail
+  the run and are not offered to OMP as a source repair.
+  `coordinatorRoot` names a distinct clean, committed coordinator
+  checkout with a credential-free HTTPS origin. `keyId`, `privateKeyPath`, and
+  `publicKeyPath` identify existing signing material. Keep the private-key path
+  and this configuration private; do not put key bytes in the file.
 - Channel and bounds: set `channelRepository`, `channelBranch`, and relative
   `channelPath`; the channel branch cannot be the protected canonical or
   integration branch. `allowInitial` is `false` unless deliberately authorizing
@@ -691,8 +794,42 @@ structural outcomes in a fixed journal below the owner-private work root.
 Records contain only fixed stage, command-kind, and outcome values; timeout
 state; a numeric exit code when known; and a bounded duration. They never
 contain command arguments, child streams, environment values, prompts,
-credentials, URLs, or error text. The journal does not alter launcher stream
-suppression or print diagnostic contents.
+credentials, URLs, or error text. Candidate build/check commands that
+explicitly opt in may also retain only the newest eight redacted stdout/stderr
+records in a separate private journal. Each stream preserves up to a 24 KiB
+head and 8 KiB tail with an explicit omission marker, so final failure context
+is not discarded; the serialized journal is capped at 1 MiB and evicts its
+oldest records before writing. URLs, sensitive assignments, known credential
+values, and common token/key formats are redacted before persistence; all
+other publisher, Git, signing, GitHub, and OMP output remains suppressed.
+
+An explicit rehearsal prepares the candidate only in the owned worktree and
+runs the same application-only compilation, asset assembly, signing, and
+focused local verification used by publication, but does not push integration,
+create or update tags/releases, or advance the signed channel:
+
+```powershell
+& .\scripts\Invoke-AutoBotLocalBuild.ps1 `
+  -ConfigPath 'C:\secure\autobot-local.json' `
+  -BunPath 'C:\tools\bun\bun.exe' `
+  -VerifyOnly
+```
+
+To promote one explicitly selected preserved stage without rebuilding,
+re-signing, or selecting the latest release again, pass its absolute directory.
+The retained controller state, release plan, committed candidate HEAD, pinned
+upstream release tag/commit/version, and signed stage must all describe the
+same candidate:
+
+```powershell
+& .\scripts\Invoke-AutoBotLocalBuild.ps1 `
+  -ConfigPath 'C:\secure\autobot-local.json' `
+  -BunPath 'C:\tools\bun\bun.exe' `
+  -PublishPrepared 'C:\secure\autobot-work\autobot-release-selected'
+```
+
+The two explicit modes are mutually exclusive. Omitting both retains the
+normal guarded publish route.
 
 To register, but not start, the dedicated hourly task:
 
@@ -711,24 +848,34 @@ Each run pins the protected canonical branch and upstream input, then updates
 only its owned persistent integration worktree. It retains the committed
 producer, canonical, and upstream ancestry in a candidate merge before
 pushing the dedicated integration branch. OMP is invoked only to resolve an
-integration conflict, review a sensitive compatibility change, or repair a
-candidate build/check failure. Its zero exit is not trusted alone: afterward
-the controller independently checks the worktree, ancestry, refs, and remote
-snapshot. Added remotes or unexpected ref changes fail validation; the controller
-commits accepted fixes while retaining candidate ancestry.
-Candidate failures may consume only the configured OMP attempts; other
-failures block the run rather than being repaired or retried.
+integration conflict or review a sensitive compatibility change; missing or
+incompatible reused native inputs and application-build failures are not
+treated as source-repair loops. OMP's zero exit is not trusted alone:
+afterward the controller independently checks the worktree, ancestry, refs,
+and remote snapshot. Added remotes or unexpected ref changes fail validation;
+the controller commits accepted fixes while retaining candidate ancestry.
+Failures outside the explicitly reviewable integration cases block the run
+rather than being repaired or retried.
 
-The publisher validates the clean committed candidate, exact pinned tools, and
-the signed predecessor before building the Windows x64 quartet: runtime and
-bootstrap (`win32-x64`), coordinator client (`universal`), and collab web
-bundle (`web`). It performs focused candidate checks and fresh-home runtime
-smokes, signs and verifies the local bundle, and creates or confirms the exact
-candidate tag without force before creating a draft. It downloads and verifies
-the uploaded bytes independently, publishes that verified draft, and advances
-the signed channel last. Channel predecessor checks compare raw committed Git
-blobs, not checkout bytes affected by line-ending conversion. It does not install
-a runtime, change PATH, or deploy the coordinator.
+The publisher validates the clean committed candidate, exact pinned tools,
+trusted reused native inputs, and the signed predecessor before compiling the
+Windows x64 application only. It does not run Cargo or rebuild native add-ons.
+It also builds the immutable bootstrap, relay/collab web bundle, and matching
+coordinator SDK/client JavaScript required by the existing four-asset signed
+topology. Broad lint, type, and test suites belong to normal CI, not every
+local publication build. The publisher retains focused exact-version,
+managed `--autobot-build-identity`, help, fresh-profile, and baseline-native
+smokes, then signs and
+verifies the local quartet and creates or confirms the exact candidate tag
+without force before creating a draft. It independently downloads and verifies
+uploaded bytes, publishes only that verified draft, and advances the signed
+channel last. Authentication, admission, signature, integrity, provenance,
+asset-topology, predecessor, immutable-prepared-publication, independent
+download, safe-idle, and recovery checks remain mandatory. Channel predecessor
+checks compare raw committed Git
+blobs, not checkout bytes affected by line-ending conversion. Publication
+does not install a runtime, change PATH, schedule a task, or deploy the
+coordinator.
 
 To recover a preserved signed stage, a reviewed operator can call
 `publishPreparedLocalRelease(config, candidate, preservedStageRoot, recorder)`

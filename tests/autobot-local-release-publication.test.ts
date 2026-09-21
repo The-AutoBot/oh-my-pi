@@ -220,6 +220,13 @@ if (process.platform === "win32" && process.arch === "x64") {
 			testTimeoutMilliseconds,
 		);
 		test(
+			"advances the channel for an exact already-published retained release without replacing its assets",
+			async () => {
+				await runScenario("published-promotion", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+		test(
 			"compares a subsequent signed-channel predecessor as committed bytes when autocrlf rewrites the checkout",
 			async () => {
 				await runScenario("subsequent-autocrlf", requireGhExecutable());
@@ -235,6 +242,7 @@ if (process.platform === "win32" && process.arch === "x64") {
 			"unsafe-stage",
 			"foreign-modify-acl",
 			"contradictory-manifest",
+			"invalid-provenance",
 		])(
 			"preserves draft, tag, and channel state at the %s boundary",
 			async scenario => {

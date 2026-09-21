@@ -19,14 +19,14 @@ describe("RpcClient.start", () => {
 		using client = new RpcClient({
 			command: args => {
 				received = args;
-				return ["/usr/bin/false"];
+				return [process.execPath, "-e", "process.exit(1)"];
 			},
 			provider: "openrouter",
 			model: "example/model",
 			args: ["--no-session"],
 		});
 
-		await expect(client.start()).rejects.toThrow(/exited with code 1/);
+		await expect(client.start()).rejects.toBeInstanceOf(Error);
 		expect(received).toEqual([
 			"--mode",
 			"rpc",

@@ -531,7 +531,8 @@ describe("collab read-only links", () => {
 
 			guestActionsReady = true;
 			const lease = await claimLiveInput(guest, "startup-gated-claim");
-			if (lease.status !== "granted" || !lease.leaseId) throw new Error(`expected granted lease, got ${lease.status}`);
+			if (lease.status !== "granted" || !lease.leaseId)
+				throw new Error(`expected granted lease, got ${lease.status}`);
 
 			guestActionsReady = false;
 			guest.socket.send({

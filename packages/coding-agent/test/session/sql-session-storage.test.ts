@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 
@@ -69,15 +70,20 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
-	it("listFilesSync returns only direct children matching the glob", async () => {
+	it("listFilesSync honors Windows directory boundaries for indexed and memory storage", async () => {
 		const { client, storage } = await createSqlite();
-		await storage.writeText("/dir/a.jsonl", "x");
-		await storage.writeText("/dir/b.jsonl", "y");
-		await storage.writeText("/dir/sub/c.jsonl", "z"); // nested — not a direct child
-		await storage.writeText("/dir/note.bak", "skip");
+		const memory = new MemorySessionStorage();
+		const dir = "C:\\sessions\\project";
+		const directChildren = [`${dir}\\a.jsonl`, `${dir}\\b.jsonl`];
+		const paths = [...directChildren, `${dir}\\nested\\c.jsonl`, `${dir}-sibling\\d.jsonl`, `${dir}\\note.bak`];
 
-		expect(storage.listFilesSync("/dir", "*.jsonl").sort()).toEqual(["/dir/a.jsonl", "/dir/b.jsonl"]);
-		expect(storage.listFilesSync("/dir", "*.bak")).toEqual(["/dir/note.bak"]);
+		for (const target of [storage, memory]) {
+			for (const filePath of paths) await target.writeText(filePath, "x");
+
+			expect(target.listFilesSync(dir, "*.jsonl").sort()).toEqual(directChildren);
+			expect(target.listFilesSync(`${dir}\\`, "*.jsonl").sort()).toEqual(directChildren);
+			expect(target.listFilesSync(dir, "*.bak")).toEqual([`${dir}\\note.bak`]);
+		}
 		await client.end();
 	});
 

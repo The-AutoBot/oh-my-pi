@@ -1144,11 +1144,16 @@ export class MemorySessionStorage implements SessionStorage {
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
-		const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+		const trailingSeparator = dir.endsWith("/") || dir.endsWith("\\");
+		const prefixLength = dir.length + (trailingSeparator ? 0 : 1);
 		const files: string[] = [];
 		for (const path of this.#files.keys()) {
-			if (!path.startsWith(prefix)) continue;
-			const name = path.slice(prefix.length);
+			if (!path.startsWith(dir)) continue;
+			if (!trailingSeparator) {
+				const separator = path[dir.length];
+				if (separator !== "/" && separator !== "\\") continue;
+			}
+			const name = path.slice(prefixLength);
 			if (name.includes("/") || name.includes("\\")) continue;
 			if (!matchesPattern(name, pattern)) continue;
 			files.push(path);

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import {
 	AutoBotRuntime,
+	type AutoBotCoordinatorPreflight,
 	createAutoBotCandidateArgs,
 	createAutoBotRestartLaunchContext,
 	parseAutoBotRestartLaunchContext,
@@ -42,9 +43,30 @@ const request: AutoBotRestartRequest = {
 	},
 };
 
+type RuntimeSession = ConstructorParameters<typeof AutoBotRuntime>[0];
+type RuntimeMode = ConstructorParameters<typeof AutoBotRuntime>[2];
+
+type PreflightSession = Pick<RuntimeSession, "getEvalKernelOwnerId"> & {
+	readonly sessionManager: Pick<
+		RuntimeSession["sessionManager"],
+		"isSessionOnDisk" | "getSessionId" | "getCwd" | "flush"
+	>;
+	readonly autoBotUpdateCoordinator: Pick<
+		NonNullable<RuntimeSession["autoBotUpdateCoordinator"]>,
+		"canPrepare" | "prepare"
+	>;
+};
+
+type PreflightMode = Pick<
+	RuntimeMode,
+	"getAutoBotUpdateDeferralReason" | "beginAutoBotUpdateAdmission" | "mcpManager"
+> & {
+	readonly collabController: Pick<RuntimeMode["collabController"], "canPrepareUpdate">;
+};
+
 function runtimeForPreflight(
 	isCollabSafe: () => boolean,
-	canPrepare: () => Promise<{ readonly canPrepare: boolean }>,
+	canPrepare: () => Promise<AutoBotCoordinatorPreflight>,
 	onReservation: () => void,
 ): AutoBotRuntime {
 	const session = {
@@ -64,7 +86,7 @@ function runtimeForPreflight(
 				throw new Error("read-only preflight must not reserve the coordinator");
 			},
 		},
-	};
+	} satisfies PreflightSession;
 	const mode = {
 		getAutoBotUpdateDeferralReason: () => undefined,
 		beginAutoBotUpdateAdmission: () => {
@@ -73,18 +95,18 @@ function runtimeForPreflight(
 		collabController: {
 			canPrepareUpdate: () => (isCollabSafe() ? { safe: true } : { safe: false, reason: "guest-incompatible" }),
 		},
-	};
+	} satisfies PreflightMode;
 	return new AutoBotRuntime(
-		session as ConstructorParameters<typeof AutoBotRuntime>[0],
+		session as unknown as RuntimeSession,
 		parseArgs([]),
-		mode as ConstructorParameters<typeof AutoBotRuntime>[2],
+		mode as unknown as RuntimeMode,
 		undefined,
 	);
 }
 
 test("AutoBot preflight defers without reserving when browser safety changes during coordinator preflight", async () => {
 	const preflightStarted = Promise.withResolvers<void>();
-	const preflight = Promise.withResolvers<{ readonly canPrepare: boolean }>();
+	const preflight = Promise.withResolvers<AutoBotCoordinatorPreflight>();
 	let collabSafe = true;
 	let reservations = 0;
 	const runtime = runtimeForPreflight(
@@ -116,7 +138,15 @@ test("AutoBot restart capsule rejects nonpersistent credential and prompt overri
 });
 
 test("AutoBot candidate args restore only safe effective launch state", () => {
-	const args = parseArgs(["--no-lsp", "--no-pty", "--approval-mode", "write", "--config", "/tmp/config.yml", "ignored prompt"]);
+	const args = parseArgs([
+		"--no-lsp",
+		"--no-pty",
+		"--approval-mode",
+		"write",
+		"--config",
+		"/tmp/config.yml",
+		"ignored prompt",
+	]);
 	const context = createAutoBotRestartLaunchContext(args);
 	expect(context).toBeDefined();
 	const parsed = parseAutoBotRestartLaunchContext(context!, request.target, {
@@ -153,10 +183,12 @@ test("AutoBot candidate rejects a coordinator reservation for another release", 
 	});
 	expect(context).toBeDefined();
 	const incompatible = { ...request.target, releaseSequence: request.target.releaseSequence + 1 };
-	expect(parseAutoBotRestartLaunchContext(context!, incompatible, {
-		target: incompatible,
-		predecessorTarget: request.predecessorTarget,
-	})).toBeUndefined();
+	expect(
+		parseAutoBotRestartLaunchContext(context!, incompatible, {
+			target: incompatible,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toBeUndefined();
 });
 
 test("AutoBot candidate treats coordinator expiry as diagnostic, not a cross-clock deadline", () => {
@@ -173,10 +205,12 @@ test("AutoBot candidate treats coordinator expiry as diagnostic, not a cross-clo
 		handoff: { manualRoom: "preserve", collab: "preserve" },
 	});
 	expect(context).toBeDefined();
-	expect(parseAutoBotRestartLaunchContext(context!, request.target, {
-		target: request.target,
-		predecessorTarget: request.predecessorTarget,
-	})).toEqual(context);
+	expect(
+		parseAutoBotRestartLaunchContext(context!, request.target, {
+			target: request.target,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toEqual(context);
 });
 
 test("AutoBot fallback capsule binds the failed target while restoring the recorded predecessor", () => {
@@ -196,17 +230,23 @@ test("AutoBot fallback capsule binds the failed target while restoring the recor
 		{ wasHosting: true, access: "view" },
 	);
 	expect(context).toBeDefined();
-	expect(parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
-		target: request.target,
-		predecessorTarget: request.predecessorTarget,
-	})).toEqual(context);
-	expect(parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
-		target: request.predecessorTarget,
-		predecessorTarget: request.predecessorTarget,
-	})).toBeUndefined();
-	expect(parseAutoBotRestartLaunchContext(
-		{ ...context!, collab: { wasHosting: true } } as unknown as JsonValue,
-		request.predecessorTarget,
-		{ target: request.target, predecessorTarget: request.predecessorTarget },
-	)).toBeUndefined();
+	expect(
+		parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
+			target: request.target,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toEqual(context);
+	expect(
+		parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
+			target: request.predecessorTarget,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toBeUndefined();
+	expect(
+		parseAutoBotRestartLaunchContext(
+			{ ...context!, collab: { wasHosting: true } } as unknown as JsonValue,
+			request.predecessorTarget,
+			{ target: request.target, predecessorTarget: request.predecessorTarget },
+		),
+	).toBeUndefined();
 });

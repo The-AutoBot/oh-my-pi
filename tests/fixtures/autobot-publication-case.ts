@@ -6,7 +6,10 @@ import { AUTO_BOT_COMPATIBILITY_EPOCH } from "../../packages/coding-agent/src/au
 import { ensureAutoBotPrivateDirectory } from "../../packages/coding-agent/src/autobot-update/permissions.ts";
 import { createManagedBundle, deriveManagedBundleId } from "../../scripts/autobot-release-web.ts";
 import { COORDINATOR_CLIENT_FILENAME } from "../../scripts/autobot-release-coordinator.ts";
-import { publishPreparedLocalRelease } from "../../scripts/autobot-local-release.ts";
+import {
+	admitPreparedLocalRelease,
+	publishPreparedLocalRelease,
+} from "../../scripts/autobot-local-release.ts";
 import type { LocalAutomationConfig, LocalCandidate } from "../../scripts/autobot-local-types.ts";
 import type { LocalCommandDiagnosticRecord, LocalCommandRecorder } from "../../scripts/autobot-local.ts";
 
@@ -69,12 +72,14 @@ try {
 	const channelSeed = path.join(root, "channel-seed");
 	const channelGit = path.join(root, "channel.git");
 	const coordinator = path.join(root, "coordinator");
+	const nativeAddonDirectory = path.join(root, "native-input");
 	for (const repository of [source, channelSeed, coordinator]) {
 		await fs.mkdir(repository);
 		git(repository, "init", "-b", "main");
 		git(repository, "config", "user.name", "Fixture Publisher");
 		git(repository, "config", "user.email", "publisher@example.invalid");
 	}
+	await fs.mkdir(nativeAddonDirectory);
 	await write(path.join(source, "package.json"), '{"name":"fixture","version":"18.2.3"}\n');
 	await write(path.join(source, "upstream.txt"), "upstream\n");
 	const upstreamCommit = commit(source, "upstream");
@@ -286,7 +291,12 @@ try {
 		await fs.copyFile(path.join(bundle, metadata), path.join(assets, metadata));
 	for (const entry of await fs.readdir(path.join(bundle, "assets")))
 		await fs.copyFile(path.join(bundle, "assets", entry), path.join(assets, entry));
-	const draft = { tag_name: tag, draft: true, target_commitish: forkCommit, assets };
+	const draft = {
+		tag_name: tag,
+		draft: scenario !== "published-promotion",
+		target_commitish: forkCommit,
+		assets,
+	};
 	const releases = scenario === "fresh" ? [] : [draft];
 	if (subsequent) {
 		if (!previousBundle) throw new Error("subsequent release fixture omitted its predecessor");
@@ -321,6 +331,7 @@ try {
 	};
 	if (scenario === "foreign-draft") draft.target_commitish = upstreamCommit;
 	if (scenario === "tampered-asset") await fs.appendFile(path.join(assets, "manifest.json"), "tamper");
+	if (scenario === "invalid-provenance") await write(path.join(bundle, "provenance.json"), "{}\n");
 	if (scenario === "contradictory-manifest") {
 		const manifestPath = path.join(bundle, "manifest.json");
 		const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as Record<string, unknown>;
@@ -403,6 +414,7 @@ try {
 		runnerBunVersion: Bun.version,
 		compilerBun: process.execPath,
 		compilerBunVersion: Bun.version,
+		nativeAddonDirectory,
 		ompExecutable: process.execPath,
 		coordinatorRoot: coordinator,
 		keyId: "fixture",
@@ -438,6 +450,15 @@ try {
 	const beforeChannel = git(channelGit, "rev-parse", "refs/heads/main");
 	let failure: unknown;
 	try {
+		const admitted = await admitPreparedLocalRelease(config, selectedStage, source, recorder);
+		if (
+			admitted.forkCommit !== candidate.forkCommit ||
+			admitted.upstreamCommit !== candidate.upstreamCommit ||
+			admitted.upstreamVersion !== candidate.upstreamVersion ||
+			admitted.compatibilityEpoch !== candidate.compatibilityEpoch
+		) {
+			throw new Error("prepared admission returned the wrong candidate identity");
+		}
 		await publishPreparedLocalRelease(config, candidate, selectedStage, recorder);
 	} catch (error) {
 		failure = error;
@@ -451,6 +472,7 @@ try {
 		"unsafe-stage",
 		"foreign-modify-acl",
 		"contradictory-manifest",
+		"invalid-provenance",
 	].includes(scenario);
 	if (rejecting) {
 		if (!failure) throw new Error(`${scenario} unexpectedly published`);
@@ -479,13 +501,21 @@ try {
 		const envelopeBytes = Buffer.from(await fs.readFile(path.join(bundle, "signed-envelope.json")));
 		if (!Buffer.from(channel.stdout).equals(envelopeBytes))
 			throw new Error("channel bytes differ from verified envelope");
+		const recoveryMutations = finalState.log.filter(
+			value => value.startsWith("upload:") || value.startsWith("create:") || value.startsWith("publish:"),
+		);
 		if (
 			scenario === "matching" &&
-			finalState.log.some(value => value.startsWith("upload:") || value.startsWith("create:"))
-		)
-			throw new Error("matching recovery replaced draft assets");
+			(recoveryMutations.length !== 1 || recoveryMutations[0] !== `publish:${tag}`)
+		) {
+			throw new Error("exact retained-draft recovery did not perform exactly the required publication");
+		}
+		if (scenario === "published-promotion" && recoveryMutations.length !== 0) {
+			throw new Error("exact published recovery replaced assets or republished the release");
+		}
 		if (
 			scenario !== "matching" &&
+			scenario !== "published-promotion" &&
 			(!finalState.log.includes(`tag-exact-at-create:${tag}`) || !finalState.log.includes(`create:${tag}`))
 		) {
 			throw new Error("draft creation did not observe the exact release tag target");
@@ -493,19 +523,15 @@ try {
 	}
 	const forbidden: Record<string, true> = {
 		"release-plan": true,
-		"baseline-native-addon-build": true,
+		"native-addon-reuse-check": true,
 		"candidate-dependency-installation": true,
 		"browser-relay-build": true,
 		"collab-web-build": true,
 		"runtime-compilation": true,
-		"runtime-version-check": true,
 		"runtime-smoke-test": true,
+		"compiled-runtime-application-check": true,
+		"runner-loader-compatibility-check": true,
 		"bootstrap-compilation": true,
-		"focused-coding-agent-runtime-checks": true,
-		"focused-collab-web-checks": true,
-		"focused-release-contract-checks": true,
-		"focused-installer-contract-checks": true,
-		"candidate-environment-isolation-checks": true,
 		"coordinator-sdk-preparation": true,
 		"coordinator-extension-build": true,
 		"release-assembly": true,

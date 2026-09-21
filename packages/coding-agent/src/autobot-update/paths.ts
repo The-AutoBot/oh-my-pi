@@ -84,7 +84,11 @@ export function autoBotBootstrapSlotPath(paths: AutoBotPaths, slotId: string): s
 	return path.join(paths.bootstrapDir, slotId);
 }
 
-export function autoBotHandoffPath(paths: AutoBotPaths, nonce: string, role: "candidate" | "fallback" = "candidate"): string {
+export function autoBotHandoffPath(
+	paths: AutoBotPaths,
+	nonce: string,
+	role: "candidate" | "fallback" = "candidate",
+): string {
 	if (!/^[A-Za-z0-9_-]{32,128}$/.test(nonce)) throw new Error("Invalid AutoBot handoff nonce");
 	return path.join(paths.handoffDir, `${nonce}.${role}.json`);
 }

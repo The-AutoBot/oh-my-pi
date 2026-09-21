@@ -668,7 +668,8 @@ async function runInteractiveMode(
 		// Dynamic import keeps the heavy wizard/TUI dependency graph out of normal
 		// and protected startup unless setup UI is actually required.
 		setupWizard =
-			!protectedAutoBotStartup && (forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash)
+			!protectedAutoBotStartup &&
+			(forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash)
 				? await import("./modes/setup")
 				: undefined;
 		setupScenes = setupWizard
@@ -1296,8 +1297,9 @@ export async function buildSessionOptions(
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
 ): Promise<CreateAgentSessionOptions> {
+	const cwd = parsed.cwd ?? getProjectDir();
 	const options: CreateAgentSessionOptions = {
-		cwd: parsed.cwd ?? getProjectDir(),
+		cwd,
 		autoApprove: parsed.autoApprove ?? false,
 	};
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));
@@ -1681,7 +1683,7 @@ export async function buildSessionOptions(
 				const alreadyConfigured = configuredExtensionPaths.some(extensionPath => {
 					try {
 						return (
-							normalizePathForComparison(path.resolve(options.cwd, extensionPath)) === canonicalCoordinatorClientPath
+							normalizePathForComparison(path.resolve(cwd, extensionPath)) === canonicalCoordinatorClientPath
 						);
 					} catch {
 						return false;
@@ -1737,10 +1739,7 @@ export async function runRootCommand(
 		autoBotFallback = startupHandoff?.role === "fallback" ? startupHandoff.fallback : undefined;
 		autoBotRequest = autoBotCandidate?.request ?? autoBotFallback?.request;
 		if (autoBotRequest) {
-			if (
-				autoBotRequest.profile !== getActiveProfile() ||
-				!requestMatchesEmbeddedRelease(autoBotRequest)
-			) {
+			if (autoBotRequest.profile !== getActiveProfile() || !requestMatchesEmbeddedRelease(autoBotRequest)) {
 				if (autoBotCandidate) {
 					await rejectAutoBotCandidate(autoBotCandidate);
 					return;
@@ -1838,7 +1837,8 @@ export async function runRootCommand(
 		// See getDbBusyTimeoutMs().
 		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
 		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-		const pipedInput = autoBotRequest || isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+		const pipedInput =
+			autoBotRequest || isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
 		const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 		const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 		// Only the interactive host renders a focusable Agent Hub / subagent session
@@ -2002,74 +2002,74 @@ export async function runRootCommand(
 				cwd = autoBotRequest.cwd;
 			} else {
 				foreignSource = resolveForeignSessionSource(parsedArgs);
-			if (foreignSource) {
-				if (isProtocolMode) {
-					throw new SessionResolutionError(`--from-${foreignSource} is not supported in ${mode} mode`);
-				}
-				const sourceName = foreignSessionSourceName(foreignSource);
-				const store = (deps.createForeignSessionStore ?? createForeignSessionStore)(foreignSource);
-				let foreignSessions: ForeignSessionInfo[];
-				try {
-					foreignSessions = await logger.time(`list${sourceName}Sessions`, () => store.list());
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					throw new SessionResolutionError(`Failed to list ${sourceName} sessions: ${message}`);
-				}
-				if (foreignSessions.length === 0) {
-					writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} sessions found`)}\n`);
-					stopStartupWatchdog();
-					process.exit(0);
-				}
-				const choices = foreignSessions.map(foreignSessionInfoToSessionInfo);
-				pauseStartupWatchdog();
-				let selected: SessionInfo | null;
-				try {
-					const selectSessionImpl = deps.selectSession ?? (await loadSessionPicker());
-					selected = await logger.time(`select${sourceName}Session`, selectSessionImpl, choices, {
-						title: `Import ${sourceName} Session`,
-						scopeLabel: false,
-						showCwd: true,
-						allowDelete: false,
-						allowGlobalScope: false,
-						historySearch: false,
-					});
-				} finally {
-					resumeStartupWatchdog();
-				}
-				if (!selected) {
-					writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} session selected`)}\n`);
-					stopStartupWatchdog();
-					process.exit(0);
-				}
-				const foreignSession = foreignSessions.find(
-					session => session.id === selected.id && session.path === selected.path,
-				);
-				if (!foreignSession) {
-					throw new SessionResolutionError(`Selected ${sourceName} session is no longer available`);
-				}
-				try {
-					sessionManager = await logger.time(
-						`import${sourceName}Session`,
-						persistForeignSession,
-						store,
-						foreignSession,
-						{ fallbackCwd: cwd, sessionDir: parsedArgs.sessionDir },
+				if (foreignSource) {
+					if (isProtocolMode) {
+						throw new SessionResolutionError(`--from-${foreignSource} is not supported in ${mode} mode`);
+					}
+					const sourceName = foreignSessionSourceName(foreignSource);
+					const store = (deps.createForeignSessionStore ?? createForeignSessionStore)(foreignSource);
+					let foreignSessions: ForeignSessionInfo[];
+					try {
+						foreignSessions = await logger.time(`list${sourceName}Sessions`, () => store.list());
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						throw new SessionResolutionError(`Failed to list ${sourceName} sessions: ${message}`);
+					}
+					if (foreignSessions.length === 0) {
+						writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} sessions found`)}\n`);
+						stopStartupWatchdog();
+						process.exit(0);
+					}
+					const choices = foreignSessions.map(foreignSessionInfoToSessionInfo);
+					pauseStartupWatchdog();
+					let selected: SessionInfo | null;
+					try {
+						const selectSessionImpl = deps.selectSession ?? (await loadSessionPicker());
+						selected = await logger.time(`select${sourceName}Session`, selectSessionImpl, choices, {
+							title: `Import ${sourceName} Session`,
+							scopeLabel: false,
+							showCwd: true,
+							allowDelete: false,
+							allowGlobalScope: false,
+							historySearch: false,
+						});
+					} finally {
+						resumeStartupWatchdog();
+					}
+					if (!selected) {
+						writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} session selected`)}\n`);
+						stopStartupWatchdog();
+						process.exit(0);
+					}
+					const foreignSession = foreignSessions.find(
+						session => session.id === selected.id && session.path === selected.path,
 					);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					throw new SessionResolutionError(`Failed to import ${sourceName} session: ${message}`);
+					if (!foreignSession) {
+						throw new SessionResolutionError(`Selected ${sourceName} session is no longer available`);
+					}
+					try {
+						sessionManager = await logger.time(
+							`import${sourceName}Session`,
+							persistForeignSession,
+							store,
+							foreignSession,
+							{ fallbackCwd: cwd, sessionDir: parsedArgs.sessionDir },
+						);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						throw new SessionResolutionError(`Failed to import ${sourceName} session: ${message}`);
+					}
+				} else {
+					sessionManager = await logger.time(
+						"createSessionManager",
+						createSessionManager,
+						parsedArgs,
+						cwd,
+						settingsInstance,
+						promptMoveSession,
+						{ nativeFlagOwnership: "preliminary" },
+					);
 				}
-			} else {
-				sessionManager = await logger.time(
-					"createSessionManager",
-					createSessionManager,
-					parsedArgs,
-					cwd,
-					settingsInstance,
-					promptMoveSession,
-					{ nativeFlagOwnership: "preliminary" },
-				);
-			}
 			}
 		} catch (error: unknown) {
 			if (error instanceof SessionResolutionError) {
@@ -2078,7 +2078,12 @@ export async function runRootCommand(
 			throw error;
 		}
 
-		if (!autoBotRequest && (typeof parsedArgs.resume === "string" || foreignSource) && sessionManager && !parsedArgs.noSession) {
+		if (
+			!autoBotRequest &&
+			(typeof parsedArgs.resume === "string" || foreignSource) &&
+			sessionManager &&
+			!parsedArgs.noSession
+		) {
 			const previousCwd = cwd;
 			const recordedCwd = sessionManager.getRecordedCwd() ?? sessionManager.getCwd();
 			const resumedProject = await switchToResumedProject(
@@ -2287,7 +2292,9 @@ export async function runRootCommand(
 					extensionsResult.runtime.flagValues.set(name, value);
 				},
 			};
-			const initialArgs = autoBotRequest ? parsedArgs : (applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs);
+			const initialArgs = autoBotRequest
+				? parsedArgs
+				: (applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs);
 			if (!autoBotRequest) normalizeContinueSessionArgs(initialArgs, rawArgs);
 			try {
 				validateSessionPersistenceArgs(initialArgs);
@@ -2336,7 +2343,9 @@ export async function runRootCommand(
 			const showStartupSplash = shouldShowStartupSplash({
 				configured: settingsInstance.get("startup.showSplash"),
 				isInteractive,
-				resuming: autoBotRequest ? true : Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+				resuming: autoBotRequest
+					? true
+					: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
 				quiet: settingsInstance.get("startup.quiet"),
 				timing: !autoBotRequest && Boolean($env.PI_TIMING),
 				stdinIsTTY: process.stdin.isTTY,
@@ -2346,14 +2355,15 @@ export async function runRootCommand(
 			// Startup changelog is only consumed by interactive mode below; kick the
 			// CHANGELOG.md parse off now so it overlaps session creation instead of
 			// serializing after it.
-			const startupChangelogPromise = isInteractive && !autoBotRequest
-				? logger.time(
-						"main:getChangelogForDisplay",
-						getChangelogForDisplay,
-						parsedArgs,
-						settingsInstance.get("startup.changelogMode"),
-					)
-				: undefined;
+			const startupChangelogPromise =
+				isInteractive && !autoBotRequest
+					? logger.time(
+							"main:getChangelogForDisplay",
+							getChangelogForDisplay,
+							parsedArgs,
+							settingsInstance.get("startup.changelogMode"),
+						)
+					: undefined;
 
 			const {
 				session,
@@ -2606,7 +2616,9 @@ export async function runRootCommand(
 						setToolUIContext,
 						lspServers,
 						mcpManager,
-						autoBotRequest ? true : Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+						autoBotRequest
+							? true
+							: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
 						autoBotRequest ? false : deps.forceSetupWizard === true,
 						autoBotRequest ? false : showStartupSplash,
 						eventBus,

@@ -60,7 +60,6 @@ export {
 	AUTO_BOT_UPDATE_INTERVAL_MS,
 } from "./timing";
 
-
 export const AUTO_BOT_UNMANAGED_CUSTOM_BUILD_MESSAGE =
 	"This AutoBot runtime is not running under its verified signed bootstrap; upstream self-update is disabled.";
 
@@ -188,7 +187,11 @@ function assertMinimumRemainingHandoffTime(request: AutoBotRestartRequest, prepa
 	}
 }
 
-function stagedMatchesUpdate(staged: StagedAutoBotRelease, target: AutoBotRestartTarget, payloadSha256: string): boolean {
+function stagedMatchesUpdate(
+	staged: StagedAutoBotRelease,
+	target: AutoBotRestartTarget,
+	payloadSha256: string,
+): boolean {
 	return staged.payloadSha256 === payloadSha256 && sameAutoBotRestartTarget(restartTarget(staged.manifest), target);
 }
 
@@ -262,7 +265,6 @@ async function runUpdateCycle(
 		return stageVerifiedAutoBotRelease(paths, release);
 	});
 	if (!staged) return false;
-
 
 	const preparedAt = performance.now();
 	const prepared = await hooks.prepareRestart(target, predecessorTarget);
@@ -453,7 +455,7 @@ export function startAutoBotUpdates(hooks: AutoBotUpdateHooks): AutoBotUpdateHan
 				// activation acknowledgement and nonce/PID-bound promotion.
 				startPollingAfterAuthenticatedPromotion("candidate");
 			},
-			reject: (reason) => source.reject(reason),
+			reject: reason => source.reject(reason),
 		};
 		return handle({ candidate });
 	}

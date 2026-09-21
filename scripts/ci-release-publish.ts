@@ -144,7 +144,9 @@ if (prepareOnly && isDryRun) {
 function prepareOnlyTsgo(): string {
 	const executable = process.env[prepareOnlyTsgoEnvironment];
 	if (!executable || !path.isAbsolute(executable)) {
-		throw new Error(`--prepare-only requires ${prepareOnlyTsgoEnvironment} to name an absolute preinstalled tsgo executable`);
+		throw new Error(
+			`--prepare-only requires ${prepareOnlyTsgoEnvironment} to name an absolute preinstalled tsgo executable`,
+		);
 	}
 	return executable;
 }

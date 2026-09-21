@@ -106,11 +106,7 @@ function restartTargetForManifest(manifest: AutoBotReleaseManifest): AutoBotRest
 	};
 }
 
-function activePointer(
-	paths: AutoBotPaths,
-	releaseSequence: number,
-	slotId: string,
-): AutoBotActivePointer {
+function activePointer(paths: AutoBotPaths, releaseSequence: number, slotId: string): AutoBotActivePointer {
 	return {
 		schemaVersion: 1,
 		slotId,
@@ -186,34 +182,40 @@ function handoffInput(
 }
 
 afterEach(async () => {
-	await Promise.all(temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	await Promise.all(
+		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 });
 
 describe("AutoBot release replay fence", () => {
-	test("allows an exact repeat but rejects rollback and equivocation before staging", async () => {
-		const paths = autoBotPaths(await createTemporaryDirectory());
-		const accepted = releaseManifest(7);
-		const acceptedPayloadSha256 = "d".repeat(64);
-		await advanceAutoBotSequenceHighWater(paths, accepted, acceptedPayloadSha256);
+	test(
+		"allows an exact repeat but rejects rollback and equivocation before staging",
+		async () => {
+			const paths = autoBotPaths(await createTemporaryDirectory());
+			const accepted = releaseManifest(7);
+			const acceptedPayloadSha256 = "d".repeat(64);
+			await advanceAutoBotSequenceHighWater(paths, accepted, acceptedPayloadSha256);
 
-		await assertAutoBotSequenceAllowed(paths, accepted, acceptedPayloadSha256);
-		const rollbackError = await rejectionOf(
-			assertAutoBotSequenceAllowed(paths, releaseManifest(6), "e".repeat(64)),
-		);
-		expect(rollbackError.message).toContain("lower than the accepted high-water mark");
-		const equivocationError = await rejectionOf(
-			assertAutoBotSequenceAllowed(paths, releaseManifest(7), "e".repeat(64)),
-		);
-		expect(equivocationError.message).toContain("conflicts with the accepted signed payload");
+			await assertAutoBotSequenceAllowed(paths, accepted, acceptedPayloadSha256);
+			const rollbackError = await rejectionOf(
+				assertAutoBotSequenceAllowed(paths, releaseManifest(6), "e".repeat(64)),
+			);
+			expect(rollbackError.message).toContain("lower than the accepted high-water mark");
+			const equivocationError = await rejectionOf(
+				assertAutoBotSequenceAllowed(paths, releaseManifest(7), "e".repeat(64)),
+			);
+			expect(equivocationError.message).toContain("conflicts with the accepted signed payload");
 
-		const highWater = await readAutoBotSequenceHighWater(paths);
-		expect(highWater).toMatchObject({
-			releaseSequence: accepted.releaseSequence,
-			payloadSha256: acceptedPayloadSha256,
-		});
-		const runtimeDirectoryError = await rejectionOf(fs.lstat(paths.runtimeDir));
-		expect((runtimeDirectoryError as NodeJS.ErrnoException).code).toBe("ENOENT");
-	}, windowsFilesystemSecurityTestTimeoutMs);
+			const highWater = await readAutoBotSequenceHighWater(paths);
+			expect(highWater).toMatchObject({
+				releaseSequence: accepted.releaseSequence,
+				payloadSha256: acceptedPayloadSha256,
+			});
+			const runtimeDirectoryError = await rejectionOf(fs.lstat(paths.runtimeDir));
+			expect((runtimeDirectoryError as NodeJS.ErrnoException).code).toBe("ENOENT");
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot signed channel redirects", () => {
@@ -333,38 +335,47 @@ describe("AutoBot signed channel redirects", () => {
 });
 
 describe("AutoBot failed candidate quarantine", () => {
-	test("quarantines only the exact failed R43 release", async () => {
-		const paths = autoBotPaths(await createTemporaryDirectory());
-		const failedR43 = releaseManifest(43);
-		const newerR44 = releaseManifest(44);
+	test(
+		"quarantines only the exact failed R43 release",
+		async () => {
+			const paths = autoBotPaths(await createTemporaryDirectory());
+			const failedR43 = releaseManifest(43);
+			const newerR44 = releaseManifest(44);
 
-		await quarantineAutoBotRelease(paths, restartTargetForManifest(failedR43));
+			await quarantineAutoBotRelease(paths, restartTargetForManifest(failedR43));
 
-		expect(await isAutoBotReleaseQuarantined(paths, failedR43)).toBeTrue();
-		expect(await isAutoBotReleaseQuarantined(paths, newerR44)).toBeFalse();
-	}, windowsFilesystemSecurityTestTimeoutMs);
+			expect(await isAutoBotReleaseQuarantined(paths, failedR43)).toBeTrue();
+			expect(await isAutoBotReleaseQuarantined(paths, newerR44)).toBeFalse();
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot installation-wide active pointer", () => {
-	test("keeps an R42 session's predecessor independent from a newer global pointer", async () => {
-		const paths = autoBotPaths(await createTemporaryDirectory());
-		const r42Fallback = activePointer(paths, 42, "r42-fallback");
-		const r43 = activePointer(paths, 43, "r43");
-		const competingR43 = activePointer(paths, 43, "r43-competing");
+	test(
+		"keeps an R42 session's predecessor independent from a newer global pointer",
+		async () => {
+			const paths = autoBotPaths(await createTemporaryDirectory());
+			const r42Fallback = activePointer(paths, 42, "r42-fallback");
+			const r43 = activePointer(paths, 43, "r43");
+			const competingR43 = activePointer(paths, 43, "r43-competing");
 
-		expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r42Fallback);
-		expect(await advanceAutoBotActivePointer(paths, r43)).toEqual(r43);
+			expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r42Fallback);
+			expect(await advanceAutoBotActivePointer(paths, r43)).toEqual(r43);
 
-		const plan = planAutoBotLaunchUpdate(launchRelease(42), releaseManifest(44));
-		expect(plan).toMatchObject({
-			target: { releaseSequence: 44, handoffBudgetMs: 390_000 },
-			predecessorTarget: { releaseSequence: 42, handoffBudgetMs: 390_000 },
-		});
+			const plan = planAutoBotLaunchUpdate(launchRelease(42), releaseManifest(44));
+			expect(plan).toMatchObject({
+				target: { releaseSequence: 44, handoffBudgetMs: 390_000 },
+				predecessorTarget: { releaseSequence: 42, handoffBudgetMs: 390_000 },
+			});
 
-		expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r43);
-		expect(await advanceAutoBotActivePointer(paths, competingR43)).toEqual(r43);
-		expect(await readAutoBotActivePointer(paths)).toEqual(r43);
-	}, windowsFilesystemSecurityTestTimeoutMs);
+			expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r43);
+			expect(await advanceAutoBotActivePointer(paths, competingR43)).toEqual(r43);
+			expect(await readAutoBotActivePointer(paths)).toEqual(r43);
+		},
+		// Four pointer advances require repeated real Windows ACL subprocesses.
+		process.platform === "win32" ? 300_000 : undefined,
+	);
 });
 
 describe("AutoBot restart handoff contracts", () => {
@@ -403,9 +414,7 @@ describe("AutoBot restart handoff contracts", () => {
 		const predecessorTarget = restartTarget(42);
 		const request = restartRequestInput(candidateTarget, predecessorTarget);
 
-		expect(() =>
-			parseAutoBotHandoffRecord(handoffInput(request, { attemptedTarget: candidateTarget })),
-		).toThrow();
+		expect(() => parseAutoBotHandoffRecord(handoffInput(request, { attemptedTarget: candidateTarget }))).toThrow();
 		expect(() =>
 			parseAutoBotHandoffRecord(
 				handoffInput(request, {
@@ -572,7 +581,10 @@ describe("Managed AutoBot session environment", () => {
 		const home = await createTemporaryDirectory();
 		const project = await createTemporaryDirectory();
 		await fs.mkdir(path.join(home, ".env"));
-		await fs.writeFile(path.join(project, ".env"), "OMP_SESSION_BUS_ROLE=coordinator\nOMP_SESSION_BUS_NAME=project-name\n");
+		await fs.writeFile(
+			path.join(project, ".env"),
+			"OMP_SESSION_BUS_ROLE=coordinator\nOMP_SESSION_BUS_NAME=project-name\n",
+		);
 		const launchEnvironment: NodeJS.ProcessEnv = {
 			OMP_SESSION_BUS_ENDPOINT: "wss://inherited.example.test/bus",
 			OMP_SESSION_BUS_ROLE: "participant",

@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
@@ -23,14 +24,18 @@ function fakeUsage(input: number, output: number): Usage {
 		cost: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
 }
+function fixturePath(...segments: string[]): string {
+	return path.resolve(path.parse(process.cwd()).root, ...segments);
+}
 
 describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 	it("persists appended assistant messages into SQL and reloads via open()", async () => {
 		const client = new SQL("sqlite::memory:");
 		const storage = await SqlSessionStorage.create({ client });
-		const sessionDir = "/sessions/proj";
+		const cwd = fixturePath("cwd");
+		const sessionDir = fixturePath("sessions", "proj");
 
-		const manager = SessionManager.create("/cwd", sessionDir, storage);
+		const manager = SessionManager.create(cwd, sessionDir, storage);
 		manager.appendMessage({
 			role: "assistant",
 			provider: "anthropic",
@@ -45,7 +50,7 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		const sessionFile = manager.getSessionFile();
 		expect(sessionFile).toBeDefined();
 		const sessionFilePath = sessionFile as string;
-		expect(sessionFilePath.startsWith(sessionDir)).toBe(true);
+		expect(path.dirname(sessionFilePath)).toBe(sessionDir);
 
 		// `appendMessage` queues the cold-path rewrite onto SessionManager's
 		// internal persist chain via a fire-and-forget call. `flush()` awaits
@@ -81,9 +86,10 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 	it("SessionManager.list returns SQL-backed sessions for the cwd", async () => {
 		const client = new SQL("sqlite::memory:");
 		const storage = await SqlSessionStorage.create({ client });
-		const sessionDir = "/sessions/list-proj";
+		const cwd = fixturePath("cwd");
+		const sessionDir = fixturePath("sessions", "list-proj");
 
-		const a = SessionManager.create("/cwd", sessionDir, storage);
+		const a = SessionManager.create(cwd, sessionDir, storage);
 		a.appendMessage({
 			role: "assistant",
 			provider: "anthropic",
@@ -98,7 +104,7 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		await storage.drain();
 		await a.close();
 
-		const b = SessionManager.create("/cwd", sessionDir, storage);
+		const b = SessionManager.create(cwd, sessionDir, storage);
 		b.appendMessage({
 			role: "assistant",
 			provider: "anthropic",
@@ -118,7 +124,7 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		expect(aFile).toBeDefined();
 		expect(bFile).toBeDefined();
 
-		const sessions = await SessionManager.list("/cwd", sessionDir, storage);
+		const sessions = await SessionManager.list(cwd, sessionDir, storage);
 		const sessionFiles = sessions.map(s => s.path).sort();
 		expect(sessionFiles).toContain(aFile as string);
 		expect(sessionFiles).toContain(bFile as string);
@@ -128,13 +134,15 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 	it("rejects a stale rewrite after another SQL storage appends", async () => {
 		const client = new SQL("sqlite::memory:");
 		const firstStorage = await SqlSessionStorage.create({ client });
-		const first = SessionManager.create("/cwd", "/sessions/shared", firstStorage);
+		const cwd = fixturePath("cwd");
+		const sessionDir = fixturePath("sessions", "shared");
+		const first = SessionManager.create(cwd, sessionDir, firstStorage);
 		await first.ensureOnDisk();
 		const sessionFile = first.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 
 		const secondStorage = await SqlSessionStorage.create({ client });
-		const second = await SessionManager.open(sessionFile, "/sessions/shared", secondStorage);
+		const second = await SessionManager.open(sessionFile, sessionDir, secondStorage);
 		second.appendMessage({ role: "user", content: "durable SQL peer turn", timestamp: Date.now() });
 		await second.close();
 

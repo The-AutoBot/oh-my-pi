@@ -1,6 +1,6 @@
 import { OmpTypeError } from "./errors";
 import type { Def, EmbeddableSchema } from "./ir";
-import { type NarrowContext, type Type as OmpType, type ToJsonSchemaOptions, type } from "./type";
+import { type FluentType, type NarrowContext, type Type as OmpType, type ToJsonSchemaOptions, type } from "./type";
 
 export interface Meta {
 	title?: string;
@@ -81,7 +81,7 @@ export interface TSchema extends AnySchema {
 }
 
 /** Schema carrying a statically known type; every `TXxx` alias resolves here. */
-export type TTyped<T> = OmpType<T> & LegacyTypeBoxCompat<T>;
+export type TTyped<T> = FluentType<T> & LegacyTypeBoxCompat<T>;
 export type Static<T extends AnySchema> = T["infer"];
 export type TAny = TTyped<unknown>;
 export type TUnknown = TTyped<unknown>;
@@ -138,7 +138,7 @@ interface RuntimeType<T> extends OmpType<T> {
 	narrow<N extends T>(predicate: (value: T, ctx: NarrowContext) => value is N): RuntimeType<N>;
 	narrow(predicate: (value: T, ctx: NarrowContext) => boolean): RuntimeType<T>;
 }
-type CompatRuntime<T> = RuntimeType<T> & LegacyTypeBoxCompat<T>;
+type CompatRuntime<T> = RuntimeType<T> & TTyped<T>;
 
 type ObjectInfo = {
 	props: Record<string, AnySchema>;

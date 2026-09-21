@@ -18,9 +18,11 @@ const WINDOWS_SYSTEM_DIRECTORY =
 	process.platform === "win32"
 		? (() => {
 				const systemRoot = process.env.SystemRoot;
-				if (!systemRoot || !path.isAbsolute(systemRoot)) throw new Error("Windows SystemRoot is unavailable for AutoBot ACL verification");
+				if (!systemRoot || !path.isAbsolute(systemRoot))
+					throw new Error("Windows SystemRoot is unavailable for AutoBot ACL verification");
 				const resolved = path.resolve(systemRoot);
-				if (path.basename(resolved).toLowerCase() !== "windows") throw new Error("Windows SystemRoot is invalid for AutoBot ACL verification");
+				if (path.basename(resolved).toLowerCase() !== "windows")
+					throw new Error("Windows SystemRoot is invalid for AutoBot ACL verification");
 				return path.join(resolved, "System32");
 			})()
 		: "";
@@ -52,7 +54,8 @@ async function runTrustedWindowsTool(
 
 async function currentWindowsSid(): Promise<string> {
 	const result = await runTrustedWindowsTool(trustedWindowsSystemBinary("whoami.exe"), ["/user", "/fo", "csv", "/nh"]);
-	if (result.exitCode !== 0) throw new Error("Cannot determine the current Windows identity for AutoBot ACL verification");
+	if (result.exitCode !== 0)
+		throw new Error("Cannot determine the current Windows identity for AutoBot ACL verification");
 	const fields = result.stdout.trim().replace(/^"|"$/g, "").split('","');
 	const sid = fields.at(-1)?.trim();
 	if (!sid || !/^S-1-\d+(?:-\d+)+$/i.test(sid)) throw new Error("Windows identity query returned an invalid SID");
@@ -99,7 +102,7 @@ function parseWindowsAclSnapshot(value: unknown): WindowsAclSnapshot {
 		typeof parsed.daclPresent !== "boolean" ||
 		typeof parsed.sddl !== "string" ||
 		!rules.every(
-			(rule) =>
+			rule =>
 				typeof rule.sid === "string" &&
 				/^S-1-\d+(?:-\d+)+$/i.test(rule.sid) &&
 				Number.isInteger(rule.rights) &&
@@ -117,7 +120,7 @@ function parseWindowsAclSnapshot(value: unknown): WindowsAclSnapshot {
 		protected: parsed.protected,
 		daclPresent: parsed.daclPresent,
 		sddl: parsed.sddl,
-		rules: rules.map((rule) => ({ ...rule, sid: rule.sid.toUpperCase() })),
+		rules: rules.map(rule => ({ ...rule, sid: rule.sid.toUpperCase() })),
 	};
 }
 
@@ -148,8 +151,13 @@ async function readWindowsAcls(directories: readonly string[]): Promise<WindowsA
 	if (result.exitCode !== 0) throw new Error("Cannot inspect the Windows ACL protecting AutoBot files");
 	try {
 		const parsed = JSON.parse(result.stdout) as { sid?: unknown; entries?: unknown };
-		if (typeof parsed.sid !== "string" || !/^S-1-\d+(?:-\d+)+$/i.test(parsed.sid)) throw new Error("invalid SID response");
-		const entries = Array.isArray(parsed.entries) ? parsed.entries : parsed.entries === undefined ? [] : [parsed.entries];
+		if (typeof parsed.sid !== "string" || !/^S-1-\d+(?:-\d+)+$/i.test(parsed.sid))
+			throw new Error("invalid SID response");
+		const entries = Array.isArray(parsed.entries)
+			? parsed.entries
+			: parsed.entries === undefined
+				? []
+				: [parsed.entries];
 		const requestedPaths = new Set(requested);
 		const snapshots = new Map<string, WindowsAclSnapshot>();
 		for (const value of entries) {
@@ -157,7 +165,8 @@ async function readWindowsAcls(directories: readonly string[]): Promise<WindowsA
 				throw new Error("invalid ACL path response");
 			}
 			const directory = path.resolve(value.path);
-			if (!requestedPaths.has(directory) || snapshots.has(directory)) throw new Error("unexpected ACL path response");
+			if (!requestedPaths.has(directory) || snapshots.has(directory))
+				throw new Error("unexpected ACL path response");
 			snapshots.set(directory, parseWindowsAclSnapshot(value));
 		}
 		if (snapshots.size !== requested.length) throw new Error("incomplete ACL response");
@@ -187,16 +196,14 @@ function hasAncestorReplacementAccess(rule: WindowsAclRule): boolean {
 }
 
 function hasWriteAccess(snapshot: WindowsAclSnapshot, sid: string): boolean {
-	return snapshot.rules.some((rule) => rule.allow && rule.sid === sid && hasRootWriteAccess(rule.rights));
+	return snapshot.rules.some(rule => rule.allow && rule.sid === sid && hasRootWriteAccess(rule.rights));
 }
 
 function removeForeignWindowsAllowGrants(snapshot: WindowsAclSnapshot, sid: string): string[] {
 	const identities = new Set(
-		snapshot.rules
-			.filter((rule) => rule.allow && rule.sid !== sid && rule.sid !== SYSTEM_SID)
-			.map((rule) => rule.sid),
+		snapshot.rules.filter(rule => rule.allow && rule.sid !== sid && rule.sid !== SYSTEM_SID).map(rule => rule.sid),
 	);
-	return [...identities].flatMap((identity) => ["/remove:g", `*${identity}`]);
+	return [...identities].flatMap(identity => ["/remove:g", `*${identity}`]);
 }
 
 function trustedWindowsAncestorOwner(owner: string, sid: string): boolean {
@@ -233,10 +240,7 @@ function windowsAncestorDirectories(canonicalDirectory: string): string[] {
 	}
 }
 
-function assertSafeWindowsAncestorSnapshots(
-	directories: readonly string[],
-	cohort: WindowsAclBatch,
-): void {
+function assertSafeWindowsAncestorSnapshots(directories: readonly string[], cohort: WindowsAclBatch): void {
 	for (const directory of directories) {
 		const snapshot = cohortSnapshot(cohort, directory);
 		if (!snapshot.daclPresent) throw new Error("An AutoBot storage ancestor has a NULL Windows DACL");
@@ -325,7 +329,12 @@ async function assertWindowsImportableDirectory(directory: string): Promise<void
 		throw new Error("AutoBot legacy directory lacks a current-user-owned Windows DACL");
 	}
 	for (const rule of snapshot.rules) {
-		if (!rule.allow || trustedWindowsPrincipal(rule.sid, cohort.sid) || trustedWindowsDescendantPrincipal(rule.sid, cohort.sid)) continue;
+		if (
+			!rule.allow ||
+			trustedWindowsPrincipal(rule.sid, cohort.sid) ||
+			trustedWindowsDescendantPrincipal(rule.sid, cohort.sid)
+		)
+			continue;
 		if (
 			(!rule.inheritOnly && hasRootWriteAccess(rule.rights)) ||
 			((rule.inheritToContainers || rule.inheritToObjects) && hasRootWriteAccess(rule.rights))
@@ -375,7 +384,10 @@ async function assertSafeWindowsCreationParent(directory: string): Promise<void>
 	// inherit-only ACEs may already be blocked by a protected profile ancestor.
 	for (const rule of snapshot.rules) {
 		if (!rule.allow || trustedWindowsDescendantPrincipal(rule.sid, cohort.sid)) continue;
-		if ((!rule.inheritOnly && hasAncestorReplacementAccess(rule)) || (rule.inheritToContainers && hasRootWriteAccess(rule.rights))) {
+		if (
+			(!rule.inheritOnly && hasAncestorReplacementAccess(rule)) ||
+			(rule.inheritToContainers && hasRootWriteAccess(rule.rights))
+		) {
 			throw new Error("AutoBot creation parent grants a foreign identity mutation access to new descendants");
 		}
 	}
@@ -421,7 +433,8 @@ async function restrictWindowsFile(filePath: string): Promise<void> {
 		`*${cohort.sid}:F`,
 		`*${SYSTEM_SID}:F`,
 	]);
-	if (result.exitCode !== 0) throw new Error("Cannot set the required owner-private Windows ACL for an AutoBot executable");
+	if (result.exitCode !== 0)
+		throw new Error("Cannot set the required owner-private Windows ACL for an AutoBot executable");
 }
 
 async function assertNoLinkDirectory(directory: string): Promise<void> {
@@ -465,14 +478,16 @@ export function assertAutoBotDenyOnlyDarwinAclListing(listing: string): void {
 	const mode = lines.shift();
 	if (!mode) throw new Error("Cannot parse the macOS ACL protecting AutoBot files");
 	const hasAclMarker = /^[bcdlps-][rwxStTs-]{9}[@+]*\+/.test(mode);
-	const entries = lines.filter((line) => line.trim().length > 0);
+	const entries = lines.filter(line => line.trim().length > 0);
 	if (entries.length === 0) {
 		if (hasAclMarker) throw new Error("Cannot parse the macOS ACL protecting AutoBot files");
 		return;
 	}
 	if (!hasAclMarker) throw new Error("Cannot parse the macOS ACL protecting AutoBot files");
 	for (const entry of entries) {
-		const parsed = /^\s*\d+:\s+\S+\s+(deny|allow)\s+[A-Za-z][A-Za-z0-9_-]*(?:,[A-Za-z][A-Za-z0-9_-]*)*\s*$/.exec(entry);
+		const parsed = /^\s*\d+:\s+\S+\s+(deny|allow)\s+[A-Za-z][A-Za-z0-9_-]*(?:,[A-Za-z][A-Za-z0-9_-]*)*\s*$/.exec(
+			entry,
+		);
 		if (!parsed || parsed[1] !== "deny") {
 			throw new Error("AutoBot storage has a macOS ACL that can grant authority");
 		}
@@ -504,7 +519,8 @@ async function assertSafePosixAncestors(directory: string): Promise<void> {
 	let current = await fs.realpath(directory);
 	while (true) {
 		const stat = await fs.lstat(current);
-		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("AutoBot storage ancestor is not a real directory");
+		if (!stat.isDirectory() || stat.isSymbolicLink())
+			throw new Error("AutoBot storage ancestor is not a real directory");
 		await assertDarwinDenyOnlyAcl(current);
 		if ((stat.mode & 0o022) !== 0) throw new Error("AutoBot storage ancestor is writable by another user");
 		if (stat.uid !== uid && stat.uid !== 0) throw new Error("AutoBot storage ancestor is owned by another user");

@@ -47,7 +47,6 @@ import { assertCompleteAutoBotReleaseTopology } from "./autobot-release-topology
 
 const SAFE_ASSET_FILENAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-
 interface StagedAsset {
 	readonly asset: AutoBotReleaseAsset;
 	readonly index: AssetIndexEntry;
@@ -83,16 +82,10 @@ function assetFilename(source: string, url: string): string {
 function assertAssetTopology(inputs: readonly AssetInput[], webBundleId: string): void {
 	assertCompleteAutoBotReleaseTopology(inputs);
 	for (const input of inputs) {
-		if (
-			input.kind === "coordinator-client" &&
-			path.basename(input.source) !== COORDINATOR_CLIENT_FILENAME
-		) {
+		if (input.kind === "coordinator-client" && path.basename(input.source) !== COORDINATOR_CLIENT_FILENAME) {
 			throw new AutoBotReleaseError(`coordinator-client filename must be ${COORDINATOR_CLIENT_FILENAME}`);
 		}
-		if (
-			input.kind === "collab-web" &&
-			path.basename(input.source) !== `omp-collab-web-${webBundleId}.tar.gz`
-		) {
+		if (input.kind === "collab-web" && path.basename(input.source) !== `omp-collab-web-${webBundleId}.tar.gz`) {
 			throw new AutoBotReleaseError(`collab-web filename must be omp-collab-web-${webBundleId}.tar.gz`);
 		}
 	}

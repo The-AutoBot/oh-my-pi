@@ -123,7 +123,6 @@ const QuarantinedReleaseSchema = type({
 	rejectedAt: "string > 0",
 });
 
-
 function validTimestamp(value: string): boolean {
 	return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && new Date(value).toISOString() === value;
 }
@@ -131,7 +130,8 @@ function validTimestamp(value: string): boolean {
 function parseRestartRequest(value: unknown): AutoBotRestartRequest {
 	const request = parseAutoBotRestartRequest(value);
 	if (!/^[A-Za-z0-9_-]{32,128}$/.test(request.nonce)) throw new Error("Invalid AutoBot restart nonce");
-	if (!path.isAbsolute(request.sessionFile) || !path.isAbsolute(request.cwd)) throw new Error("Invalid AutoBot restart paths");
+	if (!path.isAbsolute(request.sessionFile) || !path.isAbsolute(request.cwd))
+		throw new Error("Invalid AutoBot restart paths");
 	return request;
 }
 
@@ -150,13 +150,18 @@ function parseActivePointer(value: unknown, paths: AutoBotPaths): AutoBotActiveP
 function parseHighWater(value: unknown): AutoBotSequenceHighWater {
 	const highWater = HighWaterSchema.assert(value);
 	if (!/^[0-9a-f]{64}$/.test(highWater.payloadSha256)) throw new Error("Invalid AutoBot high-water payload digest");
-	if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(highWater.forkCommit)) throw new Error("Invalid AutoBot high-water commit");
+	if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(highWater.forkCommit))
+		throw new Error("Invalid AutoBot high-water commit");
 	if (!validTimestamp(highWater.acceptedAt)) throw new Error("Invalid AutoBot high-water timestamp");
 	return highWater;
 }
 
 function autoBotQuarantinePath(paths: AutoBotPaths, releaseSequence: number, forkCommit: string): string {
-	if (!Number.isSafeInteger(releaseSequence) || releaseSequence <= 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(forkCommit)) {
+	if (
+		!Number.isSafeInteger(releaseSequence) ||
+		releaseSequence <= 0 ||
+		!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(forkCommit)
+	) {
 		throw new Error("Invalid AutoBot quarantine release identity");
 	}
 	return path.join(paths.quarantineDir, `${releaseSequence}-${forkCommit}.json`);
@@ -320,10 +325,7 @@ export async function advanceAutoBotSequenceHighWater(
 }
 
 /** Persist a pre-activation candidate failure without blocking newer signed releases. */
-export async function quarantineAutoBotRelease(
-	paths: AutoBotPaths,
-	target: AutoBotRestartTarget,
-): Promise<void> {
+export async function quarantineAutoBotRelease(paths: AutoBotPaths, target: AutoBotRestartTarget): Promise<void> {
 	const filePath = autoBotQuarantinePath(paths, target.releaseSequence, target.forkCommit);
 	await writeJsonAtomically(filePath, {
 		schemaVersion: 1,
@@ -412,7 +414,6 @@ export async function hasAutoBotPendingRestartOwnership(
 	return sameOwner(owner, expectedOwner) && sameAutoBotHandoffClaim(claim, expectedClaim);
 }
 
-
 /**
  * Read a pending journal only after its stable owner tuple proves that it
  * belongs to this bootstrap. Caller MUST hold `withAutoBotHandoffLock`.
@@ -449,7 +450,10 @@ async function writeAutoBotPendingRestart(paths: AutoBotPaths, pending: AutoBotP
  * Create a pending journal only if neither global handoff journal is owned.
  * The caller MUST hold `withAutoBotHandoffLock`.
  */
-export async function createAutoBotPendingRestart(paths: AutoBotPaths, pending: AutoBotPendingRestart): Promise<boolean> {
+export async function createAutoBotPendingRestart(
+	paths: AutoBotPaths,
+	pending: AutoBotPendingRestart,
+): Promise<boolean> {
 	parsePendingRestart(pending, paths);
 	if ((await readAutoBotPendingRestart(paths)) || (await readAutoBotCommittedRestart(paths))) return false;
 	await writeAutoBotPendingRestart(paths, pending);

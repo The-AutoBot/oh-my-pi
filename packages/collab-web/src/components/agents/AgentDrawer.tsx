@@ -26,8 +26,18 @@ export function AgentDrawer(props: {
 	host?: TranscriptProps["host"];
 	onClose(): void;
 }): ReactNode {
-	const { agent, progress, client, drafts, draftsReady, draftRecoveryVersion, restartPreparing, readOnly, host, onClose } =
-		props;
+	const {
+		agent,
+		progress,
+		client,
+		drafts,
+		draftsReady,
+		draftRecoveryVersion,
+		restartPreparing,
+		readOnly,
+		host,
+		onClose,
+	} = props;
 	const [entries, setEntries] = useState<readonly SessionEntry[]>([]);
 	const [fetchError, setFetchError] = useState<string | null>(null);
 	const [draft, setDraft] = useState("");
