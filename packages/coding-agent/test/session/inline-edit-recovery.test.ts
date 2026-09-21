@@ -24,16 +24,11 @@ function assistant(content: AssistantMessage["content"], stopReason: AssistantMe
 	};
 }
 
-const payload = [
-	"*** SM:EDIT src/a.ts",
-	"*** SM:FIND",
-	"const x = 1;",
-	"*** SM:PUT",
-	"const x = 2;",
-].join("\n");
+const payload = ["*** SM:EDIT src/a.ts", "*** SM:FIND", "const x = 1;", "*** SM:PUT", "const x = 2;"].join("\n");
 
 describe("recoverInlineSloppyEdit", () => {
 	test("lifts a stray payload out of prose into a synthetic edit tool call", () => {
+		// Header bodies run to EOF, so trailing prose needs the explicit `*** End Patch` boundary.
 		const message = assistant(
 			[{ type: "text", text: `Fixing the constant.\n\n${payload}\n*** End Patch\n\nDone.` }],
 			"stop",
