@@ -8,6 +8,7 @@ import { createManagedBundle, deriveManagedBundleId } from "../../scripts/autobo
 import { COORDINATOR_CLIENT_FILENAME } from "../../scripts/autobot-release-coordinator.ts";
 import {
 	admitPreparedLocalRelease,
+	authenticateCompletedLocalRelease,
 	publishPreparedLocalRelease,
 } from "../../scripts/autobot-local-release.ts";
 import type { LocalAutomationConfig, LocalCandidate } from "../../scripts/autobot-local-types.ts";
@@ -291,9 +292,10 @@ try {
 		await fs.copyFile(path.join(bundle, metadata), path.join(assets, metadata));
 	for (const entry of await fs.readdir(path.join(bundle, "assets")))
 		await fs.copyFile(path.join(bundle, "assets", entry), path.join(assets, entry));
+	const recovery = scenario.startsWith("recovery-");
 	const draft = {
 		tag_name: tag,
-		draft: scenario !== "published-promotion",
+		draft: recovery ? scenario === "recovery-draft" : scenario !== "published-promotion",
 		target_commitish: forkCommit,
 		assets,
 	};
@@ -331,6 +333,25 @@ try {
 	};
 	if (scenario === "foreign-draft") draft.target_commitish = upstreamCommit;
 	if (scenario === "tampered-asset") await fs.appendFile(path.join(assets, "manifest.json"), "tamper");
+	if (scenario === "recovery-tampered") await fs.appendFile(path.join(assets, "manifest.json"), "tamper");
+	if (scenario === "recovery-invalid-provenance") await write(path.join(assets, "provenance.json"), "{}\n");
+	if (scenario === "recovery-wrong-target") draft.target_commitish = upstreamCommit;
+	if (scenario === "recovery-bad-signature") {
+		await fs.appendFile(path.join(bundle, "signed-envelope.json"), "tamper");
+	}
+	if (scenario === "recovery-foreign-release") {
+		releases.push({
+			tag_name: "autobot-r2",
+			draft: false,
+			target_commitish: forkCommit,
+			assets,
+		});
+	}
+	if (recovery) {
+		await fs.copyFile(path.join(bundle, "signed-envelope.json"), path.join(channelSeed, "signed-envelope.json"));
+		commit(channelSeed, "publish completed channel");
+		git(channelSeed, "push", "origin", "HEAD:refs/heads/main");
+	}
 	if (scenario === "invalid-provenance") await write(path.join(bundle, "provenance.json"), "{}\n");
 	if (scenario === "contradictory-manifest") {
 		const manifestPath = path.join(bundle, "manifest.json");
@@ -449,17 +470,35 @@ try {
 	}
 	const beforeChannel = git(channelGit, "rev-parse", "refs/heads/main");
 	let failure: unknown;
+	let recoveredTwice = false;
+	let recoveryReleaseState: string | undefined;
 	try {
-		const admitted = await admitPreparedLocalRelease(config, selectedStage, source, recorder);
-		if (
-			admitted.forkCommit !== candidate.forkCommit ||
-			admitted.upstreamCommit !== candidate.upstreamCommit ||
-			admitted.upstreamVersion !== candidate.upstreamVersion ||
-			admitted.compatibilityEpoch !== candidate.compatibilityEpoch
-		) {
-			throw new Error("prepared admission returned the wrong candidate identity");
+		if (recovery) {
+			await fs.rm(stage, { recursive: true, force: true });
+			recoveryReleaseState = JSON.stringify(state.releases);
+			const first = await authenticateCompletedLocalRelease(config, forkCommit, source, recorder);
+			const second = await authenticateCompletedLocalRelease(config, forkCommit, source, recorder);
+			if (
+				first.forkCommit !== forkCommit ||
+				first.upstreamCommit !== upstreamCommit ||
+				first.upstreamVersion !== candidate.upstreamVersion ||
+				JSON.stringify(first) !== JSON.stringify(second)
+			) {
+				throw new Error("completed publication recovery returned the wrong immutable identity");
+			}
+			recoveredTwice = true;
+		} else {
+			const admitted = await admitPreparedLocalRelease(config, selectedStage, source, recorder);
+			if (
+				admitted.forkCommit !== candidate.forkCommit ||
+				admitted.upstreamCommit !== candidate.upstreamCommit ||
+				admitted.upstreamVersion !== candidate.upstreamVersion ||
+				admitted.compatibilityEpoch !== candidate.compatibilityEpoch
+			) {
+				throw new Error("prepared admission returned the wrong candidate identity");
+			}
+			await publishPreparedLocalRelease(config, candidate, selectedStage, recorder);
 		}
-		await publishPreparedLocalRelease(config, candidate, selectedStage, recorder);
 	} catch (error) {
 		failure = error;
 	}
@@ -473,16 +512,28 @@ try {
 		"foreign-modify-acl",
 		"contradictory-manifest",
 		"invalid-provenance",
+		"recovery-tampered",
+		"recovery-invalid-provenance",
+		"recovery-bad-signature",
+		"recovery-wrong-target",
+		"recovery-draft",
+		"recovery-foreign-release",
 	].includes(scenario);
 	if (rejecting) {
 		if (!failure) throw new Error(`${scenario} unexpectedly published`);
-		if (!finalState.releases[0]?.draft) throw new Error(`${scenario} changed draft state`);
+		if (!recovery && !finalState.releases[0]?.draft) throw new Error(`${scenario} changed draft state`);
 		if (git(channelGit, "rev-parse", "refs/heads/main") !== beforeChannel)
 			throw new Error(`${scenario} changed channel`);
 		if (finalState.log.some(value => value.startsWith("publish:"))) throw new Error(`${scenario} published draft`);
 		if (readTag() !== beforeTag) throw new Error(`${scenario} changed release tag`);
 	} else {
 		if (failure) throw failure;
+		if (scenario === "recovery-complete" && !recoveredTwice) {
+			throw new Error("completed publication was not authenticated idempotently without its retained stage");
+		}
+		if (scenario === "recovery-complete" && JSON.stringify(finalState.releases) !== recoveryReleaseState) {
+			throw new Error("completed publication recovery changed observable release metadata or assets");
+		}
 		const expectedReleaseCount = subsequent ? 2 : 1;
 		if (
 			finalState.releases.length !== expectedReleaseCount ||
@@ -498,24 +549,28 @@ try {
 			stderr: "pipe",
 		});
 		if (channel.exitCode !== 0) throw new Error("published channel envelope is unreadable");
-		const envelopeBytes = Buffer.from(await fs.readFile(path.join(bundle, "signed-envelope.json")));
-		if (!Buffer.from(channel.stdout).equals(envelopeBytes))
-			throw new Error("channel bytes differ from verified envelope");
+		if (!recovery) {
+			const envelopeBytes = Buffer.from(await fs.readFile(path.join(bundle, "signed-envelope.json")));
+			if (!Buffer.from(channel.stdout).equals(envelopeBytes))
+				throw new Error("channel bytes differ from verified envelope");
+		}
 		const recoveryMutations = finalState.log.filter(
-			value => value.startsWith("upload:") || value.startsWith("create:") || value.startsWith("publish:"),
+			value =>
+				value.startsWith("upload:") ||
+				value.startsWith("create:") ||
+				value.startsWith("publish:") ||
+				value.startsWith("delete:"),
 		);
-		if (
-			scenario === "matching" &&
-			(recoveryMutations.length !== 1 || recoveryMutations[0] !== `publish:${tag}`)
-		) {
+		if (scenario === "matching" && (recoveryMutations.length !== 1 || recoveryMutations[0] !== `publish:${tag}`)) {
 			throw new Error("exact retained-draft recovery did not perform exactly the required publication");
 		}
-		if (scenario === "published-promotion" && recoveryMutations.length !== 0) {
-			throw new Error("exact published recovery replaced assets or republished the release");
+		if ((scenario === "published-promotion" || scenario === "recovery-complete") && recoveryMutations.length !== 0) {
+			throw new Error("exact completed recovery replaced assets or republished the release");
 		}
 		if (
 			scenario !== "matching" &&
 			scenario !== "published-promotion" &&
+			scenario !== "recovery-complete" &&
 			(!finalState.log.includes(`tag-exact-at-create:${tag}`) || !finalState.log.includes(`create:${tag}`))
 		) {
 			throw new Error("draft creation did not observe the exact release tag target");

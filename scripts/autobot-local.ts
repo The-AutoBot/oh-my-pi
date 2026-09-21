@@ -50,14 +50,21 @@ import type { RepairIntent } from "./autobot-publication-boundary.ts";
 import { runLocalOmp } from "./autobot-local-omp.ts";
 import {
 	admitPreparedLocalRelease,
+	authenticateCompletedLocalRelease,
 	buildAndPublishLocalRelease,
 	createCommandOutputRedactionPolicy,
 	LocalBuildFailure,
 	publishPreparedLocalRelease,
 	redactSensitiveCommandOutput,
 } from "./autobot-local-release.ts";
-import type { CommandOutputRedactionPolicy } from "./autobot-local-release.ts";
-import type { LocalAutomationConfig, LocalCandidate } from "./autobot-local-types.ts";
+import type { CommandOutputRedactionPolicy, CompletedLocalReleaseIdentity } from "./autobot-local-release.ts";
+import type {
+	EffectiveUpstreamBase,
+	LocalAutomationConfig,
+	LocalCandidate,
+	ObservedOfficialUpstreamRelease,
+	OfficialUpstreamRelease,
+} from "./autobot-local-types.ts";
 
 const CANONICAL_REPOSITORY = "The-AutoBot/oh-my-pi";
 const CONFIG_SCHEMA_VERSION = 1 as const;
@@ -148,12 +155,15 @@ const STATE_KEYS = [
 	"producerCommit",
 	"canonicalCommit",
 	"upstreamCommit",
+	"officialUpstreamRef",
 	"upstreamRef",
 	"candidateCommit",
 	"candidateMergeCommit",
 	"integrationRemoteCommit",
 	"pendingIntegrationCommit",
 	"publishedForkCommit",
+	"publishedUpstreamCommit",
+	"publishedUpstreamVersion",
 	"compatibilityReviewFingerprint",
 	"buildFailure",
 ] as const;
@@ -199,11 +209,93 @@ interface LocalState {
 	readonly candidateCommit?: string;
 	readonly candidateMergeCommit?: string;
 	readonly upstreamRef?: string;
+	readonly officialUpstreamRef?: string;
 	readonly integrationRemoteCommit?: string;
 	readonly pendingIntegrationCommit?: string;
 	readonly publishedForkCommit?: string;
+	readonly publishedUpstreamCommit?: string;
+	readonly publishedUpstreamVersion?: string;
 	readonly compatibilityReviewFingerprint?: string;
 	readonly buildFailure?: BuildFailureState;
+}
+
+export interface IntegrationCheckpointState {
+	readonly integrationRemoteCommit?: string;
+	readonly pendingIntegrationCommit?: string;
+}
+
+export type IntegrationCheckpointDisposition =
+	| "unchanged"
+	| "pending-landed"
+	| "pending-not-landed"
+	| "authenticate-completion";
+
+export function classifyIntegrationCheckpoint(
+	state: IntegrationCheckpointState,
+	observedCommit: string | undefined,
+): IntegrationCheckpointDisposition {
+	if (state.pendingIntegrationCommit !== undefined) {
+		if (observedCommit === state.pendingIntegrationCommit) return "pending-landed";
+		if (observedCommit === state.integrationRemoteCommit) return "pending-not-landed";
+		throw new AutoBotReleaseError("Dedicated integration branch did not reconcile with the interrupted local push");
+	}
+	if (state.integrationRemoteCommit !== undefined && state.integrationRemoteCommit !== observedCommit) {
+		return "authenticate-completion";
+	}
+	return "unchanged";
+}
+
+export function hasRetainedPublishedCheckpoint(
+	publishedForkCommit: string | undefined,
+	observedCommit: string | undefined,
+): boolean {
+	return publishedForkCommit !== undefined && publishedForkCommit === observedCommit;
+}
+
+export async function assertRecoverableIntegrationHistory(
+	checkpointCommit: string,
+	targetCommit: string,
+	localCommit: string,
+	ancestor: (older: string, newer: string) => Promise<boolean>,
+): Promise<void> {
+	if (!(await ancestor(checkpointCommit, targetCommit))) {
+		throw new AutoBotReleaseError(
+			"Completed publication would discard or diverge from checkpointed integration history",
+		);
+	}
+	if (
+		localCommit !== targetCommit &&
+		!(await ancestor(localCommit, targetCommit)) &&
+		!(await ancestor(targetCommit, localCommit))
+	) {
+		throw new AutoBotReleaseError("Completed publication diverges from the owned local integration history");
+	}
+}
+
+export interface PublishedUpstreamCheckpoint {
+	readonly publishedUpstreamCommit?: string;
+	readonly publishedUpstreamVersion?: string;
+}
+
+export function resolvePublishedCheckpointUpstream(
+	candidateMergeUpstreamCommit: string,
+	candidateMergeUpstreamVersion: string,
+	checkpoint: PublishedUpstreamCheckpoint,
+): { readonly upstreamCommit: string; readonly upstreamVersion: string } {
+	if (
+		(checkpoint.publishedUpstreamCommit !== undefined &&
+			checkpoint.publishedUpstreamCommit !== candidateMergeUpstreamCommit) ||
+		(checkpoint.publishedUpstreamVersion !== undefined &&
+			checkpoint.publishedUpstreamVersion !== candidateMergeUpstreamVersion)
+	) {
+		throw new AutoBotReleaseError(
+			"Published controller checkpoint conflicts with its immutable published upstream identity",
+		);
+	}
+	return {
+		upstreamCommit: candidateMergeUpstreamCommit,
+		upstreamVersion: candidateMergeUpstreamVersion,
+	};
 }
 
 export type LocalCommandStage = (typeof LOCAL_COMMAND_STAGES)[number];
@@ -251,12 +343,6 @@ interface ManagedWorktree {
 interface RemoteSnapshot {
 	readonly refs: ReadonlyMap<string, string>;
 }
-interface PinnedUpstream {
-	readonly tag: string;
-	readonly ref: string;
-	readonly commit: string;
-	readonly version: string;
-}
 
 interface OmpControllerContext {
 	readonly config: LocalAutomationConfig;
@@ -266,6 +352,7 @@ interface OmpControllerContext {
 	readonly canonicalRef: string;
 	readonly expectedCanonicalCommit: string;
 	readonly expectedUpstreamCommit: string;
+	readonly expectedOfficialUpstreamCommit: string;
 	readonly expectedUpstreamRef: string;
 	readonly expectedUpstreamVersion: string;
 	readonly expectedIntegrationCommit: string | undefined;
@@ -405,7 +492,7 @@ async function resolvePeeledRemoteTag(repository: string, tag: string): Promise<
 async function selectPublishedUpstream(
 	config: LocalAutomationConfig,
 	pinnedTag?: string,
-): Promise<Omit<PinnedUpstream, "version">> {
+): Promise<OfficialUpstreamRelease> {
 	const tag = await readPublishedUpstreamTag(config, pinnedTag);
 	return {
 		tag,
@@ -417,6 +504,33 @@ async function selectPublishedUpstream(
 function assertReleaseTagVersion(tag: string, version: string): void {
 	if (tag !== version && tag !== `v${version}`) {
 		throw new AutoBotReleaseError("Pinned upstream release tag does not match its coding-agent package version");
+	}
+}
+
+export async function selectEffectiveUpstreamBase(
+	official: EffectiveUpstreamBase,
+	retained: EffectiveUpstreamBase | undefined,
+	ancestor: (older: string, newer: string) => Promise<boolean>,
+): Promise<EffectiveUpstreamBase> {
+	if (!retained || retained.commit === official.commit) return official;
+	if (await ancestor(retained.commit, official.commit)) return official;
+	if (await ancestor(official.commit, retained.commit)) return retained;
+	throw new AutoBotReleaseError(
+		"Selected official upstream release diverges from retained candidate upstream history",
+	);
+}
+
+export async function assertCompletedUpstreamAdvance(
+	recordedCommit: string | undefined,
+	completedCommit: string,
+	ancestor: (older: string, newer: string) => Promise<boolean>,
+): Promise<void> {
+	if (
+		recordedCommit !== undefined &&
+		recordedCommit !== completedCommit &&
+		!(await ancestor(recordedCommit, completedCommit))
+	) {
+		throw new AutoBotReleaseError("Completed publication would discard or diverge from retained upstream history");
 	}
 }
 
@@ -661,6 +775,13 @@ function parseOptionalPinnedUpstreamRef(value: unknown): string | undefined {
 	return ref;
 }
 
+function parseOptionalUpstreamVersion(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	const version = requireString(value, "Published upstream version");
+	if (!BUN_VERSION.test(version)) throw new AutoBotReleaseError("Published upstream version is invalid");
+	return version;
+}
+
 function parseOptionalFingerprint(value: unknown, label: string): string | undefined {
 	if (value === undefined) return undefined;
 	const fingerprint = requireString(value, label);
@@ -779,11 +900,14 @@ function parseLocalState(value: unknown): LocalState {
 		canonicalCommit: parseOptionalCommit(value.canonicalCommit, "Canonical commit"),
 		upstreamCommit: parseOptionalCommit(value.upstreamCommit, "Upstream commit"),
 		upstreamRef: parseOptionalPinnedUpstreamRef(value.upstreamRef),
+		officialUpstreamRef: parseOptionalPinnedUpstreamRef(value.officialUpstreamRef),
 		candidateCommit: parseOptionalCommit(value.candidateCommit, "Candidate commit"),
 		candidateMergeCommit: parseOptionalCommit(value.candidateMergeCommit, "Candidate merge commit"),
 		integrationRemoteCommit: parseOptionalCommit(value.integrationRemoteCommit, "Integration remote commit"),
 		pendingIntegrationCommit: parseOptionalCommit(value.pendingIntegrationCommit, "Pending integration commit"),
 		publishedForkCommit: parseOptionalCommit(value.publishedForkCommit, "Published fork commit"),
+		publishedUpstreamCommit: parseOptionalCommit(value.publishedUpstreamCommit, "Published upstream commit"),
+		publishedUpstreamVersion: parseOptionalUpstreamVersion(value.publishedUpstreamVersion),
 		compatibilityReviewFingerprint: parseOptionalFingerprint(
 			value.compatibilityReviewFingerprint,
 			"Compatibility review fingerprint",
@@ -1428,6 +1552,7 @@ async function assertRemoteInputs(
 	canonicalRef: string,
 	canonicalCommit: string,
 	upstreamRef: string,
+	officialUpstreamCommit: string,
 	upstreamCommit: string,
 	upstreamVersion: string,
 	expectedIntegrationCommit: string | undefined,
@@ -1444,14 +1569,16 @@ async function assertRemoteInputs(
 	if (selectedTag !== pinnedTag) {
 		throw new AutoBotReleaseError("Pinned upstream release lookup returned a different tag");
 	}
-	const currentUpstream = await resolvePeeledRemoteTag(config.upstreamRepository, selectedTag);
-	if (currentUpstream !== upstreamCommit)
+	const currentOfficialUpstream = await resolvePeeledRemoteTag(config.upstreamRepository, selectedTag);
+	if (currentOfficialUpstream !== officialUpstreamCommit) {
 		throw new AutoBotReleaseError("Upstream release tag moved after it was pinned");
-	const currentVersion = await upstreamPackageVersion(worktree, currentUpstream);
-	if (currentVersion !== upstreamVersion) {
-		throw new AutoBotReleaseError("Upstream package version changed after it was pinned");
 	}
-	assertReleaseTagVersion(selectedTag, currentVersion);
+	const officialVersion = await upstreamPackageVersion(worktree, currentOfficialUpstream);
+	assertReleaseTagVersion(selectedTag, officialVersion);
+	const currentVersion = await upstreamPackageVersion(worktree, upstreamCommit);
+	if (currentVersion !== upstreamVersion) {
+		throw new AutoBotReleaseError("Effective upstream package version changed after it was pinned");
+	}
 	return snapshot;
 }
 
@@ -1463,6 +1590,7 @@ async function pushIntegrationBranch(context: OmpControllerContext, candidateCom
 		context.canonicalRef,
 		context.expectedCanonicalCommit,
 		context.expectedUpstreamRef,
+		context.expectedOfficialUpstreamCommit,
 		context.expectedUpstreamCommit,
 		context.expectedUpstreamVersion,
 		context.expectedIntegrationCommit,
@@ -1564,6 +1692,7 @@ async function prepareCandidate(
 	canonicalRef: string,
 	canonicalCommit: string,
 	upstreamRef: string,
+	officialUpstreamCommit: string,
 	upstreamCommit: string,
 	upstreamVersion: string,
 	integrationRemoteCommit: string | undefined,
@@ -1584,6 +1713,7 @@ async function prepareCandidate(
 		canonicalRef,
 		expectedCanonicalCommit: canonicalCommit,
 		expectedUpstreamCommit: upstreamCommit,
+		expectedOfficialUpstreamCommit: officialUpstreamCommit,
 		expectedUpstreamRef: upstreamRef,
 		expectedUpstreamVersion: upstreamVersion,
 		expectedIntegrationCommit: integrationRemoteCommit,
@@ -1743,42 +1873,39 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			mode.kind === "publish-prepared"
 				? await admitPreparedLocalRelease(config, mode.stageRoot, managed.worktree, commandRecorder)
 				: undefined;
-		if (preparedPlan && state.upstreamRef === undefined) {
-			throw new AutoBotReleaseError("Prepared-stage promotion requires its retained pinned upstream release ref");
+		const preparedOfficialRef = state.officialUpstreamRef ?? state.upstreamRef;
+		if (preparedPlan && preparedOfficialRef === undefined) {
+			throw new AutoBotReleaseError("Prepared-stage promotion requires its pinned official upstream release ref");
 		}
-		const preparedUpstreamTag = preparedPlan ? state.upstreamRef?.slice("refs/tags/".length) : undefined;
+		const preparedUpstreamTag = preparedPlan ? preparedOfficialRef?.slice("refs/tags/".length) : undefined;
 		const [canonicalCommit, selectedUpstream] = await Promise.all([
 			resolveRemoteCommit(canonicalRepository, canonicalRef, "Canonical"),
 			selectPublishedUpstream(config, preparedUpstreamTag),
 		]);
-		const upstreamCommit = selectedUpstream.commit;
 		const remoteRefs = await snapshotRemoteRefs(canonicalRepository);
 		if (remoteRefs.refs.get(canonicalRef) !== canonicalCommit) {
 			throw new AutoBotReleaseError("Canonical branch changed while its source was being pinned");
 		}
 		const integrationRemoteCommit = remoteRefs.refs.get(`refs/heads/${config.integrationBranch}`);
-		if (state.pendingIntegrationCommit !== undefined) {
-			if (integrationRemoteCommit === state.pendingIntegrationCommit) {
-				state = await transition(config.workRoot, state, "synchronizing", {
-					integrationRemoteCommit,
-					pendingIntegrationCommit: undefined,
-				});
-			} else if (integrationRemoteCommit === state.integrationRemoteCommit) {
-				state = await transition(config.workRoot, state, "synchronizing", {
-					pendingIntegrationCommit: undefined,
-				});
-			} else {
-				throw new AutoBotReleaseError(
-					"Dedicated integration branch did not reconcile with the interrupted local push",
-				);
-			}
-		}
-		if (state.integrationRemoteCommit !== undefined && state.integrationRemoteCommit !== integrationRemoteCommit) {
-			throw new AutoBotReleaseError("Dedicated integration branch changed outside the local controller");
+		const checkpointDisposition = classifyIntegrationCheckpoint(state, integrationRemoteCommit);
+		if (checkpointDisposition === "pending-landed") {
+			state = await transition(config.workRoot, state, "synchronizing", {
+				integrationRemoteCommit,
+				pendingIntegrationCommit: undefined,
+			});
+		} else if (checkpointDisposition === "pending-not-landed") {
+			state = await transition(config.workRoot, state, "synchronizing", {
+				pendingIntegrationCommit: undefined,
+			});
 		}
 		await fetchPinnedCommit(managed.worktree, producer.root, producer.commit, "Trusted producer");
 		await fetchPinnedCommit(managed.worktree, canonicalRepository, canonicalCommit, "Canonical");
-		await fetchPinnedCommit(managed.worktree, config.upstreamRepository, upstreamCommit, "Upstream release");
+		await fetchPinnedCommit(
+			managed.worktree,
+			config.upstreamRepository,
+			selectedUpstream.commit,
+			"Selected official upstream release",
+		);
 		if (integrationRemoteCommit) {
 			await fetchPinnedCommit(
 				managed.worktree,
@@ -1787,40 +1914,124 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				"Existing integration branch",
 			);
 		}
-		const retainedUpstreamCommits = new Set<string>();
-		if (state.upstreamCommit) retainedUpstreamCommits.add(state.upstreamCommit);
-		const localCandidateMerge = await latestCandidateMerge(
-			managed.worktree,
-			await currentCommit(managed.worktree, "Retained local integration HEAD"),
-		);
-		if (localCandidateMerge) retainedUpstreamCommits.add(localCandidateMerge.upstreamCommit);
-		const producerCandidateMerge = await latestCandidateMerge(managed.worktree, producer.commit);
-		if (producerCandidateMerge) retainedUpstreamCommits.add(producerCandidateMerge.upstreamCommit);
-		const canonicalCandidateMerge = await latestCandidateMerge(managed.worktree, canonicalCommit);
-		if (canonicalCandidateMerge) retainedUpstreamCommits.add(canonicalCandidateMerge.upstreamCommit);
-		if (integrationRemoteCommit) {
-			const remoteCandidateMerge = await latestCandidateMerge(managed.worktree, integrationRemoteCommit);
-			if (remoteCandidateMerge) retainedUpstreamCommits.add(remoteCandidateMerge.upstreamCommit);
-		}
-		for (const retainedUpstreamCommit of retainedUpstreamCommits) {
-			if (
-				retainedUpstreamCommit !== upstreamCommit &&
-				!(await isAncestor(managed.worktree, retainedUpstreamCommit, upstreamCommit))
-			) {
+		let authenticatedCompletion: CompletedLocalReleaseIdentity | undefined;
+		let authenticatedCandidateMerge: string | undefined;
+		if (checkpointDisposition === "authenticate-completion") {
+			if (!integrationRemoteCommit) {
+				throw new AutoBotReleaseError("Dedicated integration branch changed outside the local controller");
+			}
+			if (!state.integrationRemoteCommit) {
+				throw new AutoBotReleaseError("Completed publication recovery lacks its prior integration checkpoint");
+			}
+			await assertRecoverableIntegrationHistory(
+				state.integrationRemoteCommit,
+				integrationRemoteCommit,
+				await currentCommit(managed.worktree, "Owned local integration HEAD"),
+				(older, newer) => isAncestor(managed.worktree, older, newer),
+			);
+			authenticatedCompletion = await authenticateCompletedLocalRelease(
+				config,
+				integrationRemoteCommit,
+				managed.worktree,
+				commandRecorder,
+			);
+			await assertCompletedUpstreamAdvance(
+				state.upstreamCommit,
+				authenticatedCompletion.upstreamCommit,
+				(older, newer) => isAncestor(managed.worktree, older, newer),
+			);
+			const completedMerge = await latestCandidateMerge(managed.worktree, integrationRemoteCommit);
+			if (!completedMerge || completedMerge.upstreamCommit !== authenticatedCompletion.upstreamCommit) {
 				throw new AutoBotReleaseError(
-					"Selected official upstream release does not descend from retained candidate upstream history",
+					"Completed publication does not match the owned integration and candidate history",
 				);
 			}
+			authenticatedCandidateMerge = completedMerge.commit;
 		}
-		const upstreamVersion = await upstreamPackageVersion(managed.worktree, upstreamCommit);
-		assertReleaseTagVersion(selectedUpstream.tag, upstreamVersion);
-		const pinnedUpstream: PinnedUpstream = { ...selectedUpstream, version: upstreamVersion };
+		if (
+			!authenticatedCompletion &&
+			state.integrationRemoteCommit !== undefined &&
+			state.integrationRemoteCommit !== integrationRemoteCommit
+		) {
+			throw new AutoBotReleaseError("Dedicated integration branch changed outside the local controller");
+		}
+		const officialVersion = await upstreamPackageVersion(managed.worktree, selectedUpstream.commit);
+		assertReleaseTagVersion(selectedUpstream.tag, officialVersion);
+		const officialBase: EffectiveUpstreamBase = {
+			commit: selectedUpstream.commit,
+			version: officialVersion,
+		};
+		let retainedBase: EffectiveUpstreamBase | undefined;
+		let retainedIdentity: { readonly upstreamCommit: string; readonly upstreamVersion: string } | undefined =
+			authenticatedCompletion ?? preparedPlan;
+		if (!retainedIdentity && hasRetainedPublishedCheckpoint(state.publishedForkCommit, integrationRemoteCommit)) {
+			if (!integrationRemoteCommit) {
+				throw new AutoBotReleaseError("Published controller checkpoint has no integration commit");
+			}
+			const retainedMerge = await latestCandidateMerge(managed.worktree, integrationRemoteCommit);
+			if (!retainedMerge) {
+				throw new AutoBotReleaseError(
+					"Published controller checkpoint conflicts with its owned committed candidate history",
+				);
+			}
+			const retainedVersion = await upstreamPackageVersion(managed.worktree, retainedMerge.upstreamCommit);
+			retainedIdentity = resolvePublishedCheckpointUpstream(retainedMerge.upstreamCommit, retainedVersion, state);
+		}
+		if (retainedIdentity) {
+			const retainedVersion = await upstreamPackageVersion(managed.worktree, retainedIdentity.upstreamCommit);
+			if (retainedVersion !== retainedIdentity.upstreamVersion) {
+				throw new AutoBotReleaseError("Retained upstream version does not match signed published provenance");
+			}
+			retainedBase = {
+				commit: retainedIdentity.upstreamCommit,
+				version: retainedVersion,
+			};
+		}
+		const retainedCommits = new Set<string>();
+		for (const commit of [
+			await currentCommit(managed.worktree, "Retained local integration HEAD"),
+			producer.commit,
+			canonicalCommit,
+			authenticatedCompletion || state.integrationRemoteCommit === integrationRemoteCommit
+				? integrationRemoteCommit
+				: undefined,
+		]) {
+			if (!commit) continue;
+			const candidateMerge = await latestCandidateMerge(managed.worktree, commit);
+			if (candidateMerge) retainedCommits.add(candidateMerge.upstreamCommit);
+		}
+		if (retainedBase) retainedCommits.add(retainedBase.commit);
+		for (const retainedCommit of retainedCommits) {
+			const candidateBase: EffectiveUpstreamBase = {
+				commit: retainedCommit,
+				version: await upstreamPackageVersion(managed.worktree, retainedCommit),
+			};
+			if (!retainedBase || retainedBase.commit === candidateBase.commit) {
+				retainedBase = candidateBase;
+				continue;
+			}
+			if (await isAncestor(managed.worktree, retainedBase.commit, candidateBase.commit)) {
+				retainedBase = candidateBase;
+				continue;
+			}
+			if (await isAncestor(managed.worktree, candidateBase.commit, retainedBase.commit)) continue;
+			throw new AutoBotReleaseError("Owned candidate upstream histories diverge");
+		}
+		const effectiveUpstream = await selectEffectiveUpstreamBase(officialBase, retainedBase, (older, newer) =>
+			isAncestor(managed.worktree, older, newer),
+		);
+		const upstreamCommit = effectiveUpstream.commit;
+		const upstreamVersion = effectiveUpstream.version;
+		await fetchPinnedCommit(managed.worktree, config.upstreamRepository, upstreamCommit, "Effective upstream base");
+		const pinnedUpstream: ObservedOfficialUpstreamRelease = {
+			...selectedUpstream,
+			version: officialVersion,
+		};
 		if (
 			preparedPlan &&
-			(preparedPlan.upstreamCommit !== pinnedUpstream.commit ||
-				preparedPlan.upstreamVersion !== pinnedUpstream.version)
+			(preparedPlan.upstreamCommit !== upstreamCommit || preparedPlan.upstreamVersion !== upstreamVersion)
 		) {
-			throw new AutoBotReleaseError("Prepared release plan does not match its published upstream release");
+			throw new AutoBotReleaseError("Prepared release plan does not match its retained published upstream release");
 		}
 		await assertRemoteInputs(
 			config,
@@ -1830,9 +2041,28 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			canonicalCommit,
 			pinnedUpstream.ref,
 			pinnedUpstream.commit,
-			pinnedUpstream.version,
+			upstreamCommit,
+			upstreamVersion,
 			integrationRemoteCommit,
 		);
+		if (authenticatedCompletion) {
+			if (!authenticatedCandidateMerge) {
+				throw new AutoBotReleaseError("Completed publication candidate merge identity is unavailable");
+			}
+			state = await transition(config.workRoot, state, "published", {
+				upstreamCommit: authenticatedCompletion.upstreamCommit,
+				upstreamRef: undefined,
+				officialUpstreamRef: pinnedUpstream.ref,
+				candidateCommit: authenticatedCompletion.forkCommit,
+				candidateMergeCommit: authenticatedCandidateMerge,
+				integrationRemoteCommit: authenticatedCompletion.forkCommit,
+				pendingIntegrationCommit: undefined,
+				publishedForkCommit: authenticatedCompletion.forkCommit,
+				publishedUpstreamCommit: authenticatedCompletion.upstreamCommit,
+				publishedUpstreamVersion: authenticatedCompletion.upstreamVersion,
+				buildFailure: undefined,
+			});
+		}
 		if (mode.kind === "publish-prepared") {
 			if (!preparedPlan) throw new AutoBotReleaseError("Prepared release plan identity is unavailable");
 			if (
@@ -1858,8 +2088,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			if (!(await isAncestor(managed.worktree, canonicalCommit, retainedHead))) {
 				throw new AutoBotReleaseError("Prepared candidate does not retain the currently pinned canonical commit");
 			}
-			if (!(await isAncestor(managed.worktree, pinnedUpstream.commit, retainedHead))) {
-				throw new AutoBotReleaseError("Prepared candidate does not retain its signed upstream release commit");
+			if (!(await isAncestor(managed.worktree, upstreamCommit, retainedHead))) {
+				throw new AutoBotReleaseError("Prepared candidate does not retain its signed effective upstream commit");
 			}
 			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
 			const candidate: LocalCandidate = {
@@ -1873,7 +2103,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			};
 			state = await transition(config.workRoot, state, "synchronizing", {
 				canonicalCommit,
-				upstreamCommit: pinnedUpstream.commit,
+				upstreamCommit,
 				candidateCommit: candidate.forkCommit,
 				pendingIntegrationCommit: candidate.forkCommit,
 			});
@@ -1885,9 +2115,10 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					canonicalRepository,
 					canonicalRef,
 					expectedCanonicalCommit: canonicalCommit,
-					expectedUpstreamCommit: pinnedUpstream.commit,
+					expectedUpstreamCommit: upstreamCommit,
+					expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 					expectedUpstreamRef: pinnedUpstream.ref,
-					expectedUpstreamVersion: pinnedUpstream.version,
+					expectedUpstreamVersion: upstreamVersion,
 					expectedIntegrationCommit: integrationRemoteCommit,
 					commandRecorder,
 				},
@@ -1896,7 +2127,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			state = await transition(config.workRoot, state, "publishing", {
 				integrationRemoteCommit: expectedIntegrationCommit,
 				pendingIntegrationCommit: undefined,
-				upstreamRef: pinnedUpstream.ref,
+				upstreamRef: undefined,
+				officialUpstreamRef: pinnedUpstream.ref,
 			});
 			await assertRemoteInputs(
 				config,
@@ -1906,7 +2138,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				canonicalCommit,
 				pinnedUpstream.ref,
 				pinnedUpstream.commit,
-				pinnedUpstream.version,
+				upstreamCommit,
+				upstreamVersion,
 				expectedIntegrationCommit,
 			);
 			const published = await publishPreparedLocalRelease(config, candidate, mode.stageRoot, commandRecorder);
@@ -1916,6 +2149,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			}
 			await transition(config.workRoot, state, "published", {
 				publishedForkCommit: candidate.forkCommit,
+				publishedUpstreamCommit: candidate.upstreamCommit,
+				publishedUpstreamVersion: candidate.upstreamVersion,
 				buildFailure: undefined,
 			});
 			return;
@@ -1925,7 +2160,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			producerCommit: producer.commit,
 			canonicalCommit,
 			upstreamCommit,
-			upstreamRef: pinnedUpstream.ref,
+			upstreamRef: undefined,
+			officialUpstreamRef: pinnedUpstream.ref,
 			integrationRemoteCommit,
 		});
 		const ompAttempts = { value: 0 };
@@ -1948,8 +2184,9 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				canonicalRef,
 				expectedCanonicalCommit: canonicalCommit,
 				expectedUpstreamCommit: upstreamCommit,
+				expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 				expectedUpstreamRef: pinnedUpstream.ref,
-				expectedUpstreamVersion: pinnedUpstream.version,
+				expectedUpstreamVersion: upstreamVersion,
 				expectedIntegrationCommit: integrationRemoteCommit,
 				commandRecorder,
 			};
@@ -1973,6 +2210,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			canonicalRef,
 			canonicalCommit,
 			pinnedUpstream.ref,
+			pinnedUpstream.commit,
 			upstreamCommit,
 			upstreamVersion,
 			integrationRemoteCommit,
@@ -2003,7 +2241,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				canonicalCommit,
 				pinnedUpstream.ref,
 				pinnedUpstream.commit,
-				pinnedUpstream.version,
+				upstreamCommit,
+				upstreamVersion,
 				integrationRemoteCommit,
 			);
 			await setPhase("building", {
@@ -2048,8 +2287,9 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				canonicalRef,
 				expectedCanonicalCommit: canonicalCommit,
 				expectedUpstreamCommit: upstreamCommit,
+				expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 				expectedUpstreamRef: pinnedUpstream.ref,
-				expectedUpstreamVersion: pinnedUpstream.version,
+				expectedUpstreamVersion: upstreamVersion,
 				expectedIntegrationCommit: integrationRemoteCommit,
 				commandRecorder,
 			},
@@ -2069,7 +2309,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			canonicalCommit,
 			pinnedUpstream.ref,
 			pinnedUpstream.commit,
-			pinnedUpstream.version,
+			upstreamCommit,
+			upstreamVersion,
 			expectedIntegrationCommit,
 		);
 
@@ -2092,6 +2333,8 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 						candidateMergeCommit: publishCandidateMerge,
 						integrationRemoteCommit: expectedIntegrationCommit,
 						publishedForkCommit: publishCandidate.forkCommit,
+						publishedUpstreamCommit: publishCandidate.upstreamCommit,
+						publishedUpstreamVersion: publishCandidate.upstreamVersion,
 						buildFailure: undefined,
 					},
 				);
@@ -2119,8 +2362,9 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 						canonicalRef,
 						expectedCanonicalCommit: canonicalCommit,
 						expectedUpstreamCommit: upstreamCommit,
+						expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 						expectedUpstreamRef: pinnedUpstream.ref,
-						expectedUpstreamVersion: pinnedUpstream.version,
+						expectedUpstreamVersion: upstreamVersion,
 						expectedIntegrationCommit: expectedIntegrationCommit,
 						commandRecorder,
 					},
@@ -2181,8 +2425,9 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 							canonicalRef,
 							expectedCanonicalCommit: canonicalCommit,
 							expectedUpstreamCommit: upstreamCommit,
+							expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 							expectedUpstreamRef: pinnedUpstream.ref,
-							expectedUpstreamVersion: pinnedUpstream.version,
+							expectedUpstreamVersion: upstreamVersion,
 							expectedIntegrationCommit: expectedIntegrationCommit,
 							commandRecorder,
 						},
@@ -2238,8 +2483,9 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 						canonicalRef,
 						expectedCanonicalCommit: canonicalCommit,
 						expectedUpstreamCommit: upstreamCommit,
+						expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 						expectedUpstreamRef: pinnedUpstream.ref,
-						expectedUpstreamVersion: pinnedUpstream.version,
+						expectedUpstreamVersion: upstreamVersion,
 						expectedIntegrationCommit: expectedIntegrationCommit,
 						commandRecorder,
 					},

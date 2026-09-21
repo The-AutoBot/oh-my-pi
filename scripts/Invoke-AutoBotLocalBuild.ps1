@@ -1,12 +1,11 @@
 # AutoBot Local Build launcher
-# Runs the fixed local pipeline once with the caller-pinned Bun and config paths.
+# Runs the fixed local pipeline once with the config-authorized Bun runtime.
 
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath,
 
-    [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$BunPath,
 
@@ -49,6 +48,21 @@ function Resolve-ExistingFile {
     }
 
     return $item.FullName
+}
+
+function Resolve-ConfiguredBunPath {
+    param([Parameter(Mandatory = $true)][string]$ResolvedConfigPath)
+
+    try {
+        $parsed = Get-Content -LiteralPath $ResolvedConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $property = $parsed.PSObject.Properties["runnerBun"]
+        if ($null -eq $property -or -not ($property.Value -is [string]) -or [string]::IsNullOrWhiteSpace($property.Value)) {
+            throw "invalid"
+        }
+        return Resolve-ExistingFile -Path $property.Value -Label "Configured runner"
+    } catch {
+        throw "The configured runner is unavailable."
+    }
 }
 function Resolve-ExistingDirectory {
     param(
@@ -103,7 +117,13 @@ function Invoke-AutoBotLocalBuild {
 
     try {
         $resolvedConfigPath = Resolve-ExistingFile -Path $ConfigPath -Label "ConfigPath"
-        $resolvedBunPath = Resolve-ExistingFile -Path $BunPath -Label "BunPath"
+        $resolvedBunPath = Resolve-ConfiguredBunPath -ResolvedConfigPath $resolvedConfigPath
+        if (-not [string]::IsNullOrEmpty($BunPath)) {
+            $resolvedAssertedBunPath = Resolve-ExistingFile -Path $BunPath -Label "BunPath"
+            if (-not [string]::Equals($resolvedAssertedBunPath, $resolvedBunPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "BunPath does not match the configured runner."
+            }
+        }
         if ($VerifyOnly -and -not [string]::IsNullOrEmpty($PublishPrepared)) {
             throw "VerifyOnly and PublishPrepared are mutually exclusive."
         }

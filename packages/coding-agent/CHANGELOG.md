@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Local publishers now recover stale integration checkpoints only from fully verified completed signed releases, retain published source identity across interrupted preparations, and preserve an already-shipped upstream base until an official stable descendant is available.
+- Scheduled local publishers now use the configured Bun runtime directly; explicit mismatched runtime paths are rejected before execution or registration.
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
 - Fixed Windows session enumeration in indexed and in-memory storage when journal paths use native backslash separators.

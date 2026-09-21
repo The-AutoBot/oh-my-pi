@@ -736,9 +736,12 @@ fields are rejected):
   including `refs/heads/main`, are rejected. The controller pins and
   revalidates that exact selected tag's peeled commit and coding-agent package
   version; a newer release appearing during the run does not move the pin.
-  If the retained upstream commit is ahead of or incomparable with that
-  official release, the run fails closed until a published descendant exists;
-  it never relabels newer maintained ancestry as an older release.
+  If that official release is an ancestor of an authenticated retained upstream
+  base, the controller preserves the retained commit and its actual package
+  version as signed provenance. The official tag remains a separate tracking
+  and network-stability pin. A future stable descendant advances the base
+  automatically; divergent history fails closed. A stale state field alone
+  cannot authorize adopting an otherwise unretained upstream commit.
   It keeps an owned persistent repository and worktree under the private,
   absolute `workRoot`; it must be separate from the trusted producer checkout.
   Prefer a short directory directly under your user profile: deeply nested
@@ -780,11 +783,14 @@ runs so both participate in its non-overlap guard:
 
 ```powershell
 & .\scripts\Invoke-AutoBotLocalBuild.ps1 `
-  -ConfigPath 'C:\secure\autobot-local.json' `
-  -BunPath 'C:\tools\bun\bun.exe'
+  -ConfigPath 'C:\secure\autobot-local.json'
 ```
 
-It suppresses sensitive child output, propagates the controller exit code, and
+The launcher resolves Bun from the private configuration's `runnerBun`, so a
+configured toolchain update does not require a separate scheduled-action edit.
+An optional explicit `-BunPath` is a checked assertion: a different resolved
+path is rejected before execution, never silently substituted. The launcher
+suppresses sensitive child output, propagates the controller exit code, and
 rejects rooted-relative as well as ordinary relative config and Bun paths. A
 same-user/configuration mutex makes an overlapping invocation a successful
 no-op rather than a second producer run.
@@ -811,20 +817,18 @@ create or update tags/releases, or advance the signed channel:
 ```powershell
 & .\scripts\Invoke-AutoBotLocalBuild.ps1 `
   -ConfigPath 'C:\secure\autobot-local.json' `
-  -BunPath 'C:\tools\bun\bun.exe' `
   -VerifyOnly
 ```
 
 To promote one explicitly selected preserved stage without rebuilding,
 re-signing, or selecting the latest release again, pass its absolute directory.
-The retained controller state, release plan, committed candidate HEAD, pinned
-upstream release tag/commit/version, and signed stage must all describe the
-same candidate:
+The retained controller state, release plan, committed candidate HEAD, effective
+upstream commit/version, separately pinned official release observation, and
+signed stage must all describe the same candidate:
 
 ```powershell
 & .\scripts\Invoke-AutoBotLocalBuild.ps1 `
   -ConfigPath 'C:\secure\autobot-local.json' `
-  -BunPath 'C:\tools\bun\bun.exe' `
   -PublishPrepared 'C:\secure\autobot-work\autobot-release-selected'
 ```
 
@@ -835,8 +839,7 @@ To register, but not start, the dedicated hourly task:
 
 ```powershell
 & .\scripts\Install-AutoBotLocalBuildTask.ps1 `
-  -ConfigPath 'C:\secure\autobot-local.json' `
-  -BunPath 'C:\tools\bun\bun.exe'
+  -ConfigPath 'C:\secure\autobot-local.json'
 ```
 
 The installer registers **AutoBot Local Build** for the current Windows user
@@ -856,6 +859,17 @@ and remote snapshot. Added remotes or unexpected ref changes fail validation;
 the controller commits accepted fixes while retaining candidate ancestry.
 Failures outside the explicitly reviewable integration cases block the run
 rather than being repaired or retried.
+
+After an interrupted or separately completed publication, a stale integration
+checkpoint can recover automatically only when the current signed channel,
+exact immutable published release, tag, downloaded assets and provenance, and
+integration branch all authenticate the same completed release. Recovery
+requires forward checkpoint ancestry and consistent owned local history,
+rechecks remote publication state after downloading, and never republishes
+assets or rewrites Git history. Pending-push markers still admit only their
+exact recorded outcomes; unrelated branch movement remains an error. Published
+source identity is retained separately from an in-progress next candidate so
+an interrupted preparation cannot invalidate the previous published checkpoint.
 
 The publisher validates the clean committed candidate, exact pinned tools,
 trusted reused native inputs, and the signed predecessor before compiling the
@@ -884,8 +898,11 @@ the API never searches for the newest stage, rebuilds, or re-signs. It validates
 the retained inputs and copies them into a private verification snapshot,
 preserving the supplied stage. It creates a draft only when none exists, or
 reuses one exact matching next-sequence draft without replacing its assets.
-Conflicting tags, foreign or ambiguous drafts, stale channel state, and an
-already-published target fail closed.
+An exact already-published next release can complete channel-only promotion
+after independent verification; it is not republished. Conflicting tags,
+foreign or ambiguous drafts, altered assets, and stale predecessor state fail
+closed. A release already named by the current signed channel uses the
+read-only completed-publication recovery above, not next-release promotion.
 
 Publisher subprocesses inherit the caller's current environment unless an
 explicit environment is supplied. Operators can therefore isolate Git settings

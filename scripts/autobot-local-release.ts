@@ -934,6 +934,25 @@ async function listGitHubReleases(repository: string): Promise<readonly GitHubRe
 	return releases.sort((left, right) => left.sequence - right.sequence);
 }
 
+async function assertCompletedReleaseChain(
+	config: LocalAutomationConfig,
+	sequence: number,
+	tag: string,
+	forkCommit: string,
+): Promise<void> {
+	const releases = await listGitHubReleases(config.repository);
+	if (
+		releases.length !== sequence ||
+		releases.some((release, index) => release.draft || release.sequence !== index + 1) ||
+		releases.at(-1)?.tag !== tag ||
+		releases.at(-1)?.targetCommit !== forkCommit
+	) {
+		throw new AutoBotReleaseError(
+			"Signed channel does not match the exact completed immutable AutoBot release chain",
+		);
+	}
+}
+
 function parseIncludedGitHubResponse(output: string): { readonly status: number; readonly body: string } {
 	const statuses = [...output.matchAll(/(?:^|\n)HTTP\/[^\s]+\s+([0-9]{3})\b/gm)];
 	const last = statuses.at(-1);
@@ -1427,6 +1446,10 @@ async function verifyPublishedRelease(
 	);
 	const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
 	const verified = await readVerifiedEnvelope(path.join(downloaded, "signed-envelope.json"), trusted);
+	const downloadedManifest = Buffer.from(await Bun.file(path.join(downloaded, "manifest.json")).arrayBuffer());
+	if (!downloadedManifest.equals(Buffer.from(verified.envelope.payload, "utf8"))) {
+		throw new AutoBotReleaseError("Downloaded manifest bytes do not match the signed envelope payload");
+	}
 	await fetchAndAssertReleaseTag(config, candidate.sourceRoot, tag, verified.manifest.forkCommit, recorder);
 	// A predecessor is authenticated by the exact signed channel envelope and
 	// release tag binding; verify its downloaded payloads against that signed manifest,
@@ -1462,6 +1485,110 @@ async function verifyPublishedRelease(
 		cwd: publisherRoot,
 		env: environment,
 	});
+}
+
+export interface CompletedLocalReleaseIdentity extends PreparedLocalReleaseIdentity {
+	readonly releaseSequence: number;
+	readonly tag: string;
+}
+
+/**
+ * Authenticate the immutable publication currently named by the signed channel.
+ * This is deliberately read-only: it neither repairs a partial publication nor
+ * accepts a release that has not already completed channel promotion.
+ */
+export async function authenticateCompletedLocalRelease(
+	config: LocalAutomationConfig,
+	observedIntegrationCommit: string,
+	sourcePath: string,
+	recorder: LocalCommandRecorder,
+): Promise<CompletedLocalReleaseIdentity> {
+	requirePublisherConfiguration(config);
+	const forkCommit = requireCommit(observedIntegrationCommit, "Observed integration commit");
+	const sourceRoot = await requireDirectory(sourcePath, "Completed publication source root");
+	await assertCleanCommittedCheckout(sourceRoot, "Completed publication source");
+	await Promise.all([
+		requireConfiguredFile(config.runnerBun, "Runner Bun"),
+		requireConfiguredFile(config.publicKeyPath, "Trusted public key"),
+		assertExactBun(config.runnerBun, config.runnerBunVersion, "Runner Bun"),
+	]);
+	const workRoot = await assertAutoBotPrivateDirectory(config.workRoot);
+	const recoveryRoot = await ensureAutoBotPrivateDirectory(
+		await fs.mkdtemp(path.join(workRoot, "autobot-release-c-")),
+	);
+	try {
+		const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
+		const channel = await readChannelEnvelope(
+			config,
+			trusted,
+			path.join(recoveryRoot, "completed-channel-envelope.json"),
+		);
+		if (!channel) throw new AutoBotReleaseError("Completed publication recovery requires a signed channel");
+		const manifest = channel.verified.manifest;
+		if (manifest.forkCommit !== forkCommit) {
+			throw new AutoBotReleaseError("Signed channel does not name the observed integration commit");
+		}
+		if (
+			manifest.schemaVersion !== AUTO_BOT_RELEASE_SCHEMA_VERSION ||
+			manifest.sessionFormatVersion !== AUTO_BOT_SESSION_FORMAT_VERSION ||
+			manifest.collabProtocolVersion !== AUTO_BOT_COLLAB_PROTOCOL_VERSION ||
+			manifest.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH
+		) {
+			throw new AutoBotReleaseError("Signed channel is incompatible with the trusted local producer contract");
+		}
+		const sequence = requirePositiveSafeInteger(manifest.releaseSequence, "Completed release sequence");
+		const tag = requireReleaseTag(sequence);
+		await assertCompletedReleaseChain(config, sequence, tag, forkCommit);
+		const candidate: LocalCandidate = {
+			sourceRoot,
+			forkCommit,
+			upstreamCommit: manifest.upstreamCommit,
+			upstreamVersion: manifest.upstreamVersion,
+			compatibilityEpoch: manifest.compatibilityEpoch,
+			changed: false,
+			sensitivePaths: [],
+		};
+		requireCandidate(candidate);
+		const temporaryRoot = await ensureAutoBotPrivateDirectory(path.join(recoveryRoot, "t"));
+		const environment = await createPinnedBunCommandEnvironment(
+			path.join(recoveryRoot, "bp"),
+			config.runnerBun,
+			config.runnerBunVersion,
+			commandEnvironment(config, temporaryRoot),
+		);
+		const integrationRef = await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+		await verifyPublishedRelease(
+			config,
+			candidate,
+			tag,
+			recoveryRoot,
+			environment,
+			{ expectedEnvelope: channel.path, canonicalRef: integrationRef },
+			recorder,
+		);
+		const recheckedChannel = await readChannelEnvelope(
+			config,
+			trusted,
+			path.join(recoveryRoot, "rechecked-channel-envelope.json"),
+		);
+		if (!recheckedChannel) {
+			throw new AutoBotReleaseError("Signed channel disappeared during completed publication recovery");
+		}
+		await compareExactBytes(channel.path, recheckedChannel.path, "Rechecked signed channel envelope");
+		await assertCompletedReleaseChain(config, sequence, tag, forkCommit);
+		await fetchAndAssertReleaseTag(config, sourceRoot, tag, forkCommit, recorder);
+		await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+		return {
+			forkCommit,
+			upstreamCommit: manifest.upstreamCommit,
+			upstreamVersion: manifest.upstreamVersion,
+			compatibilityEpoch: manifest.compatibilityEpoch,
+			releaseSequence: sequence,
+			tag,
+		};
+	} finally {
+		await fs.rm(recoveryRoot, { recursive: true, force: true });
+	}
 }
 
 async function stageNativeAddons(

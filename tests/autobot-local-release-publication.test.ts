@@ -227,6 +227,13 @@ if (process.platform === "win32" && process.arch === "x64") {
 			testTimeoutMilliseconds,
 		);
 		test(
+			"authenticates a channel-complete publication twice without its retained stage or any release mutation",
+			async () => {
+				await runScenario("recovery-complete", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+		test(
 			"compares a subsequent signed-channel predecessor as committed bytes when autocrlf rewrites the checkout",
 			async () => {
 				await runScenario("subsequent-autocrlf", requireGhExecutable());
@@ -243,6 +250,12 @@ if (process.platform === "win32" && process.arch === "x64") {
 			"foreign-modify-acl",
 			"contradictory-manifest",
 			"invalid-provenance",
+			"recovery-tampered",
+			"recovery-invalid-provenance",
+			"recovery-bad-signature",
+			"recovery-wrong-target",
+			"recovery-draft",
+			"recovery-foreign-release",
 		])(
 			"preserves draft, tag, and channel state at the %s boundary",
 			async scenario => {
