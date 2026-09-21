@@ -9,6 +9,7 @@
  * @property {EmbeddedAddonVariant} variant
  * @property {string} filename
  * @property {number} size
+ * @property {string} sha256
  * @property {string=} filePath
  */
 
@@ -22,7 +23,9 @@
 /**
  * @typedef {Object} EmbeddedAddon
  * @property {string} platformTag
- * @property {string} version
+ * @property {string} applicationVersion
+ * @property {string} nativeCompatibilityVersion
+ * @property {string} payloadSha256
  * @property {EmbeddedAddonFile[]} files
  * @property {EmbeddedAddonArchive=} archive
  */

@@ -26,6 +26,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -50,11 +51,15 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			detectCompiledBinary({
 				embeddedAddon: {
 					platformTag: "linux-x64",
-					version: "14.5.2",
+					applicationVersion: "14.5.2",
+					nativeCompatibilityVersion: "18.2.7",
+					payloadSha256: "a".repeat(64),
 					files: [
 						{
 							variant: "modern",
 							filename: "pi_natives.linux-x64-modern.node",
+							size: 1,
+							sha256: "b".repeat(64),
 							filePath: "/$bunfs/root/packages/natives/native/pi_natives.linux-x64-modern.node",
 						},
 					],
@@ -208,28 +213,54 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			const baseline = Buffer.from("baseline native addon");
 			const modernFilename = "pi_natives.linux-x64-modern.node";
 			const baselineFilename = "pi_natives.linux-x64-baseline.node";
-			await Bun.write(
-				archivePath,
-				await new Bun.Archive(
-					{
-						[modernFilename]: modern,
-						[baselineFilename]: baseline,
-					},
-					{ compress: "gzip", level: 9 },
-				).bytes(),
-			);
+			const archiveBytes = await new Bun.Archive(
+				{
+					[modernFilename]: modern,
+					[baselineFilename]: baseline,
+				},
+				{ compress: "gzip", level: 9 },
+			).bytes();
+			await Bun.write(archivePath, archiveBytes);
+			const payloadSha256 = createHash("sha256").update(archiveBytes).digest("hex");
 
 			const files: EmbeddedAddonFile[] = [
-				{ variant: "modern", filename: modernFilename, size: modern.length },
-				{ variant: "baseline", filename: baselineFilename, size: baseline.length },
+				{
+					variant: "modern",
+					filename: modernFilename,
+					size: modern.length,
+					sha256: createHash("sha256").update(modern).digest("hex"),
+				},
+				{
+					variant: "baseline",
+					filename: baselineFilename,
+					size: baseline.length,
+					sha256: createHash("sha256").update(baseline).digest("hex"),
+				},
 			];
 
-			const written = extractEmbeddedAddonArchive({ archivePath, files, targetDir });
+			const written = extractEmbeddedAddonArchive({ archivePath, payloadSha256, files, targetDir });
 			expect(written.map(filePath => path.basename(filePath)).sort()).toEqual([baselineFilename, modernFilename]);
 			expect(await fs.readFile(path.join(targetDir, modernFilename), "utf8")).toBe("modern native addon");
 			expect(await fs.readFile(path.join(targetDir, baselineFilename), "utf8")).toBe("baseline native addon");
 
-			expect(extractEmbeddedAddonArchive({ archivePath, files, targetDir })).toEqual([]);
+			expect(extractEmbeddedAddonArchive({ archivePath, payloadSha256, files, targetDir })).toEqual([]);
+			await fs.writeFile(path.join(targetDir, modernFilename), Buffer.alloc(modern.length, 0x78));
+			expect(
+				extractEmbeddedAddonArchive({ archivePath, payloadSha256, files, targetDir }).map(filePath =>
+					path.basename(filePath),
+				),
+			).toEqual([modernFilename]);
+			expect(await fs.readFile(path.join(targetDir, modernFilename))).toEqual(modern);
+			const tamperedArchivePath = path.join(testDir, "tampered.tar.gz");
+			await fs.writeFile(tamperedArchivePath, Buffer.concat([Buffer.from(archiveBytes), Buffer.from("tampered")]));
+			expect(() =>
+				extractEmbeddedAddonArchive({
+					archivePath: tamperedArchivePath,
+					payloadSha256,
+					files,
+					targetDir: path.join(testDir, "tampered-cache"),
+				}),
+			).toThrow("payload digest mismatch");
 		} finally {
 			await fs.rm(testDir, { recursive: true, force: true });
 		}

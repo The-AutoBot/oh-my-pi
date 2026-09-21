@@ -14,6 +14,13 @@ import {
 	ensureAutoBotPrivateDirectory,
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { isRecord } from "../packages/utils/src/type-guards.ts";
+import {
+	validateNativeArtifactInputs,
+	NativeInputError,
+	type NativeBuildArtifact,
+	type NativeBuildIdentity,
+	type ValidatedNativeArtifactInputs,
+} from "../packages/natives/scripts/native-build-provenance.ts";
 import { containsVersionSentinel, versionSentinelFor } from "../packages/natives/native/version-sentinel.js";
 import {
 	AutoBotReleaseError,
@@ -25,6 +32,7 @@ import {
 	requireCommit,
 	requirePositiveSafeInteger,
 	requireRegularFile,
+	requireSha256,
 	requireString,
 	writeJsonAtomic,
 	verifyIndexedAssets,
@@ -145,14 +153,16 @@ interface ReleaseBuildIdentity {
 	readonly collabProtocolVersion: number;
 	readonly compatibilityEpoch: number;
 }
-interface NativeAddonReuseEvidence {
-	readonly filename: string;
-	readonly version: string;
-	readonly variant: "baseline" | "modern";
-	readonly size: number;
-	readonly sha256: string;
+interface NativeAddonReuseArtifactEvidence extends NativeBuildArtifact {
 	readonly origin: "local-reuse";
 	readonly producerSourceCommit: null;
+}
+interface NativeAddonReuseEvidence {
+	readonly nativeCompatibilityVersion: string;
+	readonly inputsSha256: string;
+	readonly provenanceSha256: string;
+	readonly build: NativeBuildIdentity;
+	readonly artifacts: readonly NativeAddonReuseArtifactEvidence[];
 }
 
 interface CandidateAssets {
@@ -160,7 +170,7 @@ interface CandidateAssets {
 	readonly bootstrap: string;
 	readonly webArchive: string;
 	readonly webBundleId: string;
-	readonly nativeAddons: readonly NativeAddonReuseEvidence[];
+	readonly nativeReuse: NativeAddonReuseEvidence;
 }
 
 interface CoordinatorAsset {
@@ -798,6 +808,7 @@ function requirePublisherConfiguration(config: LocalAutomationConfig): void {
 	] as const) {
 		requireAbsolutePath(value, label);
 	}
+	requireSha256(config.nativeAddonProvenanceSha256, "Native addon provenance SHA-256");
 	if (typeof config.allowInitial !== "boolean") throw new AutoBotReleaseError("allowInitial must be boolean");
 }
 
@@ -1590,90 +1601,115 @@ export async function authenticateCompletedLocalRelease(
 		await fs.rm(recoveryRoot, { recursive: true, force: true });
 	}
 }
+const WINDOWS_NATIVE_ARTIFACTS: Record<string, true> = {
+	"pi_natives.win32-x64-baseline.node": true,
+	"pi_natives.win32-x64-modern.node": true,
+};
+
+function assertWindowsNativeArtifacts(validated: ValidatedNativeArtifactInputs): void {
+	if (
+		validated.provenance.build.target !== "x86_64-pc-windows-msvc" ||
+		!validated.artifacts.some(artifact => artifact.filename === "pi_natives.win32-x64-baseline.node") ||
+		validated.artifacts.some(artifact => !WINDOWS_NATIVE_ARTIFACTS[artifact.filename])
+	) {
+		throw new NativeInputError(
+			"NATIVE_WINDOWS_ARTIFACT_SET_INVALID",
+			"Pinned native provenance must identify x86_64-pc-windows-msvc and contain the Windows x64 baseline addon plus only supported Windows x64 variants",
+		);
+	}
+}
+
+export async function validateConfiguredNativeReuseInputs(
+	config: LocalAutomationConfig,
+	sourceRoot: string,
+): Promise<ValidatedNativeArtifactInputs> {
+	const nativeAddonDirectory = await requireDirectory(config.nativeAddonDirectory, "Native addon directory");
+	if (!sameCanonicalPath(nativeAddonDirectory, config.nativeAddonDirectory)) {
+		throw new NativeInputError(
+			"NATIVE_DIRECTORY_NOT_CANONICAL",
+			"Native addon directory must use its canonical path without aliases",
+		);
+	}
+	if (isInside(sourceRoot, nativeAddonDirectory) || isInside(nativeAddonDirectory, sourceRoot)) {
+		throw new NativeInputError(
+			"NATIVE_DIRECTORY_OVERLAP",
+			"Native addon directory must be separate from the candidate checkout",
+		);
+	}
+	const validated = await validateNativeArtifactInputs({
+		sourceRoot,
+		nativeDirectory: nativeAddonDirectory,
+		provenanceSha256: config.nativeAddonProvenanceSha256,
+	});
+	assertWindowsNativeArtifacts(validated);
+	return validated;
+}
 
 async function stageNativeAddons(
-	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
-): Promise<readonly NativeAddonReuseEvidence[]> {
-	const sourceRoot = candidate.sourceRoot;
-	const inputDirectory = await requireDirectory(config.nativeAddonDirectory, "Native addon directory");
-	if (!sameCanonicalPath(inputDirectory, config.nativeAddonDirectory)) {
-		throw new AutoBotReleaseError("Native addon directory must use its canonical path without aliases");
-	}
-	if (isInside(sourceRoot, inputDirectory) || isInside(inputDirectory, sourceRoot)) {
-		throw new AutoBotReleaseError("Native addon directory must be separate from the candidate checkout");
-	}
-	const nativeRoot = path.join(sourceRoot, "packages", "natives");
-	const nativeDirectory = path.join(nativeRoot, "native");
+	validated: ValidatedNativeArtifactInputs,
+): Promise<NativeAddonReuseEvidence> {
+	const nativeDirectory = path.join(candidate.sourceRoot, "packages", "natives", "native");
 	const canonicalNativeDirectory = await requireDirectory(nativeDirectory, "Candidate native staging directory");
 	if (!sameCanonicalPath(nativeDirectory, canonicalNativeDirectory)) {
 		throw new AutoBotReleaseError("Candidate native staging directory must be a real canonical directory");
 	}
-	const packageJson = await readJson(path.join(nativeRoot, "package.json"), "candidate native package");
-	if (!isRecord(packageJson)) throw new AutoBotReleaseError("Candidate native package metadata must be an object");
-	const version = requireUpstreamVersion(
-		requireString(packageJson.version, "Candidate native package version"),
-		"Candidate native package version",
-	);
-	if (version !== candidate.upstreamVersion) {
-		throw new AutoBotReleaseError("Candidate native package version does not match the approved upstream version");
-	}
-	const expectedSentinel = versionSentinelFor(version);
-	const descriptors = [
-		{ filename: "pi_natives.win32-x64-baseline.node", variant: "baseline" as const, required: true },
-		{ filename: "pi_natives.win32-x64-modern.node", variant: "modern" as const, required: false },
-	] as const;
-	const evidence: NativeAddonReuseEvidence[] = [];
-	for (const descriptor of descriptors) {
-		const destination = path.join(nativeDirectory, descriptor.filename);
+	for (const filename of Object.keys(WINDOWS_NATIVE_ARTIFACTS)) {
+		const destination = path.join(nativeDirectory, filename);
 		const existingDestination = await fs.lstat(destination).catch(error => {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
 		});
-		if (existingDestination) {
-			if (!existingDestination.isFile() || existingDestination.isSymbolicLink()) {
-				throw new AutoBotReleaseError(`Candidate ${descriptor.variant} native staging path is not a real file`);
-			}
-			await fs.rm(destination);
-		}
-		const source = path.join(inputDirectory, descriptor.filename);
-		const sourceStat = await fs.lstat(source).catch(error => {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-			throw error;
-		});
-		if (!sourceStat) {
-			if (descriptor.required) {
-				throw new AutoBotReleaseError(`Required ${descriptor.variant} native addon is missing`);
-			}
-			continue;
-		}
-		if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
-			throw new AutoBotReleaseError(`${descriptor.variant} native addon must be a real regular file`);
-		}
-		const canonicalSource = await requireCanonicalImportableFile(source, `${descriptor.variant} native addon`);
-		const before = await hashFile(canonicalSource);
-		const bytes = await fs.readFile(canonicalSource);
-		if (!containsVersionSentinel(bytes, expectedSentinel)) {
-			throw new AutoBotReleaseError(
-				`${descriptor.variant} native addon does not contain the exact ${version} version sentinel`,
+		if (!existingDestination) continue;
+		if (!existingDestination.isFile() || existingDestination.isSymbolicLink()) {
+			throw new NativeInputError(
+				"NATIVE_STAGING_PATH_INVALID",
+				`Candidate native staging path for ${filename} is not a real file`,
 			);
 		}
-		const staged = await copyOwnedPrivateFile(canonicalSource, destination, `${descriptor.variant} native addon`);
-		const after = await hashFile(staged);
-		if (after.sha256 !== before.sha256 || after.size !== before.size) {
-			throw new AutoBotReleaseError(`${descriptor.variant} native addon changed while it was staged`);
+		await fs.rm(destination);
+	}
+	const artifacts: NativeAddonReuseArtifactEvidence[] = [];
+	const expectedSentinel = versionSentinelFor(validated.provenance.nativeCompatibilityVersion);
+	for (const artifact of validated.artifacts) {
+		const destination = path.join(nativeDirectory, artifact.filename);
+		const before = await hashFile(artifact.path);
+		if (before.sha256 !== artifact.sha256 || before.size !== artifact.size) {
+			throw new NativeInputError(
+				"NATIVE_ARTIFACT_CHANGED",
+				`Validated ${artifact.variant} native addon changed before staging`,
+			);
 		}
-		evidence.push({
-			filename: descriptor.filename,
-			version,
-			variant: descriptor.variant,
-			size: after.size,
-			sha256: after.sha256,
+		const staged = await copyOwnedPrivateFile(artifact.path, destination, `${artifact.variant} native addon`);
+		const after = await hashFile(staged);
+		if (after.sha256 !== artifact.sha256 || after.size !== artifact.size) {
+			throw new NativeInputError(
+				"NATIVE_ARTIFACT_CHANGED",
+				`${artifact.variant} native addon changed while it was staged`,
+			);
+		}
+		if (!containsVersionSentinel(await fs.readFile(staged), expectedSentinel)) {
+			throw new NativeInputError(
+				"NATIVE_SENTINEL_MISMATCH",
+				`Staged ${artifact.variant} native addon lost its exact compatibility version sentinel`,
+			);
+		}
+		artifacts.push({
+			filename: artifact.filename,
+			variant: artifact.variant,
+			size: artifact.size,
+			sha256: artifact.sha256,
 			origin: "local-reuse",
 			producerSourceCommit: null,
 		});
 	}
-	return evidence;
+	return {
+		nativeCompatibilityVersion: validated.provenance.nativeCompatibilityVersion,
+		inputsSha256: validated.provenance.inputsSha256,
+		provenanceSha256: validated.provenanceSha256,
+		build: validated.provenance.build,
+		artifacts,
+	};
 }
 
 async function qualifyNativeLoader(
@@ -1688,8 +1724,10 @@ async function qualifyNativeLoader(
 	await Bun.write(
 		probe,
 		`import { pathToFileURL } from "node:url";
+// The candidate entrypoint is runtime-selected by the isolated publisher probe.
 const native = await import(pathToFileURL(process.argv[2]).href);
 if (native.visibleWidth("x", 4) !== 1) throw new Error("native application contract mismatch");
+if (typeof native.LiveWebRtcPeer?.prototype?.setOutputMuted !== "function") throw new Error("native audio contract mismatch");
 `,
 	);
 	const loaders =
@@ -1699,17 +1737,24 @@ if (native.visibleWidth("x", 4) !== 1) throw new Error("native application contr
 					{ executable: config.compilerBun, kind: "native-addon-reuse-check" as const },
 					{ executable: config.runnerBun, kind: "runner-loader-compatibility-check" as const },
 				];
-	for (const loader of loaders) {
-		await runQuiet(
-			recorder,
-			loader.kind,
-			`Reused baseline native loader check (${path.basename(loader.executable)})`,
-			bunCommand(loader.executable, probe, nativeEntrypoint),
-			{
-				cwd: sourceRoot,
-				env: { ...environment, PI_NATIVE_VARIANT: "baseline" },
-				captureOutput: true,
-			},
+	try {
+		for (const loader of loaders) {
+			await runQuiet(
+				recorder,
+				loader.kind,
+				`Reused baseline native loader check (${path.basename(loader.executable)})`,
+				bunCommand(loader.executable, probe, nativeEntrypoint),
+				{
+					cwd: sourceRoot,
+					env: { ...environment, PI_NATIVE_VARIANT: "baseline" },
+				},
+			);
+		}
+	} catch (error) {
+		if (error instanceof NativeInputError) throw error;
+		throw new NativeInputError(
+			"NATIVE_LOADER_INCOMPATIBLE",
+			"Pinned native addon failed the configured Bun loader compatibility check",
 		);
 	}
 }
@@ -1718,6 +1763,7 @@ async function buildCandidateAssets(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
 	identity: ReleaseBuildIdentity,
+	validatedNativeInputs: ValidatedNativeArtifactInputs,
 	stageRoot: string,
 	environment: NodeJS.ProcessEnv,
 	recorder: LocalCommandRecorder,
@@ -1738,6 +1784,8 @@ async function buildCandidateAssets(
 	);
 	const inputs = path.join(stageRoot, "i");
 	await fs.mkdir(inputs);
+	await stageNativeAddons(candidate, validatedNativeInputs);
+	await qualifyNativeLoader(config, sourceRoot, stageRoot, compilerCommandEnvironment, recorder);
 	await runQuiet(
 		recorder,
 		"candidate-dependency-installation",
@@ -1749,6 +1797,7 @@ async function buildCandidateAssets(
 			captureOutput: true,
 		},
 	);
+	const nativeReuse = await stageNativeAddons(candidate, validatedNativeInputs);
 	await candidateBuildStage("Browser relay build failed", () =>
 		runQuiet(
 			recorder,
@@ -1797,8 +1846,6 @@ async function buildCandidateAssets(
 			},
 		),
 	);
-	const nativeAddons = await stageNativeAddons(config, candidate);
-	await qualifyNativeLoader(config, sourceRoot, stageRoot, compilerCommandEnvironment, recorder);
 	const compilerEnvironment: NodeJS.ProcessEnv = {
 		...compilerCommandEnvironment,
 		OMP_AUTOBOT_BUILD_IDENTITY: JSON.stringify(identity),
@@ -1908,7 +1955,7 @@ async function buildCandidateAssets(
 			out: webArchive,
 		}),
 	);
-	return { runtime, bootstrap, webArchive, webBundleId, nativeAddons };
+	return { runtime, bootstrap, webArchive, webBundleId, nativeReuse };
 }
 
 async function buildCoordinatorAsset(
@@ -2009,7 +2056,7 @@ async function writeLocalProvenanceEvidence(
 	stageRoot: string,
 	coordinator: CoordinatorAsset,
 	bunSupport: string,
-	nativeAddons: readonly NativeAddonReuseEvidence[],
+	nativeReuse: NativeAddonReuseEvidence,
 ): Promise<void> {
 	const coordinatorProvenance = parseCoordinatorClientProvenance(
 		await readJson(coordinator.provenance, "local coordinator provenance"),
@@ -2038,7 +2085,7 @@ async function writeLocalProvenanceEvidence(
 				size: compiler.size,
 			},
 		},
-		nativeAddons,
+		nativeReuse,
 		coordinator: {
 			repository: coordinatorProvenance.source.repository,
 			commit: coordinatorProvenance.source.commit,
@@ -2457,7 +2504,7 @@ async function finalizeVerifiedRelease(
 }
 /**
  * Build and publish one fully verified Windows x64 AutoBot release from
- * application source plus separately trusted native addon bytes.
+ * application source plus a pinned native build record and its exact addon bytes.
  *
  * Application build/smoke failures alone use LocalBuildFailure so the
  * controller can route those failures through the disposable local OMP repair
@@ -2554,6 +2601,7 @@ export async function buildAndPublishLocalRelease(
 				return { kind: "unchanged", forkCommit: candidate.forkCommit };
 			}
 		}
+		const validatedNativeInputs = await validateConfiguredNativeReuseInputs(config, sourceRoot);
 		if (options.mode === "publish") await assertIntegrationRef(config, candidate, sourceRoot, recorder);
 		const identity: ReleaseBuildIdentity = {
 			schemaVersion: AUTO_BOT_RELEASE_SCHEMA_VERSION,
@@ -2565,10 +2613,18 @@ export async function buildAndPublishLocalRelease(
 			collabProtocolVersion: AUTO_BOT_COLLAB_PROTOCOL_VERSION,
 			compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH,
 		};
-		const assets = await buildCandidateAssets(config, candidate, identity, stageRoot, environment, recorder);
+		const assets = await buildCandidateAssets(
+			config,
+			candidate,
+			identity,
+			validatedNativeInputs,
+			stageRoot,
+			environment,
+			recorder,
+		);
 		const coordinator = await buildCoordinatorAsset(config, candidate, stageRoot, environment, recorder);
 		await assertCleanCommittedCheckout(sourceRoot, "Candidate source", candidate.forkCommit);
-		await writeLocalProvenanceEvidence(config, candidate, stageRoot, coordinator, bunSupport, assets.nativeAddons);
+		await writeLocalProvenanceEvidence(config, candidate, stageRoot, coordinator, bunSupport, assets.nativeReuse);
 		const bundle = await assembleBundle(
 			config,
 			candidate,

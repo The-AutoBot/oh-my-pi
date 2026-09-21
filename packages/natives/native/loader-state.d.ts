@@ -1,7 +1,8 @@
 export interface EmbeddedAddonFile {
 	variant: "modern" | "baseline" | "default";
 	filename: string;
-	size?: number;
+	size: number;
+	sha256: string;
 	filePath?: string;
 }
 
@@ -13,7 +14,9 @@ export interface EmbeddedAddonArchive {
 
 export interface EmbeddedAddon {
 	platformTag: string;
-	version: string;
+	applicationVersion: string;
+	nativeCompatibilityVersion: string;
+	payloadSha256: string;
 	files: EmbeddedAddonFile[];
 	archive?: EmbeddedAddonArchive;
 }
@@ -66,6 +69,7 @@ export interface InitLoaderContextOverrides {
 export interface NativeLoaderContext {
 	platformTag: string;
 	packageVersion: string;
+	nativeCompatibilityVersion: string;
 	nativeDir: string;
 	leafPackageDir: string | null;
 	versionedDir: string;
@@ -93,6 +97,7 @@ export function prepareNativeVersionDir(versionedDir: string): void;
 
 export interface ExtractEmbeddedAddonArchiveInput {
 	archivePath: string;
+	payloadSha256: string;
 	files: EmbeddedAddonFile[];
 	targetDir: string;
 }
@@ -118,6 +123,7 @@ export function selectCpuVariant(input: SelectCpuVariantInput): SelectCpuVariant
 export interface ValidateLoadedBindingsContext {
 	isWorkspaceLoad: boolean;
 	packageVersion: string;
+	nativeCompatibilityVersion: string;
 	versionSentinelExport: string;
 }
 

@@ -8,6 +8,8 @@ import {
 	assertAutoBotPrivateDirectory,
 	assertAutoBotPrivateFile,
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
+import { synchronizeNativeReleaseMetadata } from "../packages/natives/scripts/native-compatibility.ts";
+import { NativeInputError } from "../packages/natives/scripts/native-build-provenance.ts";
 import { isRecord } from "../packages/utils/src/type-guards.ts";
 import {
 	AutoBotReleaseError,
@@ -21,6 +23,7 @@ import {
 	requireCommit,
 	requireKeyId,
 	requireRegularFile,
+	requireSha256,
 	requireString,
 	requiredOption,
 	runCommand,
@@ -54,6 +57,7 @@ import {
 	buildAndPublishLocalRelease,
 	createCommandOutputRedactionPolicy,
 	LocalBuildFailure,
+	validateConfiguredNativeReuseInputs,
 	publishPreparedLocalRelease,
 	redactSensitiveCommandOutput,
 } from "./autobot-local-release.ts";
@@ -136,6 +140,7 @@ const CONFIG_KEYS = [
 	"compilerBun",
 	"compilerBunVersion",
 	"nativeAddonDirectory",
+	"nativeAddonProvenanceSha256",
 	"ompExecutable",
 	"coordinatorRoot",
 	"keyId",
@@ -166,6 +171,7 @@ const STATE_KEYS = [
 	"publishedUpstreamVersion",
 	"compatibilityReviewFingerprint",
 	"buildFailure",
+	"nativeInputFailure",
 ] as const;
 
 const WORK_ROOT_ENTRY: Record<string, true> = {
@@ -200,6 +206,10 @@ interface BuildFailureState {
 	readonly attempts: number;
 }
 
+interface NativeInputFailureState {
+	readonly code: string;
+}
+
 interface LocalState {
 	readonly schemaVersion: typeof STATE_SCHEMA_VERSION;
 	readonly phase: LocalPhase;
@@ -217,6 +227,7 @@ interface LocalState {
 	readonly publishedUpstreamVersion?: string;
 	readonly compatibilityReviewFingerprint?: string;
 	readonly buildFailure?: BuildFailureState;
+	readonly nativeInputFailure?: NativeInputFailureState;
 }
 
 export interface IntegrationCheckpointState {
@@ -619,6 +630,10 @@ async function loadLocalAutomationConfig(configPath: string, producerRoot: strin
 		recordString(parsed, "nativeAddonDirectory", "Native addon directory"),
 		"Native addon directory",
 	);
+	const nativeAddonProvenanceSha256 = requireSha256(
+		recordString(parsed, "nativeAddonProvenanceSha256", "Native addon provenance SHA-256"),
+		"Native addon provenance SHA-256",
+	);
 	const ompExecutable = await requireExistingFile(
 		recordString(parsed, "ompExecutable", "OMP executable"),
 		"OMP executable",
@@ -672,6 +687,7 @@ async function loadLocalAutomationConfig(configPath: string, producerRoot: strin
 		compilerBun,
 		compilerBunVersion,
 		nativeAddonDirectory,
+		nativeAddonProvenanceSha256,
 		ompExecutable,
 		coordinatorRoot,
 		keyId,
@@ -802,6 +818,23 @@ function parseBuildFailure(value: unknown): BuildFailureState | undefined {
 	return { fingerprint, attempts };
 }
 
+function parseNativeInputFailure(value: unknown): NativeInputFailureState | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) throw new AutoBotReleaseError("Native input failure state is invalid");
+	requireExactKeys(value, ["code"], "Native input failure state");
+	const code = requireString(value.code, "Native input failure code");
+	if (!/^[A-Za-z][A-Za-z0-9._-]{0,127}$/.test(code)) {
+		throw new AutoBotReleaseError("Native input failure code is invalid");
+	}
+	return { code };
+}
+
+function nativeInputFailureState(error: NativeInputError): NativeInputFailureState {
+	return {
+		code: /^[A-Za-z][A-Za-z0-9._-]{0,127}$/.test(error.code) ? error.code : "native-input-invalid",
+	};
+}
+
 function requireLocalCommandEnum<T extends string>(value: unknown, values: readonly T[], label: string): T {
 	if (typeof value !== "string" || !(values as readonly string[]).includes(value)) {
 		throw new AutoBotReleaseError(`Local command diagnostic ${label} is invalid`);
@@ -913,6 +946,7 @@ function parseLocalState(value: unknown): LocalState {
 			"Compatibility review fingerprint",
 		),
 		buildFailure: parseBuildFailure(value.buildFailure),
+		nativeInputFailure: parseNativeInputFailure(value.nativeInputFailure),
 	};
 }
 
@@ -1467,6 +1501,111 @@ async function commitPendingChanges(
 	return after;
 }
 
+const NATIVE_RELEASE_METADATA_PATHS: Record<string, true> = {
+	"Cargo.toml": true,
+	"Cargo.lock": true,
+	"crates/pi-natives/src/lib.rs": true,
+	"packages/natives/native/index.js": true,
+	"packages/natives/native/index.d.ts": true,
+};
+
+function nullSeparatedPaths(value: string, label: string): string[] {
+	if (value === "") return [];
+	const fields = value.split("\0");
+	if (fields.at(-1) !== "") throw new AutoBotReleaseError(`${label} is malformed`);
+	return fields.slice(0, -1);
+}
+
+function assertExactPathSet(actual: readonly string[], expected: readonly string[], label: string): void {
+	const actualSet = new Set(actual);
+	const expectedSet = new Set(expected);
+	if (
+		actualSet.size !== actual.length ||
+		expectedSet.size !== expected.length ||
+		actualSet.size !== expectedSet.size ||
+		[...actualSet].some(value => !expectedSet.has(value))
+	) {
+		throw new AutoBotReleaseError(`${label} does not match the declared native release metadata paths`);
+	}
+}
+
+async function synchronizeAndCommitNativeReleaseMetadata(
+	worktree: string,
+	localRef: string,
+	base: string,
+): Promise<{ readonly commit: string; readonly changed: boolean }> {
+	await assertCleanWorktree(worktree, localRef, base);
+	const before = await currentCommit(worktree, "Pre-synchronization integration HEAD");
+	const changedPaths = await synchronizeNativeReleaseMetadata(worktree);
+	if (
+		new Set(changedPaths).size !== changedPaths.length ||
+		changedPaths.some(relativePath => !NATIVE_RELEASE_METADATA_PATHS[relativePath])
+	) {
+		throw new AutoBotReleaseError("Native release metadata synchronization returned an unexpected path");
+	}
+	const unstaged = nullSeparatedPaths(
+		(
+			await runCommand(["git", "diff", "--name-only", "-z"], {
+				cwd: worktree,
+				capture: true,
+			})
+		).stdout,
+		"Native release metadata worktree diff",
+	);
+	const untracked = nullSeparatedPaths(
+		(
+			await runCommand(["git", "ls-files", "--others", "--exclude-standard", "-z"], {
+				cwd: worktree,
+				capture: true,
+			})
+		).stdout,
+		"Native release metadata untracked paths",
+	);
+	const stagedBefore = nullSeparatedPaths(
+		(
+			await runCommand(["git", "diff", "--cached", "--name-only", "-z"], {
+				cwd: worktree,
+				capture: true,
+			})
+		).stdout,
+		"Native release metadata staged diff",
+	);
+	assertExactPathSet([...unstaged, ...untracked, ...stagedBefore], changedPaths, "Native release metadata diff");
+	if (changedPaths.length === 0) return { commit: before, changed: false };
+	await runCommand(["git", "add", "--", ...changedPaths], { cwd: worktree, capture: true });
+	const staged = nullSeparatedPaths(
+		(
+			await runCommand(["git", "diff", "--cached", "--name-only", "-z"], {
+				cwd: worktree,
+				capture: true,
+			})
+		).stdout,
+		"Staged native release metadata diff",
+	);
+	assertExactPathSet(staged, changedPaths, "Staged native release metadata diff");
+	await assertDiffCheck(worktree, base);
+	await runCommand(
+		[
+			"git",
+			"-c",
+			"user.name=autobot-local",
+			"-c",
+			"user.email=autobot-local@invalid",
+			"commit",
+			"--no-gpg-sign",
+			"-m",
+			"chore(native): synchronize compatibility metadata",
+		],
+		{ cwd: worktree, capture: true },
+	);
+	const after = await currentCommit(worktree, "Synchronized native release metadata commit");
+	if (!(await isAncestor(worktree, before, after))) {
+		throw new AutoBotReleaseError("Native release metadata synchronization did not preserve integration history");
+	}
+	await assertCleanWorktree(worktree, localRef, base);
+	return { commit: after, changed: true };
+}
+
 async function invokeOmpGuarded(
 	context: OmpControllerContext,
 	reason: "conflicts" | "compatibility" | "build-failure",
@@ -1790,6 +1929,14 @@ async function prepareCandidate(
 	if (!(await isAncestor(managed.worktree, upstreamCommit, currentHead))) {
 		throw new AutoBotReleaseError("Local integration does not retain its pinned upstream ancestor");
 	}
+	const metadataSynchronization = await synchronizeAndCommitNativeReleaseMetadata(
+		managed.worktree,
+		managed.localRef,
+		canonicalCommit,
+	);
+	currentHead = metadataSynchronization.commit;
+	sourceChanged = sourceChanged || metadataSynchronization.changed;
+	await validateConfiguredNativeReuseInputs(config, managed.worktree);
 
 	let identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, currentHead);
 	let candidate = candidateFromIdentity(
@@ -2061,6 +2208,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				publishedUpstreamCommit: authenticatedCompletion.upstreamCommit,
 				publishedUpstreamVersion: authenticatedCompletion.upstreamVersion,
 				buildFailure: undefined,
+				nativeInputFailure: undefined,
 			});
 		}
 		if (mode.kind === "publish-prepared") {
@@ -2152,6 +2300,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				publishedUpstreamCommit: candidate.upstreamCommit,
 				publishedUpstreamVersion: candidate.upstreamVersion,
 				buildFailure: undefined,
+				nativeInputFailure: undefined,
 			});
 			return;
 		}
@@ -2261,6 +2410,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				candidateCommit: candidate.forkCommit,
 				candidateMergeCommit: prepared.candidateMergeCommit,
 				buildFailure: undefined,
+				nativeInputFailure: undefined,
 			});
 			console.log(`AutoBot verified stage: ${verified.preservedStageRoot}`);
 			return;
@@ -2336,6 +2486,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 						publishedUpstreamCommit: publishCandidate.upstreamCommit,
 						publishedUpstreamVersion: publishCandidate.upstreamVersion,
 						buildFailure: undefined,
+						nativeInputFailure: undefined,
 					},
 				);
 				return;
@@ -2500,7 +2651,11 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			}
 		}
 	} catch (error) {
-		await writeLocalState(config.workRoot, { ...state, phase: "blocked" }).catch(() => {});
+		await writeLocalState(config.workRoot, {
+			...state,
+			phase: "blocked",
+			nativeInputFailure: error instanceof NativeInputError ? nativeInputFailureState(error) : undefined,
+		}).catch(() => {});
 		throw error;
 	}
 }

@@ -39,6 +39,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "./host-detect";
+import { NATIVE_BUILD_PROVENANCE_FILENAME } from "../packages/natives/scripts/native-build-provenance";
 
 const repoRoot = path.join(import.meta.dir, "..");
 
@@ -234,10 +235,17 @@ async function buildLocalHostAddon(filename: string, destDir: string): Promise<v
 	const exitCode = await proc.exited;
 	if (exitCode !== 0) process.exit(exitCode || 1);
 
-	const builtPath = path.join(repoRoot, "packages/natives/native", filename);
-	if (path.dirname(builtPath) !== destDir) {
+	const builtDirectory = path.join(repoRoot, "packages/natives/native");
+	const builtPath = path.join(builtDirectory, filename);
+	if (builtDirectory !== destDir) {
 		await fs.mkdir(destDir, { recursive: true });
 		await installAddon(builtPath, path.join(destDir, filename));
+		if (process.platform === "win32") {
+			await installAddon(
+				path.join(builtDirectory, NATIVE_BUILD_PROVENANCE_FILENAME),
+				path.join(destDir, NATIVE_BUILD_PROVENANCE_FILENAME),
+			);
+		}
 	}
 	console.log(`installed ${filename} → ${path.join(destDir, filename)}`);
 }

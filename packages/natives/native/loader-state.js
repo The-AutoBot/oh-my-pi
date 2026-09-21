@@ -1,4 +1,5 @@
 import * as childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -79,7 +80,7 @@ function resolveLeafPackageDir(platformTag) {
 
 /**
  * @param {{
- *   embeddedAddon: { platformTag: string; version: string; files: unknown[] } | null | undefined;
+ *   embeddedAddon: { platformTag: string; applicationVersion: string; nativeCompatibilityVersion: string; payloadSha256: string; files: unknown[] } | null | undefined;
  *   env: Record<string, string | undefined>;
  *   importMetaUrl: string | null | undefined;
  * }} input
@@ -476,11 +477,15 @@ function isSafeEmbeddedAddonFilename(filename) {
 	return filename.length > 0 && path.basename(filename) === filename && !filename.includes("/") && !filename.includes("\\");
 }
 
+function sha256(bytes) {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
 function isEmbeddedAddonFileCurrent(targetPath, file) {
 	try {
 		const stat = fs.statSync(targetPath);
-		if (!stat.isFile()) return false;
-		return typeof file.size !== "number" || stat.size === file.size;
+		if (!stat.isFile() || stat.size !== file.size) return false;
+		return sha256(fs.readFileSync(targetPath)) === file.sha256;
 	} catch (err) {
 		if (err && err.code === "ENOENT") return false;
 		throw err;
@@ -502,7 +507,7 @@ function writeEmbeddedAddonFile(targetPath, content) {
 	}
 }
 
-export function extractEmbeddedAddonArchive({ archivePath, files, targetDir }) {
+export function extractEmbeddedAddonArchive({ archivePath, payloadSha256, files, targetDir }) {
 	const pending = new Map();
 	for (const file of files) {
 		if (!isSafeEmbeddedAddonFilename(file.filename)) {
@@ -515,7 +520,12 @@ export function extractEmbeddedAddonArchive({ archivePath, files, targetDir }) {
 	}
 	if (pending.size === 0) return [];
 
-	const archive = zlib.gunzipSync(fs.readFileSync(archivePath));
+	const archiveBytes = fs.readFileSync(archivePath);
+	const actualPayloadSha256 = sha256(archiveBytes);
+	if (actualPayloadSha256 !== payloadSha256) {
+		throw new Error(`Embedded addon payload digest mismatch: expected ${payloadSha256}, got ${actualPayloadSha256}`);
+	}
+	const archive = zlib.gunzipSync(archiveBytes);
 	const writtenPaths = [];
 	let offset = 0;
 
@@ -540,11 +550,16 @@ export function extractEmbeddedAddonArchive({ archivePath, files, targetDir }) {
 
 		const file = pending.get(filename);
 		if (file) {
-			if (typeof file.size === "number" && file.size !== size) {
+			if (file.size !== size) {
 				throw new Error(`Embedded addon size mismatch for ${filename}: expected ${file.size}, got ${size}`);
 			}
+			const content = archive.subarray(offset, offset + size);
+			const actualSha256 = sha256(content);
+			if (actualSha256 !== file.sha256) {
+				throw new Error(`Embedded addon digest mismatch for ${filename}: expected ${file.sha256}, got ${actualSha256}`);
+			}
 			const targetPath = path.join(targetDir, filename);
-			writeEmbeddedAddonFile(targetPath, archive.subarray(offset, offset + size));
+			writeEmbeddedAddonFile(targetPath, content);
 			pending.delete(filename);
 			writtenPaths.push(targetPath);
 		}
@@ -561,8 +576,16 @@ export function extractEmbeddedAddonArchive({ archivePath, files, targetDir }) {
 
 function maybeExtractEmbeddedAddon(ctx, errors) {
 	if (!ctx.isCompiledBinary || !embeddedAddon) return null;
-	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return null;
-
+	if (
+		embeddedAddon.platformTag !== ctx.platformTag ||
+		embeddedAddon.applicationVersion !== ctx.packageVersion ||
+		embeddedAddon.nativeCompatibilityVersion !== ctx.nativeCompatibilityVersion
+	) {
+		errors.push(
+			`embedded addon identity: expected ${ctx.platformTag}, application ${ctx.packageVersion}, native compatibility ${ctx.nativeCompatibilityVersion}`,
+		);
+		return null;
+	}
 	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
 	if (!selectedEmbeddedFile) return null;
 	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
@@ -581,6 +604,7 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 			extractEmbeddedAddonArchive({
 				archivePath: embeddedAddon.archive.filePath,
 				files: embeddedAddon.files,
+				payloadSha256: embeddedAddon.payloadSha256,
 				targetDir: ctx.versionedDir,
 			});
 			if (isEmbeddedAddonFileCurrent(targetPath, selectedEmbeddedFile)) {
@@ -605,7 +629,11 @@ function maybeExtractEmbeddedAddon(ctx, errors) {
 
 	try {
 		const buffer = fs.readFileSync(selectedEmbeddedFile.filePath);
-		fs.writeFileSync(targetPath, buffer);
+		if (buffer.length !== selectedEmbeddedFile.size || sha256(buffer) !== selectedEmbeddedFile.sha256) {
+			errors.push(`embedded addon digest mismatch for ${selectedEmbeddedFile.filename}`);
+			return null;
+		}
+		writeEmbeddedAddonFile(targetPath, buffer);
 		return targetPath;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -657,33 +685,8 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 }
 
 
-/**
- * Before version sentinels were exported, published native addons still shared
- * this stable core ABI. Let those on-disk addons bridge a package-version bump
- * when they expose the signature; keep every versioned addon and a current
- * on-disk file paired with resident old exports on the strict path below.
- */
-function isCompatiblePreSentinelNativeAddon(bindings, diskHasExpectedSentinel) {
-	if (diskHasExpectedSentinel) return false;
-	if (Object.keys(bindings).some(key => /^__piNativesV[A-Za-z0-9_]+$/.test(key))) return false;
-	return (
-		typeof bindings.countTokens === "function" &&
-		typeof bindings.executeShell === "function" &&
-		typeof bindings.visibleWidth === "function" &&
-		typeof bindings.DesktopSession === "function" &&
-		typeof bindings.DesktopSession.prototype?.capture === "function" &&
-		typeof bindings.DesktopSession.prototype?.execute === "function" &&
-		typeof bindings.DesktopSession.prototype?.close === "function"
-	);
-}
 
 export function validateLoadedBindings(ctx, bindings, candidate) {
-	// In workspace dev (running out of `packages/natives/native/` rather than a
-	// `node_modules` install or a compiled bundle) the local `.node` only gains
-	// the renamed sentinel after `bun --cwd=packages/natives run build`. Skip
-	// validation there so a stale post-pull dev tree boots while the rebuild
-	// completes; install and compiled-binary paths still validate.
-	if (ctx.isWorkspaceLoad) return;
 	if (typeof bindings[ctx.versionSentinelExport] === "function") return;
 
 	// The expected sentinel is missing. Distinguish two failure modes by the
@@ -709,22 +712,21 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 		// The successful require above normally guarantees readability. If the
 		// file disappears concurrently, retain the safe reinstall diagnosis.
 	}
-	if (isCompatiblePreSentinelNativeAddon(bindings, diskHasExpectedSentinel)) return;
 	if (residentSentinel && diskHasExpectedSentinel) {
 		const residentVersion = residentSentinel.slice("__piNativesV".length).replace(/_/g, ".");
 		throw new Error(
 			`Loaded ${candidate}, which exposes the @oh-my-pi/pi-natives@${residentVersion} version ` +
-				`sentinel \`${residentSentinel}\` but not the @${ctx.packageVersion} sentinel ` +
-				`\`${ctx.versionSentinelExport}\` this loader expects. omp was upgraded to ` +
-				`${ctx.packageVersion} while this session was running; the ${residentVersion} addon is ` +
+				`sentinel \`${residentSentinel}\` but not the native compatibility @${ctx.nativeCompatibilityVersion} sentinel ` +
+				`\`${ctx.versionSentinelExport}\` this loader expects. omp application ${ctx.packageVersion} loaded ` +
+				`a different native generation while this session was running; the ${residentVersion} addon is ` +
 				"still resident in this process. Disk is already consistent — restart omp to pick up " +
-				`${ctx.packageVersion} (reinstalling changes nothing).`,
+				`native compatibility ${ctx.nativeCompatibilityVersion} (reinstalling changes nothing).`,
 		);
 	}
 	throw new Error(
-		`Loaded ${candidate} but it does not expose the @oh-my-pi/pi-natives@${ctx.packageVersion} ` +
-			`version sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different ` +
-			"release than this loader — reinstall to re-sync.",
+		`Loaded ${candidate} but it does not expose native compatibility ${ctx.nativeCompatibilityVersion} ` +
+			`sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different native generation ` +
+			"than this loader — reinstall to re-sync.",
 	);
 }
 
@@ -750,23 +752,15 @@ function installNativeTokioRuntime(bindings) {
 
 function buildHelpMessage(ctx) {
 	if (ctx.isCompiledBinary) {
-		const expectedPaths = ctx.addonFilenames.map(filename => `  ${path.join(ctx.versionedDir, filename)}`).join("\n");
-		const downloadHints = ctx.addonFilenames
-			.map(filename => {
-				const downloadUrl = `https://github.com/can1357/oh-my-pi/releases/latest/download/${filename}`;
-				const targetPath = path.join(ctx.versionedDir, filename);
-				return `  curl -fsSL "${downloadUrl}" -o "${targetPath}"`;
-			})
-			.join("\n");
 		return (
-			`The compiled binary should extract one of:\n${expectedPaths}\n\n` +
-			`If missing, delete ${ctx.versionedDir} and re-run, or download manually:\n${downloadHints}`
+			`The compiled runtime could not restore its exact embedded native payload in ${ctx.versionedDir}. ` +
+			"Restore or reinstall this same runtime build; do not substitute an addon from another release or build."
 		);
 	}
 	return (
-		"If installed via npm/bun, try reinstalling: bun install @oh-my-pi/pi-natives\n" +
-		"If developing locally, build with: bun --cwd=packages/natives run build\n" +
-		"Explicit targets: bun scripts/bazel-natives.ts <target> --dest packages/natives/native"
+		`Restore the matching @oh-my-pi/pi-natives package and platform addon for native compatibility ` +
+		`${ctx.nativeCompatibilityVersion}. Source or custom builds must use native artifacts from the same ` +
+		"validated source/build provenance; an arbitrary latest official addon is not interchangeable."
 	);
 }
 
@@ -783,10 +777,16 @@ export function initLoaderContext(overrides = {}) {
 	const platform = overrides.platform ?? process.platform;
 	const platformTag = `${platform}-${process.arch}`;
 	const packageVersion = packageJson.version;
+	const nativeCompatibilityVersion = packageJson.nativeCompatibilityVersion;
+	if (
+		typeof nativeCompatibilityVersion !== "string" ||
+		!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(nativeCompatibilityVersion)
+	) {
+		throw new Error("@oh-my-pi/pi-natives package metadata is missing a valid nativeCompatibilityVersion");
+	}
 	const nativeDir = overrides.nativeDir ?? path.join(import.meta.dir, "..", "native");
 	const execDir = path.dirname(process.execPath);
 	const nativesDir = getNativesDir();
-	const versionedDir = path.join(nativesDir, packageVersion);
 	const userDataDir =
 		platform === "win32"
 			? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "omp")
@@ -799,6 +799,14 @@ export function initLoaderContext(overrides = {}) {
 			env: process.env,
 			importMetaUrl: import.meta.url,
 		});
+	if (embeddedAddon && !/^[a-f0-9]{64}$/.test(embeddedAddon.payloadSha256)) {
+		throw new Error("Embedded native addon metadata has an invalid payloadSha256");
+	}
+	const applicationVersionDir = path.join(nativesDir, packageVersion);
+	const versionedDir =
+		isCompiledBinary && embeddedAddon
+			? path.join(applicationVersionDir, embeddedAddon.payloadSha256)
+			: applicationVersionDir;
 	const normalizedNativeDir = platform === "win32" ? nativeDir.toLowerCase() : nativeDir;
 	const isWorkspaceLoad =
 		!isCompiledBinary &&
@@ -831,18 +839,14 @@ export function initLoaderContext(overrides = {}) {
 		userDataDir,
 	});
 
-	// Version sentinel emitted by the Rust addon under a `js_name` that encodes
-	// the package version (`__piNativesV{major}_{minor}_{patch}`).
-	// `scripts/release.ts` bumps the name in `crates/pi-natives/src/lib.rs` in
-	// lock-step with the version, so a `.node` from a different release
-	// physically cannot expose the symbol this loader is looking for. That
-	// turns the silent `<sym> is not a function` crash from a Windows
-	// locked-file update into an actionable load-time error.
-	const versionSentinelExport = versionSentinelFor(packageVersion);
+	// The sentinel tracks native ABI/build compatibility, independently from the
+	// application/package version used to isolate Windows locked-file caches.
+	const versionSentinelExport = versionSentinelFor(nativeCompatibilityVersion);
 
 	return {
 		platformTag,
 		packageVersion,
+		nativeCompatibilityVersion,
 		nativeDir,
 		leafPackageDir,
 		versionedDir,
@@ -865,9 +869,13 @@ export function loadNative() {
 
 	const errors = [];
 	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
-	const stagedCandidate = embeddedCandidate ? null : maybeStageNodeModulesAddon(ctx, errors);
+	const stagedCandidate = embeddedAddon ? null : maybeStageNodeModulesAddon(ctx, errors);
 	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	const runtimeCandidates = embeddedAddon
+		? prepended
+		: prepended.length > 0
+			? [...prepended, ...ctx.candidates]
+			: ctx.candidates;
 
 	for (const candidate of runtimeCandidates) {
 		try {

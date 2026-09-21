@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support, resolveLocalHostAddon } from "../../../scripts/host-detect";
 import { generateEnumExports } from "./gen-enums";
+import { computeNativeInputsSha256, writeNativeBuildProvenance } from "./native-build-provenance";
 
 const targetVariant = Bun.env.OMP_NATIVE_TARGET_VARIANT?.trim();
 const forcedBaseline = targetVariant === "baseline";
@@ -183,9 +184,58 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 		throw new Error(`Failed to install generated index.d.ts: ${message}`);
 	}
 }
+async function cargoConfigRustc(configPath: string): Promise<string | null> {
+	let source: string;
+	try {
+		source = await fs.readFile(configPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	let config: unknown;
+	try {
+		config = Bun.TOML.parse(source);
+	} catch (error) {
+		throw new Error(
+			`Cannot inspect Cargo compiler configuration ${configPath}; set RUSTC explicitly: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (
+		typeof config !== "object" ||
+		config === null ||
+		!("build" in config) ||
+		typeof config.build !== "object" ||
+		config.build === null ||
+		!("rustc" in config.build)
+	) {
+		return null;
+	}
+	if (typeof config.build.rustc !== "string" || !config.build.rustc.trim()) {
+		throw new Error(`Cargo build.rustc in ${configPath} is unsupported; set RUSTC explicitly`);
+	}
+	return config.build.rustc.trim();
+}
+
+async function inheritedCargoRustcConfig(): Promise<string | null> {
+	const candidates: string[] = [];
+	for (let current = path.dirname(repoRoot); ; current = path.dirname(current)) {
+		candidates.push(path.join(current, ".cargo/config"), path.join(current, ".cargo/config.toml"));
+		if (current === path.parse(current).root) break;
+	}
+	const cargoHome =
+		Bun.env.CARGO_HOME?.trim() ||
+		(process.env.USERPROFILE ? path.join(process.env.USERPROFILE, ".cargo") : null) ||
+		(process.env.HOME ? path.join(process.env.HOME, ".cargo") : null);
+	if (cargoHome) candidates.push(path.join(cargoHome, "config"), path.join(cargoHome, "config.toml"));
+	for (const candidate of new Set(candidates)) {
+		if (await cargoConfigRustc(candidate)) return candidate;
+	}
+	return null;
+}
 
 const canonicalAddonFilename = localAddon.filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
+const nativeInputsBeforeBuild = process.platform === "win32" ? await computeNativeInputsSha256(repoRoot) : null;
 
 console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
 
@@ -222,6 +272,29 @@ const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
 // speed, `ci` strips and drops incremental state.
 const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
+let nativeRustcCommand: string | null = null;
+if (process.platform === "win32") {
+	const explicitRustc = Bun.env.RUSTC?.trim() || Bun.env.CARGO_BUILD_RUSTC?.trim();
+	if (explicitRustc) {
+		nativeRustcCommand = explicitRustc;
+	} else {
+		nativeRustcCommand =
+			(await cargoConfigRustc(path.join(repoRoot, ".cargo/config"))) ??
+			(await cargoConfigRustc(path.join(repoRoot, ".cargo/config.toml")));
+		if (!nativeRustcCommand) {
+			const inheritedConfig = await inheritedCargoRustcConfig();
+			if (inheritedConfig) {
+				throw new Error(
+					`Cargo compiler configuration is inherited from ${inheritedConfig}; set RUSTC explicitly so native provenance can attest the compiler before building`,
+				);
+			}
+			nativeRustcCommand = "rustc";
+		}
+	}
+	// Override Cargo's remaining configuration layers with the command selected
+	// above, then probe this exact command after the successful build.
+	Bun.env.RUSTC = nativeRustcCommand;
+}
 
 const napiArgs = [
 	"build",
@@ -274,6 +347,37 @@ try {
 	await installGeneratedBindings(buildOutputDir);
 
 	await generateEnumExports();
+	if (nativeInputsBeforeBuild) {
+		if (!nativeRustcCommand) throw new Error("Windows native build has no pinned Rust compiler");
+		const rustc = Bun.spawnSync([nativeRustcCommand, "--version", "--verbose"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (rustc.exitCode !== 0) {
+			throw new Error(
+				`Native build succeeded but rustc identity could not be recorded: ${rustc.stderr.toString("utf8").trim()}`,
+			);
+		}
+		const rustcIdentity = rustc.stdout.toString("utf8").trim();
+		const rustcHost = /^host: (.+)$/m.exec(rustcIdentity)?.[1];
+		const cargoTarget = Bun.env.CARGO_BUILD_TARGET?.trim() || rustcHost;
+		if (!cargoTarget) {
+			throw new Error("Native build succeeded but rustc did not report its host target");
+		}
+		const variant = canonicalAddonFilename.slice("pi_natives.".length, -".node".length);
+		await writeNativeBuildProvenance({
+			sourceRoot: repoRoot,
+			nativeDirectory: nativeDir,
+			inputsSha256: nativeInputsBeforeBuild,
+			build: {
+				target: cargoTarget,
+				profile: cargoProfile,
+				toolchain: rustcIdentity.replace(/\r?\n/g, "; "),
+			},
+			artifacts: [{ filename: canonicalAddonFilename, variant }],
+		});
+	}
 
 	console.log("Bindings build complete.");
 } finally {

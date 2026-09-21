@@ -32,11 +32,12 @@ async function withCandidate(contents: string, test: (candidate: string) => void
 	}
 }
 
-function ctxFor(version: string) {
+function ctxFor(nativeCompatibilityVersion: string, packageVersion = "99.4.1") {
 	return {
 		isWorkspaceLoad: false,
-		packageVersion: version,
-		versionSentinelExport: `__piNativesV${version.replace(/[^A-Za-z0-9]/g, "_")}`,
+		packageVersion,
+		nativeCompatibilityVersion,
+		versionSentinelExport: `__piNativesV${nativeCompatibilityVersion.replace(/[^A-Za-z0-9]/g, "_")}`,
 	};
 }
 
@@ -63,16 +64,16 @@ describe("issue 4812: pi-natives sentinel process-stale diagnosis", () => {
 		const ctx = ctxFor("16.3.11");
 		const stale = { __piNativesV16_3_10: () => {}, grep: () => {} };
 		await withCandidate("__piNativesV16_3_10", candidate => {
-			expect(() => validateLoadedBindings(ctx, stale, candidate)).toThrow(
-				"from a different release than this loader",
-			);
+			expect(() => validateLoadedBindings(ctx, stale, candidate)).toThrow("from a different native generation");
 			expect(() => validateLoadedBindings(ctx, stale, candidate)).toThrow("reinstall to re-sync");
 			expect(() => validateLoadedBindings(ctx, stale, candidate)).not.toThrow("restart omp");
 		});
 	});
 
-	it("skips validation entirely in workspace dev", () => {
+	it("keeps workspace loads on the same strict native identity path", () => {
 		const ctx = { ...ctxFor("16.3.11"), isWorkspaceLoad: true };
-		expect(() => validateLoadedBindings(ctx, { grep: () => {} }, unusedCandidate)).not.toThrow();
+		expect(() => validateLoadedBindings(ctx, { grep: () => {} }, unusedCandidate)).toThrow(
+			"different native generation",
+		);
 	});
 });

@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { containsVersionSentinel, versionSentinelFor } from "../native/version-sentinel.js";
 
@@ -15,6 +16,7 @@ const embeddedAddonTypedefs = `/** @typedef {"modern" | "baseline" | "default"} 
  * @property {EmbeddedAddonVariant} variant
  * @property {string} filename
  * @property {number} size
+ * @property {string} sha256
  * @property {string=} filePath
  */
 
@@ -28,7 +30,9 @@ const embeddedAddonTypedefs = `/** @typedef {"modern" | "baseline" | "default"} 
 /**
  * @typedef {Object} EmbeddedAddon
  * @property {string} platformTag
- * @property {string} version
+ * @property {string} applicationVersion
+ * @property {string} nativeCompatibilityVersion
+ * @property {string} payloadSha256
  * @property {EmbeddedAddonFile[]} files
  * @property {EmbeddedAddonArchive=} archive
  */`;
@@ -62,8 +66,8 @@ interface CandidateAddon {
 }
 
 interface AvailableAddon extends CandidateAddon {
-	path: string;
 	size: number;
+	sha256: string;
 }
 
 /**
@@ -74,13 +78,15 @@ export async function embedNativeAddon({
 	targetArch,
 	nativeDir,
 	outputPath,
-	version,
+	applicationVersion,
+	nativeCompatibilityVersion,
 }: {
 	targetPlatform: string;
 	targetArch: string;
 	nativeDir: string;
 	outputPath: string;
-	version: string;
+	applicationVersion: string;
+	nativeCompatibilityVersion: string;
 }): Promise<void> {
 	const platformTag = `${targetPlatform}-${targetArch}`;
 	const candidates: CandidateAddon[] =
@@ -91,12 +97,25 @@ export async function embedNativeAddon({
 				]
 			: [{ variant: "default", filename: `pi_natives.${platformTag}.node` }];
 
+	const versionSentinel = versionSentinelFor(nativeCompatibilityVersion);
+	const archiveEntries: Record<string, Uint8Array> = {};
 	const available: AvailableAddon[] = [];
 	for (const candidate of candidates) {
 		const candidatePath = path.join(nativeDir, candidate.filename);
 		try {
-			const stat = await fs.stat(candidatePath);
-			available.push({ ...candidate, path: candidatePath, size: stat.size });
+			const bytes = await fs.readFile(candidatePath);
+			if (!containsVersionSentinel(bytes, versionSentinel)) {
+				throw new Error(
+					`Native addon ${candidatePath} does not contain native compatibility ${nativeCompatibilityVersion} sentinel ` +
+						`\`${versionSentinel}\`. Rebuild it or provide a matching validated native artifact before embedding.`,
+				);
+			}
+			available.push({
+				...candidate,
+				size: bytes.length,
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			});
+			archiveEntries[candidate.filename] = bytes;
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 		}
@@ -109,24 +128,14 @@ export async function embedNativeAddon({
 
 	const archiveFilename = `${archivePrefix}${platformTag}${archiveSuffix}`;
 	const archivePath = path.join(nativeDir, archiveFilename);
-	const archiveEntries: Record<string, Uint8Array> = {};
-	const versionSentinel = versionSentinelFor(version);
-	for (const addon of available) {
-		const bytes = await fs.readFile(addon.path);
-		if (!containsVersionSentinel(bytes, versionSentinel)) {
-			throw new Error(
-				`Native addon ${addon.path} does not contain the @oh-my-pi/pi-natives@${version} version sentinel ` +
-					`\`${versionSentinel}\`. Rebuild it or fetch @oh-my-pi/pi-natives-${platformTag}@${version} before embedding.`,
-			);
-		}
-		archiveEntries[addon.filename] = bytes;
-	}
-	await Bun.write(archivePath, await new Bun.Archive(archiveEntries, { compress: "gzip", level: 9 }).bytes());
+	const archiveBytes = await new Bun.Archive(archiveEntries, { compress: "gzip", level: 9 }).bytes();
+	const payloadSha256 = createHash("sha256").update(archiveBytes).digest("hex");
+	await Bun.write(archivePath, archiveBytes);
 
 	const files = available
 		.map(
 			addon =>
-				`\t\t{ variant: ${JSON.stringify(addon.variant)}, filename: ${JSON.stringify(addon.filename)}, size: ${addon.size} },`,
+				`\t\t{ variant: ${JSON.stringify(addon.variant)}, filename: ${JSON.stringify(addon.filename)}, size: ${addon.size}, sha256: ${JSON.stringify(addon.sha256)} },`,
 		)
 		.join("\n");
 
@@ -140,7 +149,9 @@ import archivePath from ${JSON.stringify(`../native/${archiveFilename}`)} with {
 
 export const embeddedAddon = {
 \tplatformTag: ${JSON.stringify(platformTag)},
-\tversion: ${JSON.stringify(version)},
+\tapplicationVersion: ${JSON.stringify(applicationVersion)},
+\tnativeCompatibilityVersion: ${JSON.stringify(nativeCompatibilityVersion)},
+\tpayloadSha256: ${JSON.stringify(payloadSha256)},
 \tarchive: {
 \t\tformat: "tar.gz",
 \t\tfilename: ${JSON.stringify(archiveFilename)},
@@ -161,13 +172,17 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const packageJson = (await Bun.file(packageJsonPath).json()) as { version: string };
+	const packageJson = (await Bun.file(packageJsonPath).json()) as {
+		version: string;
+		nativeCompatibilityVersion: string;
+	};
 	await embedNativeAddon({
 		targetPlatform: Bun.env.TARGET_PLATFORM || process.platform,
 		targetArch: Bun.env.TARGET_ARCH || process.arch,
 		nativeDir,
 		outputPath,
-		version: packageJson.version,
+		applicationVersion: packageJson.version,
+		nativeCompatibilityVersion: packageJson.nativeCompatibilityVersion,
 	});
 }
 

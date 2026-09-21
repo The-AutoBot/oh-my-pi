@@ -12,6 +12,7 @@ import { $, Glob } from "bun";
 import { compareVersions } from "../packages/utils/src/version.ts";
 import { runChangelogFixer } from "./fix-changelogs";
 import { generateNixBunDeps, resolveNixBunDepsGenerator } from "./gen-nix-bun";
+import { synchronizeNativeReleaseMetadata } from "../packages/natives/scripts/native-compatibility";
 
 const changelogGlob = new Glob("packages/*/CHANGELOG.md");
 const packageJsonGlob = new Glob("packages/*/package.json");
@@ -310,55 +311,16 @@ async function cmdRelease(versionOrBump: string): Promise<void> {
 	await Bun.write("package.json", rootPkgRaw);
 	console.log("  Updated root catalog @oh-my-pi/* entries");
 
-	// 3. Update Rust workspace version
-	console.log(`Updating Rust workspace version to ${version}…`);
-	await $`sd '^version = "[^"]+"' ${`version = "${version}"`} Cargo.toml`;
-
-	// Verify
-	const cargoToml = await Bun.file("Cargo.toml").text();
-	const versionMatch = cargoToml.match(/^\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m);
-	if (versionMatch) {
-		console.log(`  workspace: ${versionMatch[1]}`);
-	}
-
-	// List crates using workspace version
-	for await (const cargoPath of cargoTomlGlob.scan(".")) {
-		const content = await Bun.file(cargoPath).text();
-		if (content.includes("version.workspace = true")) {
-			const nameMatch = content.match(/^name = "([^"]+)"/m);
-			if (nameMatch) {
-				console.log(`  ${nameMatch[1]}: ${version} (workspace)`);
-			}
-		}
+	// 3. Keep Rust/native build identity pinned to the explicit compatibility
+	// generation. Application npm versions still advance independently above.
+	console.log("Synchronizing native compatibility metadata...");
+	const nativeMetadataChanges = await synchronizeNativeReleaseMetadata(".");
+	if (nativeMetadataChanges.length === 0) {
+		console.log("  Native metadata already compatible");
+	} else {
+		for (const changedPath of nativeMetadataChanges) console.log(`  Updated ${changedPath}`);
 	}
 	console.log();
-
-	// 3b. Rename the pi-natives version sentinel so any `.node` left on disk from
-	// a previous release physically cannot expose the symbol the new `index.js`
-	// expects. The JS loader derives `VERSION_SENTINEL_EXPORT` from `package.json`
-	// at runtime, so the only thing that has to move on the Rust side is the
-	// `js_name = "__piNativesV…"` literal. `gen-enums.ts` regenerates the matching
-	// entries in `packages/natives/native/{index.d.ts,index.js}` on the next napi
-	// build, but bump them here too so the committed surface tracks the version
-	// without waiting for a local rebuild on the release host.
-	console.log(`Bumping pi-natives version sentinel to v${version}…`);
-	const sentinelJsId = version.replace(/[^A-Za-z0-9]/g, "_");
-	const sentinelName = `__piNativesV${sentinelJsId}`;
-	const sentinelFiles = [
-		"crates/pi-natives/src/lib.rs",
-		"packages/natives/native/index.d.ts",
-		"packages/natives/native/index.js",
-	];
-	await $`sd '__piNativesV[A-Za-z0-9_]+' ${sentinelName} ${sentinelFiles}`;
-	const libRs = await Bun.file("crates/pi-natives/src/lib.rs").text();
-	if (!libRs.includes(`js_name = "${sentinelName}"`)) {
-		console.error(
-			`Error: pi-natives version sentinel did not move to ${sentinelName} in crates/pi-natives/src/lib.rs. ` +
-				"The `__piNativesV…` literal may have been removed or renamed; restore it before releasing.",
-		);
-		process.exit(1);
-	}
-	console.log(`  sentinel: ${sentinelName}\n`);
 
 	// 4. Regenerate lockfiles and generated configs
 	console.log("Regenerating lockfiles...");

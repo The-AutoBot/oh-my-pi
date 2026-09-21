@@ -13,10 +13,12 @@ describe("generated native npm leaf packages", () => {
 			cpu: "x64",
 			files: addonFiles,
 			version: "15.5.15",
+			nativeCompatibilityVersion: "14.9.3",
 		});
 
 		expect(manifest.name).toBe("@oh-my-pi/pi-natives-linux-x64");
 		expect(manifest.version).toBe("15.5.15");
+		expect(manifest.nativeCompatibilityVersion).toBe("14.9.3");
 		expect(manifest.os).toEqual(["linux"]);
 		expect(manifest.cpu).toEqual(["x64"]);
 		expect(addonFiles).toContain(manifest.main.slice("./".length));
@@ -39,6 +41,7 @@ describe("generated native npm leaf packages", () => {
 			cpu: "arm64",
 			files: addonFiles,
 			version: "15.5.15",
+			nativeCompatibilityVersion: "14.9.3",
 		});
 
 		expect(manifest.name).toBe("@oh-my-pi/pi-natives-darwin-arm64");
@@ -53,7 +56,10 @@ describe("generated native npm leaf packages", () => {
 		const packageDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-natives-npm-"));
 		try {
 			await fs.mkdir(path.join(packageDir, "native"));
-			await Bun.write(path.join(packageDir, "package.json"), JSON.stringify({ version: "15.5.15" }));
+			await Bun.write(
+				path.join(packageDir, "package.json"),
+				JSON.stringify({ version: "15.5.15", nativeCompatibilityVersion: "14.9.3" }),
+			);
 			await Promise.all([
 				Bun.write(path.join(packageDir, "LICENSE"), "MIT payload\n"),
 				Bun.write(path.join(packageDir, "THIRD-PARTY-NOTICES.txt"), "Notice payload\n"),
@@ -88,6 +94,7 @@ describe("generated native npm leaf packages", () => {
 			const manifest = await Bun.file(path.join(packageDir, "npm/linux-x64/package.json")).json();
 			expect(manifest.main).toBe("./pi_natives.linux-x64-baseline.node");
 			expect(manifest.files).toEqual(["*.node", "README.md", "LICENSE", "THIRD-PARTY-NOTICES.txt"]);
+			expect(manifest.nativeCompatibilityVersion).toBe("14.9.3");
 			expect(await Bun.file(path.join(packageDir, "npm/linux-x64/LICENSE")).text()).toBe("MIT payload\n");
 			expect(await Bun.file(path.join(packageDir, "npm/linux-x64/THIRD-PARTY-NOTICES.txt")).text()).toBe(
 				"Notice payload\n",
@@ -104,7 +111,10 @@ describe("generated native npm leaf packages", () => {
 		try {
 			await fs.mkdir(path.join(packageDir, "native"), { recursive: true });
 			await Promise.all([
-				Bun.write(path.join(packageDir, "package.json"), JSON.stringify({ version: "15.5.15" })),
+				Bun.write(
+					path.join(packageDir, "package.json"),
+					JSON.stringify({ version: "15.5.15", nativeCompatibilityVersion: "14.9.3" }),
+				),
 				Bun.write(path.join(packageDir, "native/pi_natives.darwin-arm64.node"), "darwin"),
 				Bun.write(path.join(packageDir, "LICENSE"), "MIT payload\n"),
 				Bun.write(path.join(root, "THIRD-PARTY-NOTICES.txt"), "Repository notice\n"),
@@ -124,7 +134,10 @@ describe("generated native npm leaf packages", () => {
 		const logSpy = spyOn(console, "log").mockImplementation(() => {});
 		try {
 			await fs.mkdir(path.join(packageDir, "native"));
-			await Bun.write(path.join(packageDir, "package.json"), JSON.stringify({ version: "15.5.15" }));
+			await Bun.write(
+				path.join(packageDir, "package.json"),
+				JSON.stringify({ version: "15.5.15", nativeCompatibilityVersion: "14.9.3" }),
+			);
 			await Bun.write(path.join(packageDir, "native/pi_natives.darwin-arm64.node"), "darwin");
 
 			const leaves = await generateNpmPackages({ packageDir, dryRun: true });
