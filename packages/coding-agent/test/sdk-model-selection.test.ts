@@ -547,7 +547,6 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			modelRegistry,
 			settings: Settings.isolated(),
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
 			disableExtensionDiscovery: true,
 			extensions: [providerExtension],
 			skills: [],

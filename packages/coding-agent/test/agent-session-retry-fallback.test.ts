@@ -5837,14 +5837,7 @@ describe("AgentSession retry fallback", () => {
 		);
 		expect(discoveredModel.contextWindow).toBe(staleModel.contextWindow);
 		expect(discoveredModel.api).toBe("openai-completions");
-		writeModelCache(
-			"ollama-cloud",
-			Date.now(),
-			[discoveredModel],
-			true,
-			"",
-			path.join(tempDir.path(), "models.db"),
-		);
+		writeModelCache("ollama-cloud", Date.now(), [discoveredModel], true, "", path.join(tempDir.path(), "models.db"));
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.json"));
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		const agent = new Agent({

@@ -87,6 +87,9 @@ enum InputCommand {
 	Close,
 }
 
+/// Callback for decoded 48 kHz mono assistant PCM output.
+pub type OutputCallback = Box<dyn Fn(&[f32]) + Send + Sync>;
+
 /// Host callbacks for peer lifecycle and media events. Every callback is
 /// invoked from tokio worker threads and must not block (the N-API adapter
 /// forwards through non-blocking threadsafe functions).
@@ -96,7 +99,7 @@ pub struct LiveCallbacks {
 	/// RMS output level in `[0, 1]`, one report per level window.
 	pub level:   Box<dyn Fn(f64) + Send + Sync>,
 	/// Decoded 48 kHz mono assistant PCM, before optional local speaker output.
-	pub output:  Option<Box<dyn Fn(&[f32]) + Send + Sync>>,
+	pub output:  Option<OutputCallback>,
 	/// Terminal transport failure; reported at most once per peer.
 	pub failure: Box<dyn Fn(String) + Send + Sync>,
 }

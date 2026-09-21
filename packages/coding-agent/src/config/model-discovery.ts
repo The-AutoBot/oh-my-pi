@@ -868,9 +868,7 @@ export async function discoverOpenAIModelsList(
 				supportsStore: false,
 				supportsDeveloperRole: false,
 				supportsReasoningEffort: referenceCompat?.supportsReasoningEffort ?? false,
-				...(referenceCompat?.reasoningEffortMap
-					? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
-					: {}),
+				...(referenceCompat?.reasoningEffortMap ? { reasoningEffortMap: referenceCompat.reasoningEffortMap } : {}),
 				...(referenceCompat?.omitReasoningEffort !== undefined
 					? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
 					: {}),

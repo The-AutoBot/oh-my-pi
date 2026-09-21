@@ -1310,7 +1310,6 @@ export async function buildSessionOptions(
 	if (parsed.systemPrompt !== undefined && parsed.systemPromptTemplate !== undefined) {
 		throw new Error("--system-prompt and --system-prompt-template cannot be combined");
 	}
-	const cwd = options.cwd;
 	const discoveredOverride =
 		parsed.systemPrompt === undefined && parsed.systemPromptTemplate === undefined
 			? await discoverSystemPromptOverride(cwd)
