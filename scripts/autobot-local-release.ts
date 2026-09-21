@@ -1125,10 +1125,15 @@ async function establishReleaseChain(
 	if (expectedDraft && (expectedDraft.sequence !== sequence || expectedDraft.tag !== tag)) {
 		throw new AutoBotReleaseError("Prepared release is not the next signed release sequence");
 	}
-	const expectedPublishedCount = matchingPublished ? 2 : 1;
+	const expectedPublishedCount = previousSequence + (matchingPublished ? 1 : 0);
 	if (
 		published.length !== expectedPublishedCount ||
-		published.some(release => release !== previousRelease && release !== matchingPublished)
+		published.some(
+			(release, index) =>
+				release.sequence !== index + 1 ||
+				(release.sequence === previousSequence && release !== previousRelease) ||
+				(release.sequence === sequence && release !== matchingPublished),
+		)
 	) {
 		throw new AutoBotReleaseError("Published AutoBot release state is not the exact channel predecessor chain");
 	}

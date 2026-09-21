@@ -240,6 +240,21 @@ if (process.platform === "win32" && process.arch === "x64") {
 			},
 			testTimeoutMilliseconds,
 		);
+		test(
+			"publishes a third release with contiguous older publication history",
+			async () => {
+				await runScenario("third-release-history", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+		test(
+			"rejects an unexpected future publication while preparing a third release",
+			async () => {
+				await runScenario("third-release-future", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+
 
 		test.each([
 			"conflicting-tag",
