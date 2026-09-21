@@ -32,12 +32,7 @@ import {
 	type AutoBotInstallationIdentity,
 } from "./identity";
 import { acquireAutoBotFileLock } from "./lock";
-import {
-	autoBotLaunchLeaseLockPath,
-	autoBotPaths,
-	resolveAutoBotBootstrapRoot,
-	type AutoBotPaths,
-} from "./paths";
+import { autoBotLaunchLeaseLockPath, autoBotPaths, resolveAutoBotBootstrapRoot, type AutoBotPaths } from "./paths";
 import {
 	advanceAutoBotActivePointer,
 	clearAutoBotCommittedRestart,
@@ -131,7 +126,12 @@ async function readStagedRuntime(paths: AutoBotPaths, runtimePath: string): Prom
 	const resolvedRuntimePath = path.resolve(runtimePath);
 	const slotPath = path.dirname(resolvedRuntimePath);
 	const relative = path.relative(paths.runtimeDir, slotPath);
-	if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || path.basename(resolvedRuntimePath) !== executableName()) {
+	if (
+		!relative ||
+		relative.startsWith("..") ||
+		path.isAbsolute(relative) ||
+		path.basename(resolvedRuntimePath) !== executableName()
+	) {
 		throw new Error("Managed runtime path is invalid");
 	}
 	const markerValue = SlotMarkerSchema.assert(JSON.parse(await Bun.file(path.join(slotPath, "release.json")).text()));
@@ -191,7 +191,9 @@ function runtimeEnvironment(input: {
 			role: input.role,
 			launchId: input.claim.launchId,
 			bootstrapProcessId: input.claim.bootstrapProcessId,
-			...(input.request ? { handoffFile: path.join(input.paths.handoffDir, `${input.request.nonce}.${input.role}.json`) } : {}),
+			...(input.request
+				? { handoffFile: path.join(input.paths.handoffDir, `${input.request.nonce}.${input.role}.json`) }
+				: {}),
 			...(input.request ? { handoffNonce: input.request.nonce } : {}),
 			releaseSequence: input.runtime.manifest.releaseSequence,
 			releaseVersion: input.runtime.manifest.upstreamVersion,
@@ -235,7 +237,7 @@ async function waitForCandidateReady(
 	child: RuntimeProcess,
 ): Promise<CandidateReadyWait> {
 	let exitCode: number | undefined;
-	void child.exited.then((code) => {
+	void child.exited.then(code => {
 		exitCode = code;
 	});
 	const normalExit = () =>
@@ -264,10 +266,12 @@ async function retireFailedCandidate(child: RuntimeProcess): Promise<boolean> {
 	} catch {
 		return false;
 	}
-	return (await Promise.race([
-		child.exited.then(() => true),
-		Bun.sleep(AUTO_BOT_FAILED_CANDIDATE_RETIREMENT_TIMEOUT_MS).then(() => false),
-	])) === true;
+	return (
+		(await Promise.race([
+			child.exited.then(() => true),
+			Bun.sleep(AUTO_BOT_FAILED_CANDIDATE_RETIREMENT_TIMEOUT_MS).then(() => false),
+		])) === true
+	);
 }
 
 function journalMatch(
@@ -282,10 +286,7 @@ function journalMatch(
 	};
 }
 
-function isClaimedBy(
-	record: Pick<AutoBotPendingRestart, "claim">,
-	claim: AutoBotHandoffClaim,
-): boolean {
+function isClaimedBy(record: Pick<AutoBotPendingRestart, "claim">, claim: AutoBotHandoffClaim): boolean {
 	return sameAutoBotHandoffClaim(record.claim, claim);
 }
 
@@ -304,15 +305,9 @@ async function discardAutoBotHandoffIfOwned(paths: AutoBotPaths, expected: AutoB
 	}
 }
 
-type CandidateJournalRecord = Pick<
-	AutoBotPendingRestart,
-	"owner" | "request" | "runtimePath" | "previousRuntimePath"
->;
+type CandidateJournalRecord = Pick<AutoBotPendingRestart, "owner" | "request" | "runtimePath" | "previousRuntimePath">;
 
-function candidateHandoffMatchesJournal(
-	handoff: AutoBotHandoffRecord,
-	record: CandidateJournalRecord,
-): boolean {
+function candidateHandoffMatchesJournal(handoff: AutoBotHandoffRecord, record: CandidateJournalRecord): boolean {
 	const request = record.request;
 	return (
 		handoff.role === "candidate" &&
@@ -339,7 +334,10 @@ async function readCandidateHandoffForJournal(
 	paths: AutoBotPaths,
 	record: CandidateJournalRecord,
 ): Promise<AutoBotHandoffRecord | undefined> {
-	const handoff = await readAutoBotHandoff(paths, path.join(paths.handoffDir, `${record.request.nonce}.candidate.json`));
+	const handoff = await readAutoBotHandoff(
+		paths,
+		path.join(paths.handoffDir, `${record.request.nonce}.candidate.json`),
+	);
 	return handoff && candidateHandoffMatchesJournal(handoff, record) ? handoff : undefined;
 }
 
@@ -372,7 +370,6 @@ async function abandonPendingRestart(
 ): Promise<void> {
 	await abandonCandidateRestart(paths, pending, claim);
 }
-
 
 /** Promotion retains its authenticated handoff, but releases only exact journals. */
 async function clearCandidateRestartOwnership(
@@ -614,7 +611,6 @@ function runtimeMatchesRestartTarget(runtime: StagedRuntime, target: AutoBotRest
 	);
 }
 
-
 type FallbackPromotionWait = "promoted" | "normal-exit" | "timed-out" | { readonly exitCode: number };
 
 async function waitForFallbackPromotion(
@@ -623,7 +619,7 @@ async function waitForFallbackPromotion(
 	child: RuntimeProcess,
 ): Promise<FallbackPromotionWait> {
 	let exitCode: number | undefined;
-	void child.exited.then((code) => {
+	void child.exited.then(code => {
 		exitCode = code;
 	});
 	const normalExit = () =>
@@ -675,11 +671,7 @@ async function launchFallback(
 	}
 	const fallbackHandoff = await withAutoBotHandoffLock(paths, async () => {
 		const current = await readAutoBotPendingRestart(paths);
-		if (
-			!current ||
-			!isClaimedBy(current, claim) ||
-			!matchesAutoBotHandoffJournal(current, journalMatch(pending))
-		) {
+		if (!current || !isClaimedBy(current, claim) || !matchesAutoBotHandoffJournal(current, journalMatch(pending))) {
 			return undefined;
 		}
 		await discardCandidateHandoffIfOwned(paths, current);
@@ -727,7 +719,15 @@ async function launchFallback(
 		}
 		return 1;
 	}
-	const exitCode = await supervisePromotedRuntime(paths, identity, claim, active, fallbackRuntime, child, terminationRequested);
+	const exitCode = await supervisePromotedRuntime(
+		paths,
+		identity,
+		claim,
+		active,
+		fallbackRuntime,
+		child,
+		terminationRequested,
+	);
 	await withAutoBotHandoffLock(paths, () => discardAutoBotHandoffIfOwned(paths, fallbackHandoff));
 	return exitCode;
 }
@@ -788,9 +788,7 @@ async function activateCandidate(
 		recoveryState: "candidate-running",
 	};
 	if (
-		!(await withAutoBotHandoffLock(paths, () =>
-			commitAutoBotPendingRestart(paths, journalMatch(pending), committed),
-		))
+		!(await withAutoBotHandoffLock(paths, () => commitAutoBotPendingRestart(paths, journalMatch(pending), committed)))
 	) {
 		return 1;
 	}
@@ -1010,7 +1008,12 @@ async function resumeCommittedCandidate(
 			await writeAutoBotActivation(paths, running.request);
 		}
 	});
-	const acknowledgement = await waitForCandidateActivationAcknowledgement(paths, running.request, candidate.runtimePath, child);
+	const acknowledgement = await waitForCandidateActivationAcknowledgement(
+		paths,
+		running.request,
+		candidate.runtimePath,
+		child,
+	);
 	if (acknowledgement === "normal-exit") return stopNormally();
 	if (acknowledgement !== "acknowledged") {
 		if (acknowledgement !== "timed-out") return finishExitedCandidate();
@@ -1083,7 +1086,15 @@ async function runBootstrap(): Promise<number> {
 		});
 		// Await under this try so finally cannot release the lifetime lease while
 		// the active child (and any nested handoff supervision) is still live.
-		return await supervisePromotedRuntime(paths, identity, claim, active, activeRuntime, child, () => terminationRequested);
+		return await supervisePromotedRuntime(
+			paths,
+			identity,
+			claim,
+			active,
+			activeRuntime,
+			child,
+			() => terminationRequested,
+		);
 	} finally {
 		process.off("SIGINT", preserveChildTerminalOwnership);
 		process.off("SIGTERM", preserveChildTerminalOwnership);

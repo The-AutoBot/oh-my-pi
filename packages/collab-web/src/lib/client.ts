@@ -8,10 +8,7 @@
  * applied frame, so React change detection is reference equality all the way.
  */
 
-import {
-	COLLAB_RESTART_CAPABILITY_UPDATE,
-	COLLAB_RESTART_PREPARATION_CAPABILITY,
-} from "@oh-my-pi/pi-wire";
+import { COLLAB_RESTART_CAPABILITY_UPDATE, COLLAB_RESTART_PREPARATION_CAPABILITY } from "@oh-my-pi/pi-wire";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
@@ -593,7 +590,6 @@ export class GuestClient {
 				try {
 					listener(frame);
 				} catch {
-
 					// One playback consumer must not break ordered socket delivery.
 				}
 			}
@@ -716,11 +712,7 @@ export class GuestClient {
 		}
 	}
 
-	#sendRestartReady(
-		requestId: string,
-		status: "ready" | "blocked",
-		reason?: CollabRestartBlockReason,
-	): void {
+	#sendRestartReady(requestId: string, status: "ready" | "blocked", reason?: CollabRestartBlockReason): void {
 		if (!this.#restartPreparationEnabled || !this.#hostRestartCapable || this.#phase === "ended") return;
 		if (status === "ready" || reason === undefined) {
 			this.#socket.send({ t: "restart-ready", requestId, status });
@@ -753,8 +745,7 @@ export class GuestClient {
 				this.#canceledLiveClaims.clear();
 				this.#clearUiRequests();
 				this.#welcomed = true;
-				this.#hostRestartCapable =
-					frame.capabilities?.includes(COLLAB_RESTART_PREPARATION_CAPABILITY) === true;
+				this.#hostRestartCapable = frame.capabilities?.includes(COLLAB_RESTART_PREPARATION_CAPABILITY) === true;
 				this.#hostCapabilityUpdateSupported =
 					frame.capabilities?.includes(COLLAB_RESTART_CAPABILITY_UPDATE) === true;
 				this.#clearWelcomeTimer();

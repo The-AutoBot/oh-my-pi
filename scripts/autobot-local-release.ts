@@ -1,14 +1,20 @@
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, createReadStream, createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { pipeline } from "node:stream/promises";
 import {
 	AUTO_BOT_COLLAB_PROTOCOL_VERSION,
 	AUTO_BOT_COMPATIBILITY_EPOCH,
 	AUTO_BOT_RELEASE_SCHEMA_VERSION,
 	AUTO_BOT_SESSION_FORMAT_VERSION,
 } from "../packages/coding-agent/src/autobot-update/contract.ts";
-import { ensureAutoBotPrivateDirectory } from "../packages/coding-agent/src/autobot-update/permissions.ts";
+import {
+	assertAutoBotImportableFile,
+	assertAutoBotPrivateDirectory,
+	ensureAutoBotPrivateDirectory,
+} from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { isRecord } from "../packages/utils/src/type-guards.ts";
+import { containsVersionSentinel, versionSentinelFor } from "../packages/natives/native/version-sentinel.js";
 import {
 	AutoBotReleaseError,
 	hashFile,
@@ -35,6 +41,7 @@ import {
 import { assertCompleteAutoBotReleaseTopology } from "./autobot-release-topology.ts";
 import { createManagedBundle, deriveManagedBundleId } from "./autobot-release-web.ts";
 import type { LocalAutomationConfig, LocalCandidate } from "./autobot-local-types.ts";
+import type { LocalCommandKind, LocalCommandRecorder } from "./autobot-local.ts";
 
 const RELEASE_REPOSITORY = "The-AutoBot/oh-my-pi";
 const RELEASE_TARGET = "win32-x64";
@@ -51,22 +58,48 @@ const RELEASE_METADATA_FILES = [
 	"coordinator-source.json",
 	"signed-envelope.json",
 ] as const;
+const MAX_CAPTURED_COMMAND_BYTES = 32 * 1024;
+const MAX_WINDOWS_RELEASE_PATH = 160;
+const CANDIDATE_SECRET_NAME =
+	/(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIAL|AUTHORIZATION|COOKIE|SESSION)/i;
+const CANDIDATE_AUTOLOAD_NAME =
+	/^(?:BUN_PRELOAD|NODE_OPTIONS|NODE_PATH|TS_NODE_PROJECT|DOTENV_CONFIG_PATH|NPM_CONFIG_USERCONFIG|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GH_CONFIG_DIR|AWS_PROFILE|AWS_SHARED_CREDENTIALS_FILE|GOOGLE_APPLICATION_CREDENTIALS|AZURE_CONFIG_DIR)$/i;
 
-/** A failure in a candidate build or focused candidate check that may be repaired in the isolated candidate worktree. */
+/** An application asset build or executable smoke failure that may be repaired in the isolated candidate worktree. */
 export class LocalBuildFailure extends Error {
 	public readonly diagnostics: string;
 
 	public constructor(diagnostics: string, options?: ErrorOptions) {
-		super(`Local candidate build/check failed: ${diagnostics}`, options);
+		super(`Local application build/smoke failed: ${diagnostics}`, options);
 		this.name = "LocalBuildFailure";
 		this.diagnostics = diagnostics;
 	}
 }
-class CommandExitError extends AutoBotReleaseError {}
+type ReleaseCommandKind = Exclude<LocalCommandKind, "omp-invocation">;
+
+interface CommandExitDetails {
+	readonly commandKind: ReleaseCommandKind;
+	readonly exitCode: number;
+	readonly durationMs: number;
+}
+
+class CommandExitError extends AutoBotReleaseError {
+	public readonly commandKind?: ReleaseCommandKind;
+	public readonly exitCode?: number;
+	public readonly durationMs?: number;
+
+	public constructor(message: string, details?: CommandExitDetails) {
+		super(message);
+		this.commandKind = details?.commandKind;
+		this.exitCode = details?.exitCode;
+		this.durationMs = details?.durationMs;
+	}
+}
 
 interface CommandOptions {
 	readonly cwd?: string;
 	readonly env?: NodeJS.ProcessEnv;
+	readonly captureOutput?: boolean;
 }
 
 interface CandidateReleasePlan {
@@ -82,7 +115,6 @@ interface GitHubRelease {
 	readonly draft: boolean;
 	readonly targetCommit: string;
 }
-
 interface ChannelEnvelope {
 	readonly path: string;
 	readonly verified: VerifiedReleaseEnvelope;
@@ -93,6 +125,14 @@ interface ReleaseChain {
 	readonly tag: string;
 	readonly previous?: ChannelEnvelope;
 	readonly previousRelease?: GitHubRelease;
+	readonly matchingDraft?: GitHubRelease;
+	readonly matchingPublished?: GitHubRelease;
+}
+
+interface ExpectedDraft {
+	readonly sequence: number;
+	readonly tag: string;
+	readonly targetCommit: string;
 }
 
 interface ReleaseBuildIdentity {
@@ -105,12 +145,22 @@ interface ReleaseBuildIdentity {
 	readonly collabProtocolVersion: number;
 	readonly compatibilityEpoch: number;
 }
+interface NativeAddonReuseEvidence {
+	readonly filename: string;
+	readonly version: string;
+	readonly variant: "baseline" | "modern";
+	readonly size: number;
+	readonly sha256: string;
+	readonly origin: "local-reuse";
+	readonly producerSourceCommit: null;
+}
 
 interface CandidateAssets {
 	readonly runtime: string;
 	readonly bootstrap: string;
 	readonly webArchive: string;
 	readonly webBundleId: string;
+	readonly nativeAddons: readonly NativeAddonReuseEvidence[];
 }
 
 interface CoordinatorAsset {
@@ -124,6 +174,168 @@ interface AssembledBundle {
 	readonly signedEnvelope: string;
 }
 
+export interface LocalReleaseOptions {
+	readonly mode: "verify" | "publish";
+}
+
+export type LocalReleaseResult =
+	| {
+			readonly kind: "published";
+			readonly forkCommit: string;
+			readonly releaseSequence: number;
+			readonly tag: string;
+	  }
+	| {
+			readonly kind: "unchanged";
+			readonly forkCommit: string;
+	  }
+	| {
+			readonly kind: "verified";
+			readonly forkCommit: string;
+			readonly releaseSequence: number;
+			readonly tag: string;
+			readonly preservedStageRoot: string;
+	  };
+
+interface CapturedStream {
+	readonly text: string;
+	readonly truncated: boolean;
+}
+export interface CommandOutputRedactionPolicy {
+	readonly knownCredentials: readonly string[];
+}
+
+export function createCommandOutputRedactionPolicy(
+	...environments: readonly NodeJS.ProcessEnv[]
+): CommandOutputRedactionPolicy {
+	const knownCredentials = new Set<string>();
+	for (const environment of environments) {
+		for (const [name, value] of Object.entries(environment)) {
+			if (
+				value !== undefined &&
+				value.length >= 4 &&
+				/(?:authorization|credential|password|passwd|token|secret|api[_-]?key|private[_-]?key)/i.test(name)
+			) {
+				for (const part of value.split(/\r?\n/)) {
+					if (part.length >= 4) knownCredentials.add(part);
+				}
+			}
+		}
+	}
+	return { knownCredentials: [...knownCredentials].sort((left, right) => right.length - left.length) };
+}
+
+export function redactSensitiveCommandOutput(value: string, policy: CommandOutputRedactionPolicy): string {
+	let redacted = value
+		.replace(/\b(?:https?|wss?):\/\/[^\s"'<>]+/gi, "[REDACTED URL]")
+		.replace(
+			/\b(authorization|password|passwd|token|secret|api[_-]?key|private[_-]?key)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+			"$1=[REDACTED]",
+		)
+		.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED CREDENTIAL]")
+		.replace(
+			/-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]+PRIVATE KEY-----/g,
+			"[REDACTED PRIVATE KEY]",
+		);
+	for (const credential of policy.knownCredentials) {
+		redacted = redacted.replaceAll(credential, "[REDACTED CREDENTIAL]");
+	}
+	return redacted;
+}
+
+async function captureBounded(
+	stream: ReadableStream<Uint8Array>,
+	limit: number,
+	redactionPolicy: CommandOutputRedactionPolicy,
+): Promise<CapturedStream> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder("utf8", { fatal: false });
+	const encoder = new TextEncoder();
+	const headLimit = Math.floor((limit * 3) / 4);
+	const tailLimit = limit - headLimit;
+	const head: Uint8Array[] = [];
+	const tail = new Uint8Array(tailLimit);
+	let headBytes = 0;
+	let tailBytes = 0;
+	let tailPosition = 0;
+	let total = 0;
+	let pending = "";
+	let insidePrivateKey = false;
+	let oversizedLine = false;
+	let oversizedRedacted = false;
+	const append = (text: string): void => {
+		const value = encoder.encode(text);
+		total += value.byteLength;
+		const headTake = Math.min(value.byteLength, Math.max(0, headLimit - headBytes));
+		if (headTake > 0) {
+			head.push(value.subarray(0, headTake));
+			headBytes += headTake;
+		}
+		let offset = headTake;
+		while (offset < value.byteLength) {
+			const take = Math.min(value.byteLength - offset, tailLimit - tailPosition);
+			tail.set(value.subarray(offset, offset + take), tailPosition);
+			tailPosition = (tailPosition + take) % tailLimit;
+			tailBytes = Math.min(tailLimit, tailBytes + take);
+			offset += take;
+		}
+	};
+	const appendSanitizedLine = (line: string, newline: boolean): void => {
+		const suffix = newline ? "\n" : "";
+		const beginsPrivateKey = /-----BEGIN [^-]*PRIVATE KEY-----/i.test(line);
+		const endsPrivateKey = /-----END [^-]*PRIVATE KEY-----/i.test(line);
+		if (oversizedLine) {
+			if (beginsPrivateKey) insidePrivateKey = true;
+			if (endsPrivateKey) insidePrivateKey = false;
+			append(`[REDACTED OVERSIZED OUTPUT LINE]${suffix}`);
+			oversizedLine = false;
+			return;
+		}
+		if (insidePrivateKey || beginsPrivateKey) {
+			if (!insidePrivateKey) append(`[REDACTED PRIVATE KEY]${suffix}`);
+			insidePrivateKey = !endsPrivateKey;
+			return;
+		}
+		append(`${redactSensitiveCommandOutput(line, redactionPolicy)}${suffix}`);
+	};
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		pending += decoder.decode(value, { stream: true });
+		for (;;) {
+			const newline = pending.indexOf("\n");
+			if (newline < 0) break;
+			const line = pending.slice(0, newline).replace(/\r$/, "");
+			pending = pending.slice(newline + 1);
+			appendSanitizedLine(line, true);
+		}
+		if (pending.length > 8 * 1024) {
+			if (/-----BEGIN [^-]*PRIVATE KEY-----/i.test(pending)) insidePrivateKey = true;
+			if (/-----END [^-]*PRIVATE KEY-----/i.test(pending)) insidePrivateKey = false;
+			pending = pending.slice(-128);
+			oversizedRedacted = true;
+			oversizedLine = true;
+		}
+	}
+	pending += decoder.decode();
+	if (pending || oversizedLine || insidePrivateKey) appendSanitizedLine(pending, false);
+	if (total <= limit) {
+		const trailing = tail.subarray(0, tailBytes);
+		return {
+			text: Buffer.concat([...head, trailing]).toString("utf8"),
+			truncated: oversizedRedacted,
+		};
+	}
+	const trailing =
+		tailBytes < tailLimit
+			? tail.subarray(0, tailBytes)
+			: Buffer.concat([tail.subarray(tailPosition), tail.subarray(0, tailPosition)]);
+	const omitted = total - headBytes - tailBytes;
+	return {
+		text: `${Buffer.concat(head).toString("utf8")}\n...[${omitted} sanitized output bytes truncated]...\n${Buffer.from(trailing).toString("utf8")}`,
+		truncated: true,
+	};
+}
 function isInside(parent: string, child: string): boolean {
 	const relative = path.relative(parent, child);
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -196,20 +408,80 @@ async function requireConfiguredFile(pathname: string, label: string): Promise<s
 	return absolute;
 }
 
-async function runQuiet(label: string, argv: readonly string[], options: CommandOptions = {}): Promise<void> {
-	let child: Bun.Subprocess<"ignore", "ignore", "ignore">;
+export async function runQuiet(
+	recorder: LocalCommandRecorder,
+	commandKind: ReleaseCommandKind,
+	label: string,
+	argv: readonly string[],
+	options: CommandOptions = {},
+): Promise<void> {
+	try {
+		await recorder.record({ stage: "release", commandKind, outcome: "started", timedOut: false });
+	} catch {
+		throw new AutoBotReleaseError("Local command diagnostics could not be recorded");
+	}
+	const startedAt = performance.now();
+	let child: Bun.Subprocess<"ignore", "ignore" | "pipe", "ignore" | "pipe">;
+	const captureOutput = options.captureOutput === true && recorder.recordOutput !== undefined;
 	try {
 		child = Bun.spawn([...argv], {
 			cwd: options.cwd,
-			env: options.env,
+			env: options.env ?? process.env,
 			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
+			stdout: captureOutput ? "pipe" : "ignore",
+			stderr: captureOutput ? "pipe" : "ignore",
 		});
 	} catch (error) {
+		const durationMs = Math.min(7 * 24 * 60 * 60 * 1000, Math.max(0, Math.floor(performance.now() - startedAt)));
+		try {
+			await recorder.record({ stage: "release", commandKind, outcome: "start-failed", timedOut: false, durationMs });
+		} catch {
+			// The original process-start failure is already terminal.
+		}
 		throw new AutoBotReleaseError(`${label} could not start`, { cause: error });
 	}
-	if ((await child.exited) !== 0) throw new CommandExitError(`${label} failed`);
+	const redactionPolicy = createCommandOutputRedactionPolicy(process.env, options.env ?? process.env);
+	const captured =
+		captureOutput &&
+		child.stdout !== undefined &&
+		child.stderr !== undefined &&
+		typeof child.stdout !== "number" &&
+		typeof child.stderr !== "number"
+			? await Promise.all([
+					captureBounded(child.stdout, MAX_CAPTURED_COMMAND_BYTES, redactionPolicy),
+					captureBounded(child.stderr, MAX_CAPTURED_COMMAND_BYTES, redactionPolicy),
+					child.exited,
+				])
+			: undefined;
+	const exitCode = captured?.[2] ?? (await child.exited);
+	const durationMs = Math.min(7 * 24 * 60 * 60 * 1000, Math.max(0, Math.floor(performance.now() - startedAt)));
+	try {
+		await recorder.record({
+			stage: "release",
+			commandKind,
+			outcome: "exited",
+			timedOut: false,
+			exitCode,
+			durationMs,
+		});
+	} catch {
+		if (exitCode === 0) throw new AutoBotReleaseError("Local command diagnostics could not be recorded");
+	}
+	if (captured && recorder.recordOutput) {
+		try {
+			await recorder.recordOutput({
+				commandKind,
+				stdout: captured[0].text,
+				stderr: captured[1].text,
+				truncated: captured[0].truncated || captured[1].truncated,
+			});
+		} catch {
+			throw new AutoBotReleaseError("Local command output diagnostics could not be recorded");
+		}
+	}
+	if (exitCode !== 0) {
+		throw new CommandExitError(`${label} failed`, { commandKind, exitCode, durationMs });
+	}
 }
 
 async function runText(label: string, argv: readonly string[], options: CommandOptions = {}): Promise<string> {
@@ -217,7 +489,7 @@ async function runText(label: string, argv: readonly string[], options: CommandO
 	try {
 		child = Bun.spawn([...argv], {
 			cwd: options.cwd,
-			env: options.env,
+			env: options.env ?? process.env,
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
@@ -235,12 +507,39 @@ async function runText(label: string, argv: readonly string[], options: CommandO
 	return stdout;
 }
 
+async function writeCommandOutput(
+	label: string,
+	argv: readonly string[],
+	destination: string,
+	options: CommandOptions = {},
+): Promise<void> {
+	let child: Bun.Subprocess<"ignore", "pipe", "ignore">;
+	try {
+		child = Bun.spawn([...argv], {
+			cwd: options.cwd,
+			env: options.env ?? process.env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+	} catch (error) {
+		throw new AutoBotReleaseError(`${label} could not start`, { cause: error });
+	}
+	const stdoutStream = child.stdout;
+	if (typeof stdoutStream === "number" || stdoutStream === undefined || stdoutStream === null) {
+		throw new AutoBotReleaseError(`${label} did not expose captured standard output`);
+	}
+	const [bytes, exitCode] = await Promise.all([new Response(stdoutStream).arrayBuffer(), child.exited]);
+	if (exitCode !== 0) throw new CommandExitError(`${label} failed`);
+	await Bun.write(destination, bytes);
+}
+
 async function runExitCode(argv: readonly string[], options: CommandOptions = {}): Promise<number> {
 	let child: Bun.Subprocess<"ignore", "ignore", "ignore">;
 	try {
 		child = Bun.spawn([...argv], {
 			cwd: options.cwd,
-			env: options.env,
+			env: options.env ?? process.env,
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
@@ -290,14 +589,69 @@ async function assertCleanCommittedCheckout(
 
 async function assertExactBun(executable: string, expectedVersion: string, label: string): Promise<void> {
 	const actualVersion = (await runText(`${label} version check`, [executable, "--version"])).trim();
-	if (actualVersion !== expectedVersion)
+	if (actualVersion !== expectedVersion) {
 		throw new AutoBotReleaseError(`${label} does not match its configured exact version`);
+	}
 }
 
+export async function assertDeclaredToolingBunSupport(sourceRoot: string, compilerVersion: string): Promise<string> {
+	const manifest = await readJson(path.join(sourceRoot, "package.json"), "candidate package manifest");
+	if (!isRecord(manifest) || typeof manifest.packageManager !== "string") {
+		throw new AutoBotReleaseError("Candidate package manifest must declare its Bun tooling requirement");
+	}
+	const match = /^bun@(>=)?([0-9]+\.[0-9]+(?:\.[0-9]+)?)$/.exec(manifest.packageManager);
+	if (!match) throw new AutoBotReleaseError("Candidate package manifest has an unsupported Bun tooling declaration");
+	const required = match[2]!;
+	let compatible: boolean;
+	if (match[1] === ">=") {
+		const actualMatch = /^([0-9]+)\.([0-9]+)(?:\.([0-9]+))?$/.exec(compilerVersion);
+		if (!actualMatch) {
+			throw new AutoBotReleaseError("Compiler Bun does not report a supported numeric version");
+		}
+		const normalizedActual = `${actualMatch[1]}.${actualMatch[2]}.${actualMatch[3] ?? "0"}`;
+		const requiredParts = required.split(".");
+		const normalizedRequired = `${requiredParts[0]}.${requiredParts[1]}.${requiredParts[2] ?? "0"}`;
+		compatible = Bun.semver.order(normalizedActual, normalizedRequired) >= 0;
+	} else {
+		compatible = compilerVersion === required;
+	}
+	if (!compatible) {
+		throw new AutoBotReleaseError("Compiler Bun does not satisfy the candidate Bun tooling declaration");
+	}
+	return manifest.packageManager;
+}
 function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
 	if (environment[name] !== undefined) return environment[name];
 	const normalizedName = name.toUpperCase();
 	return Object.entries(environment).find(([key]) => key.toUpperCase() === normalizedName)?.[1];
+}
+
+function deleteEnvironmentName(environment: NodeJS.ProcessEnv, name: string): void {
+	for (const key of Object.keys(environment)) {
+		if (key.toUpperCase() === name.toUpperCase()) delete environment[key];
+	}
+}
+
+function sanitizeCandidateEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const sanitized = { ...environment };
+	for (const key of Object.keys(sanitized)) {
+		if (CANDIDATE_SECRET_NAME.test(key) || CANDIDATE_AUTOLOAD_NAME.test(key)) delete sanitized[key];
+	}
+	deleteEnvironmentName(sanitized, "BUN_COMPILE_EXECUTABLE_PATH");
+	deleteEnvironmentName(sanitized, "AUTOBOT_COMPILER_BUN");
+	deleteEnvironmentName(sanitized, "BUN_ENV");
+	sanitized.BUN_CONFIG_NO_ENV_FILE = "1";
+	return sanitized;
+}
+
+function bunCommand(executable: string, ...args: readonly string[]): string[] {
+	return [executable, "--no-env-file", ...args];
+}
+
+function requireBoundedWindowsPath(pathname: string, label: string): void {
+	if (process.platform === "win32" && pathname.length > MAX_WINDOWS_RELEASE_PATH) {
+		throw new AutoBotReleaseError(`${label} exceeds the bounded Windows release path limit`);
+	}
 }
 
 /**
@@ -309,22 +663,26 @@ async function createPrivateCommandEnvironment(
 	environment: NodeJS.ProcessEnv,
 ): Promise<NodeJS.ProcessEnv> {
 	const privateRoot = await ensureAutoBotPrivateDirectory(root);
-	const originalHome = environmentValue(environment, "HOME") ?? environmentValue(environment, "USERPROFILE");
-	const cargoHome = environmentValue(environment, "CARGO_HOME") ?? (originalHome && path.join(originalHome, ".cargo"));
-	const rustupHome =
-		environmentValue(environment, "RUSTUP_HOME") ?? (originalHome && path.join(originalHome, ".rustup"));
-	const [home, xdgConfig, xdgData, xdgCache, xdgState, appData, localAppData, bunCache] = await Promise.all([
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "home")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-config")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-data")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-cache")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "xdg-state")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "appdata")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "localappdata")),
-		ensureAutoBotPrivateDirectory(path.join(privateRoot, "bun-cache")),
-	]);
+	requireBoundedWindowsPath(privateRoot, "Private candidate command root");
+	const sanitized = sanitizeCandidateEnvironment(environment);
+	// The already-verified root propagates its owner-only Windows ACL to children.
+	const directories = ["h", "xc", "xd", "xx", "xs", "a", "l", "b", "t"].map(name => path.join(privateRoot, name));
+	await Promise.all(directories.map(directory => fs.mkdir(directory, { mode: 0o700 })));
+	const [home, xdgConfig, xdgData, xdgCache, xdgState, appData, localAppData, bunCache, temporary] = directories as [
+		string,
+		string,
+		string,
+		string,
+		string,
+		string,
+		string,
+		string,
+		string,
+	];
+	const gitConfig = path.join(privateRoot, "g");
+	await Bun.write(gitConfig, "");
 	return {
-		...environment,
+		...sanitized,
 		HOME: home,
 		USERPROFILE: home,
 		XDG_CONFIG_HOME: xdgConfig,
@@ -334,16 +692,64 @@ async function createPrivateCommandEnvironment(
 		APPDATA: appData,
 		LOCALAPPDATA: localAppData,
 		BUN_INSTALL_CACHE_DIR: bunCache,
-		CARGO_HOME: cargoHome,
-		RUSTUP_HOME: rustupHome,
+		TEMP: temporary,
+		TMP: temporary,
+		TMPDIR: temporary,
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_CONFIG_GLOBAL: gitConfig,
 	};
+}
+function normalizedPathEntry(value: string): string {
+	const resolved = path.resolve(value);
+	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+export async function createPinnedBunCommandEnvironment(
+	root: string,
+	executable: string,
+	expectedVersion: string,
+	environment: NodeJS.ProcessEnv,
+): Promise<NodeJS.ProcessEnv> {
+	const bin = await ensureAutoBotPrivateDirectory(root);
+	requireBoundedWindowsPath(bin, "Pinned Bun command directory");
+	const commandName = process.platform === "win32" ? "bun.exe" : "bun";
+	const pinnedCommand = path.join(bin, commandName);
+	try {
+		await fs.link(executable, pinnedCommand);
+	} catch (error) {
+		if (
+			(error as NodeJS.ErrnoException).code !== "EXDEV" &&
+			(error as NodeJS.ErrnoException).code !== "EPERM" &&
+			(error as NodeJS.ErrnoException).code !== "EACCES"
+		) {
+			throw new AutoBotReleaseError("Pinned Bun command link could not be created", { cause: error });
+		}
+		await fs.copyFile(executable, pinnedCommand, fsConstants.COPYFILE_EXCL);
+	}
+	const inheritedPath = environmentValue(environment, "PATH") ?? "";
+	const normalizedBin = normalizedPathEntry(bin);
+	const retained = inheritedPath
+		.split(path.delimiter)
+		.filter(entry => entry && normalizedPathEntry(entry) !== normalizedBin);
+	const pinnedEnvironment = { ...environment };
+	deleteEnvironmentName(pinnedEnvironment, "PATH");
+	pinnedEnvironment.PATH = [bin, ...retained].join(path.delimiter);
+	const nestedVersion = (
+		await runText("Pinned nested Bun version check", ["bun", "--version"], {
+			env: pinnedEnvironment,
+		})
+	).trim();
+	if (nestedVersion !== expectedVersion) {
+		throw new AutoBotReleaseError("Nested Bun command does not resolve to its configured exact version");
+	}
+	return pinnedEnvironment;
 }
 
 export async function createCandidateBuildEnvironment(
 	stageRoot: string,
 	environment: NodeJS.ProcessEnv,
 ): Promise<NodeJS.ProcessEnv> {
-	return createPrivateCommandEnvironment(path.join(stageRoot, "candidate-environment"), environment);
+	return createPrivateCommandEnvironment(path.join(stageRoot, "e"), environment);
 }
 
 /** Publisher and coordinator commands retain the operator's credential and signing environment. */
@@ -385,6 +791,7 @@ function requirePublisherConfiguration(config: LocalAutomationConfig): void {
 		[config.workRoot, "Work root"],
 		[config.runnerBun, "Runner Bun"],
 		[config.compilerBun, "Compiler Bun"],
+		[config.nativeAddonDirectory, "Native addon directory"],
 		[config.coordinatorRoot, "Coordinator root"],
 		[config.privateKeyPath, "Private signing key"],
 		[config.publicKeyPath, "Public signing key"],
@@ -419,27 +826,7 @@ async function candidateBuildStage<T>(diagnostics: string, action: () => Promise
 	}
 }
 
-async function readCandidateReleasePlan(
-	config: LocalAutomationConfig,
-	sourceRoot: string,
-	stageRoot: string,
-	environment: NodeJS.ProcessEnv,
-): Promise<CandidateReleasePlan> {
-	const output = path.join(stageRoot, "release-plan.json");
-	const publisherRoot = path.resolve(import.meta.dir, "..");
-	await runQuiet(
-		"Release plan",
-		[
-			config.runnerBun,
-			path.join(publisherRoot, "scripts", "autobot-release-plan.ts"),
-			"--source-root",
-			sourceRoot,
-			"--out",
-			output,
-		],
-		{ cwd: publisherRoot, env: environment },
-	);
-	const value = await readJson(output, "local release plan");
+function parseCandidateReleasePlan(value: unknown): CandidateReleasePlan {
 	if (!isRecord(value) || value.ready !== true) {
 		throw new AutoBotReleaseError("Candidate does not retain a release-eligible AutoBot merge");
 	}
@@ -455,6 +842,32 @@ async function readCandidateReleasePlan(
 		),
 		compatibilityEpoch: requirePositiveSafeInteger(value.compatibilityEpoch, "Release plan compatibility epoch"),
 	};
+}
+
+async function readCandidateReleasePlan(
+	config: LocalAutomationConfig,
+	sourceRoot: string,
+	stageRoot: string,
+	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
+): Promise<CandidateReleasePlan> {
+	const output = path.join(stageRoot, "release-plan.json");
+	const publisherRoot = path.resolve(import.meta.dir, "..");
+	await runQuiet(
+		recorder,
+		"release-plan",
+		"Release plan",
+		[
+			config.runnerBun,
+			path.join(publisherRoot, "scripts", "autobot-release-plan.ts"),
+			"--source-root",
+			sourceRoot,
+			"--out",
+			output,
+		],
+		{ cwd: publisherRoot, env: environment },
+	);
+	return parseCandidateReleasePlan(await readJson(output, "local release plan"));
 }
 
 function assertPlanMatchesCandidate(plan: CandidateReleasePlan, candidate: LocalCandidate): void {
@@ -521,6 +934,25 @@ async function listGitHubReleases(repository: string): Promise<readonly GitHubRe
 	return releases.sort((left, right) => left.sequence - right.sequence);
 }
 
+async function assertCompletedReleaseChain(
+	config: LocalAutomationConfig,
+	sequence: number,
+	tag: string,
+	forkCommit: string,
+): Promise<void> {
+	const releases = await listGitHubReleases(config.repository);
+	if (
+		releases.length !== sequence ||
+		releases.some((release, index) => release.draft || release.sequence !== index + 1) ||
+		releases.at(-1)?.tag !== tag ||
+		releases.at(-1)?.targetCommit !== forkCommit
+	) {
+		throw new AutoBotReleaseError(
+			"Signed channel does not match the exact completed immutable AutoBot release chain",
+		);
+	}
+}
+
 function parseIncludedGitHubResponse(output: string): { readonly status: number; readonly body: string } {
 	const statuses = [...output.matchAll(/(?:^|\n)HTTP\/[^\s]+\s+([0-9]{3})\b/gm)];
 	const last = statuses.at(-1);
@@ -543,6 +975,7 @@ async function readIncludedGitHubApi(
 	let child: Bun.Subprocess<"ignore", "pipe", "ignore">;
 	try {
 		child = Bun.spawn(["gh", "api", "--include", endpoint], {
+			env: process.env,
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
@@ -610,12 +1043,41 @@ async function establishReleaseChain(
 	config: LocalAutomationConfig,
 	stageRoot: string,
 	trusted: TrustedKeySet,
+	expectedDraft?: ExpectedDraft,
 ): Promise<ReleaseChain> {
 	const releases = await listGitHubReleases(config.repository);
-	if (releases.some(release => release.draft)) {
-		throw new AutoBotReleaseError(
-			"An existing draft AutoBot release must be resolved before another local publication",
-		);
+	const drafts = releases.filter(release => release.draft);
+	const published = releases.filter(release => !release.draft);
+	let matchingDraft: GitHubRelease | undefined;
+	let matchingPublished: GitHubRelease | undefined;
+	if (!expectedDraft) {
+		if (drafts.length !== 0) {
+			throw new AutoBotReleaseError(
+				"An existing draft AutoBot release must be resolved before another local publication",
+			);
+		}
+	} else if (drafts.length > 1) {
+		throw new AutoBotReleaseError("Prepared publication found ambiguous AutoBot draft releases");
+	} else if (drafts.length === 1) {
+		matchingDraft = drafts[0];
+		if (
+			matchingDraft.sequence !== expectedDraft.sequence ||
+			matchingDraft.tag !== expectedDraft.tag ||
+			matchingDraft.targetCommit !== expectedDraft.targetCommit
+		) {
+			throw new AutoBotReleaseError("Existing AutoBot draft does not exactly match the prepared release");
+		}
+	}
+	if (expectedDraft) {
+		matchingPublished = published.find(release => release.sequence === expectedDraft.sequence);
+		if (
+			matchingPublished &&
+			(matchingPublished.tag !== expectedDraft.tag ||
+				matchingPublished.targetCommit !== expectedDraft.targetCommit ||
+				matchingDraft)
+		) {
+			throw new AutoBotReleaseError("Existing published release does not exactly match the prepared release");
+		}
 	}
 	const channel = await readChannelEnvelope(config, trusted, path.join(stageRoot, "previous-channel-envelope.json"));
 	if (!channel) {
@@ -624,42 +1086,76 @@ async function establishReleaseChain(
 				"A verified prior channel envelope is required unless initial publication is explicitly enabled",
 			);
 		}
-		if (releases.length !== 0) {
-			throw new AutoBotReleaseError(
-				"The signed channel is absent despite existing AutoBot releases; initial publication is not genuine",
-			);
+		const sequence = 1;
+		const tag = requireReleaseTag(sequence);
+		if (expectedDraft && (expectedDraft.sequence !== sequence || expectedDraft.tag !== tag)) {
+			throw new AutoBotReleaseError("Prepared release is not the next initial release");
 		}
-		return { sequence: 1, tag: requireReleaseTag(1) };
+		const permittedPublished = matchingPublished ? 1 : 0;
+		if (published.length !== permittedPublished) {
+			throw new AutoBotReleaseError("The signed channel is absent despite foreign published AutoBot release state");
+		}
+		return { sequence, tag, matchingDraft, matchingPublished };
 	}
-	if (releases.length === 0) {
+	if (published.length === 0) {
 		throw new AutoBotReleaseError(
-			"The signed channel has a predecessor but GitHub has no corresponding AutoBot release",
+			"The signed channel has a predecessor but GitHub has no corresponding published AutoBot release",
 		);
 	}
-	const latest = releases.at(-1)!;
 	const previousSequence = channel.verified.manifest.releaseSequence;
-	if (latest.sequence !== previousSequence) {
-		throw new AutoBotReleaseError("Signed channel predecessor does not match the latest published AutoBot release");
+	const previousRelease = published.find(release => release.sequence === previousSequence);
+	if (!previousRelease || previousRelease.targetCommit !== channel.verified.manifest.forkCommit) {
+		throw new AutoBotReleaseError("Signed channel predecessor does not match its published AutoBot release");
 	}
-	if (latest.targetCommit !== channel.verified.manifest.forkCommit) {
-		throw new AutoBotReleaseError(
-			"Latest published AutoBot release target does not match the signed channel predecessor",
-		);
-	}
-	if (latest.sequence >= MAX_RELEASE_SEQUENCE)
+	if (previousSequence >= MAX_RELEASE_SEQUENCE)
 		throw new AutoBotReleaseError("AutoBot release sequence exceeds JavaScript safe integer range");
-	const sequence = latest.sequence + 1;
-	return { sequence, tag: requireReleaseTag(sequence), previous: channel, previousRelease: latest };
+	const sequence = previousSequence + 1;
+	const tag = requireReleaseTag(sequence);
+	if (expectedDraft && (expectedDraft.sequence !== sequence || expectedDraft.tag !== tag)) {
+		throw new AutoBotReleaseError("Prepared release is not the next signed release sequence");
+	}
+	const expectedPublishedCount = matchingPublished ? 2 : 1;
+	if (
+		published.length !== expectedPublishedCount ||
+		published.some(release => release !== previousRelease && release !== matchingPublished)
+	) {
+		throw new AutoBotReleaseError("Published AutoBot release state is not the exact channel predecessor chain");
+	}
+	return {
+		sequence,
+		tag,
+		previous: channel,
+		previousRelease,
+		matchingDraft,
+		matchingPublished,
+	};
 }
 
 function githubRepositoryUrl(repository: string): string {
 	return `https://github.com/${repository}.git`;
 }
 
+async function createAndAssertReleaseTag(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	tag: string,
+	recorder: LocalCommandRecorder,
+): Promise<void> {
+	await runQuiet(
+		recorder,
+		"release-tag-creation",
+		"Release tag creation",
+		["git", "push", githubRepositoryUrl(config.repository), `${candidate.forkCommit}:refs/tags/${tag}`],
+		{ cwd: candidate.sourceRoot },
+	);
+	await fetchAndAssertReleaseTag(config, candidate.sourceRoot, tag, candidate.forkCommit, recorder);
+}
+
 async function assertIntegrationRef(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
 	sourceRoot: string,
+	recorder: LocalCommandRecorder,
 ): Promise<string> {
 	const branchRef = `refs/heads/${config.integrationBranch}`;
 	const remote = await runText("Integration branch lookup", [
@@ -681,6 +1177,8 @@ async function assertIntegrationRef(
 	}
 	const localRef = `refs/remotes/autobot-local-publisher/${config.integrationBranch}`;
 	await runQuiet(
+		recorder,
+		"integration-branch-fetch",
 		"Integration branch fetch",
 		["git", "fetch", "--no-tags", githubRepositoryUrl(config.repository), `${branchRef}:${localRef}`],
 		{ cwd: sourceRoot },
@@ -699,8 +1197,11 @@ async function fetchAndAssertReleaseTag(
 	sourceRoot: string,
 	tag: string,
 	forkCommit: string,
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
 	await runQuiet(
+		recorder,
+		"release-tag-fetch",
 		"Release tag fetch",
 		["git", "fetch", "--no-tags", githubRepositoryUrl(config.repository), `refs/tags/${tag}:refs/tags/${tag}`],
 		{ cwd: sourceRoot },
@@ -790,6 +1291,122 @@ async function prepareDownloadedBundle(
 	}
 }
 
+function sameCanonicalPath(left: string, right: string): boolean {
+	const resolvedLeft = path.resolve(left);
+	const resolvedRight = path.resolve(right);
+	return process.platform === "win32"
+		? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+		: resolvedLeft === resolvedRight;
+}
+
+async function requireCanonicalImportableFile(pathname: string, label: string): Promise<string> {
+	const lexical = path.resolve(pathname);
+	const canonical = await assertAutoBotImportableFile(lexical);
+	if (!sameCanonicalPath(lexical, canonical)) {
+		throw new AutoBotReleaseError(`${label} must use its canonical path without aliases`);
+	}
+	return canonical;
+}
+
+async function copyOwnedPrivateFile(source: string, destination: string, label: string): Promise<string> {
+	await pipeline(createReadStream(source), createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+	const stat = await fs.lstat(destination);
+	if (!stat.isFile() || stat.isSymbolicLink()) {
+		throw new AutoBotReleaseError(`${label} snapshot must be a real regular file`);
+	}
+	const canonical = await fs.realpath(destination);
+	if (!sameCanonicalPath(canonical, destination)) {
+		throw new AutoBotReleaseError(`${label} snapshot did not retain its canonical path`);
+	}
+	return canonical;
+}
+
+async function requirePreparedStage(config: LocalAutomationConfig, preservedStageRoot: string): Promise<string> {
+	const workRoot = await assertAutoBotPrivateDirectory(config.workRoot);
+	const requested = requireAbsolutePath(preservedStageRoot, "Prepared release stage");
+	const requestedStat = await fs.lstat(requested).catch(error => {
+		throw new AutoBotReleaseError("Prepared release stage does not exist", { cause: error });
+	});
+	if (!requestedStat.isDirectory() || requestedStat.isSymbolicLink()) {
+		throw new AutoBotReleaseError("Prepared release stage must be a real directory");
+	}
+	const stageRoot = await fs.realpath(requested);
+	if (!sameCanonicalPath(requested, stageRoot)) {
+		throw new AutoBotReleaseError("Prepared release stage must use its canonical path without aliases");
+	}
+	if (
+		!sameCanonicalPath(path.dirname(stageRoot), workRoot) ||
+		!/^autobot-release-[A-Za-z0-9._-]+$/.test(path.basename(stageRoot))
+	) {
+		throw new AutoBotReleaseError("Prepared release stage must be an immediate owned work-root release directory");
+	}
+	return stageRoot;
+}
+
+async function requireCanonicalBundleDirectories(bundleRoot: string): Promise<string> {
+	const canonicalBundleRoot = await requireDirectory(bundleRoot, "Prepared release bundle");
+	if (!sameCanonicalPath(canonicalBundleRoot, bundleRoot)) {
+		throw new AutoBotReleaseError("Prepared release bundle must use its canonical path without aliases");
+	}
+	const expectedRootNames = [...RELEASE_METADATA_FILES, "assets"].sort((left, right) => left.localeCompare(right));
+	const rootEntries = await fs.readdir(bundleRoot, { withFileTypes: true });
+	const rootNames = rootEntries.map(entry => entry.name).sort((left, right) => left.localeCompare(right));
+	if (
+		rootNames.length !== expectedRootNames.length ||
+		rootNames.some((name, index) => name !== expectedRootNames[index]) ||
+		rootEntries.some(entry =>
+			entry.name === "assets"
+				? !entry.isDirectory() || entry.isSymbolicLink()
+				: !entry.isFile() || entry.isSymbolicLink(),
+		)
+	) {
+		throw new AutoBotReleaseError("Prepared bundle must contain exactly the signed metadata and assets directory");
+	}
+	const assetsRoot = path.join(bundleRoot, "assets");
+	const canonicalAssetsRoot = await requireDirectory(assetsRoot, "Prepared bundle assets");
+	if (!sameCanonicalPath(canonicalAssetsRoot, assetsRoot)) {
+		throw new AutoBotReleaseError("Prepared bundle assets must use their canonical path without aliases");
+	}
+	return assetsRoot;
+}
+
+async function requireExactLocalBundle(bundleRoot: string): Promise<AssetIndex> {
+	const assetsRoot = await requireCanonicalBundleDirectories(bundleRoot);
+	const index = parseAssetIndex(await readJson(path.join(bundleRoot, "asset-index.json"), "prepared asset index"));
+	assertCompleteAutoBotReleaseTopology(index.assets);
+	if (index.assets.length !== 4)
+		throw new AutoBotReleaseError("Prepared bundle must contain exactly four payload assets");
+	const expectedAssetNames = index.assets
+		.map(asset => {
+			const filename = path.basename(asset.file);
+			if (!filename || asset.file !== `assets/${filename}`) {
+				throw new AutoBotReleaseError("Prepared asset index must use the owned flat assets directory");
+			}
+			return filename;
+		})
+		.sort((left, right) => left.localeCompare(right));
+
+	const assetEntries = await fs.readdir(assetsRoot, { withFileTypes: true });
+	const assetNames = assetEntries.map(entry => entry.name).sort((left, right) => left.localeCompare(right));
+	if (
+		assetNames.length !== expectedAssetNames.length ||
+		assetNames.some((name, index) => name !== expectedAssetNames[index]) ||
+		assetEntries.some(entry => !entry.isFile() || entry.isSymbolicLink())
+	) {
+		throw new AutoBotReleaseError("Prepared bundle assets do not exactly match the signed asset index");
+	}
+	return index;
+}
+
+async function admitPreparedSourceBundle(bundleRoot: string): Promise<AssetIndex> {
+	await requireCanonicalBundleDirectories(bundleRoot);
+	for (const metadata of RELEASE_METADATA_FILES)
+		await requireCanonicalImportableFile(path.join(bundleRoot, metadata), `Prepared ${metadata}`);
+	const index = await requireExactLocalBundle(bundleRoot);
+	for (const asset of index.assets)
+		await requireCanonicalImportableFile(path.join(bundleRoot, asset.file), `Prepared ${asset.file}`);
+	return index;
+}
 async function verifyPublishedRelease(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
@@ -803,12 +1420,13 @@ async function verifyPublishedRelease(
 		readonly canonicalRef?: string;
 		readonly historicalPredecessor?: boolean;
 	},
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
 	if (options.historicalPredecessor && !options.expectedEnvelope) {
 		throw new AutoBotReleaseError("Historical predecessor verification requires the exact signed channel envelope");
 	}
 	const downloaded = await fs.mkdtemp(path.join(stageRoot, "downloaded-release-"));
-	await runQuiet("GitHub release download", [
+	await runQuiet(recorder, "github-release-download", "GitHub release download", [
 		"gh",
 		"release",
 		"download",
@@ -828,7 +1446,11 @@ async function verifyPublishedRelease(
 	);
 	const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
 	const verified = await readVerifiedEnvelope(path.join(downloaded, "signed-envelope.json"), trusted);
-	await fetchAndAssertReleaseTag(config, candidate.sourceRoot, tag, verified.manifest.forkCommit);
+	const downloadedManifest = Buffer.from(await Bun.file(path.join(downloaded, "manifest.json")).arrayBuffer());
+	if (!downloadedManifest.equals(Buffer.from(verified.envelope.payload, "utf8"))) {
+		throw new AutoBotReleaseError("Downloaded manifest bytes do not match the signed envelope payload");
+	}
+	await fetchAndAssertReleaseTag(config, candidate.sourceRoot, tag, verified.manifest.forkCommit, recorder);
 	// A predecessor is authenticated by the exact signed channel envelope and
 	// release tag binding; verify its downloaded payloads against that signed manifest,
 	// but do not retroactively apply the current producer target policy.
@@ -859,42 +1481,237 @@ async function verifyPublishedRelease(
 	];
 	if (options.previousEnvelope) args.push("--previous-envelope", options.previousEnvelope);
 	if (options.canonicalRef) args.push("--canonical-ref", options.canonicalRef);
-	await runQuiet("Downloaded release verification", args, { cwd: publisherRoot, env: environment });
+	await runQuiet(recorder, "downloaded-release-verification", "Downloaded release verification", args, {
+		cwd: publisherRoot,
+		env: environment,
+	});
 }
 
-async function buildWindowsBaselineAddon(
+export interface CompletedLocalReleaseIdentity extends PreparedLocalReleaseIdentity {
+	readonly releaseSequence: number;
+	readonly tag: string;
+}
+
+/**
+ * Authenticate the immutable publication currently named by the signed channel.
+ * This is deliberately read-only: it neither repairs a partial publication nor
+ * accepts a release that has not already completed channel promotion.
+ */
+export async function authenticateCompletedLocalRelease(
+	config: LocalAutomationConfig,
+	observedIntegrationCommit: string,
+	sourcePath: string,
+	recorder: LocalCommandRecorder,
+): Promise<CompletedLocalReleaseIdentity> {
+	requirePublisherConfiguration(config);
+	const forkCommit = requireCommit(observedIntegrationCommit, "Observed integration commit");
+	const sourceRoot = await requireDirectory(sourcePath, "Completed publication source root");
+	await assertCleanCommittedCheckout(sourceRoot, "Completed publication source");
+	await Promise.all([
+		requireConfiguredFile(config.runnerBun, "Runner Bun"),
+		requireConfiguredFile(config.publicKeyPath, "Trusted public key"),
+		assertExactBun(config.runnerBun, config.runnerBunVersion, "Runner Bun"),
+	]);
+	const workRoot = await assertAutoBotPrivateDirectory(config.workRoot);
+	const recoveryRoot = await ensureAutoBotPrivateDirectory(
+		await fs.mkdtemp(path.join(workRoot, "autobot-release-c-")),
+	);
+	try {
+		const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
+		const channel = await readChannelEnvelope(
+			config,
+			trusted,
+			path.join(recoveryRoot, "completed-channel-envelope.json"),
+		);
+		if (!channel) throw new AutoBotReleaseError("Completed publication recovery requires a signed channel");
+		const manifest = channel.verified.manifest;
+		if (manifest.forkCommit !== forkCommit) {
+			throw new AutoBotReleaseError("Signed channel does not name the observed integration commit");
+		}
+		if (
+			manifest.schemaVersion !== AUTO_BOT_RELEASE_SCHEMA_VERSION ||
+			manifest.sessionFormatVersion !== AUTO_BOT_SESSION_FORMAT_VERSION ||
+			manifest.collabProtocolVersion !== AUTO_BOT_COLLAB_PROTOCOL_VERSION ||
+			manifest.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH
+		) {
+			throw new AutoBotReleaseError("Signed channel is incompatible with the trusted local producer contract");
+		}
+		const sequence = requirePositiveSafeInteger(manifest.releaseSequence, "Completed release sequence");
+		const tag = requireReleaseTag(sequence);
+		await assertCompletedReleaseChain(config, sequence, tag, forkCommit);
+		const candidate: LocalCandidate = {
+			sourceRoot,
+			forkCommit,
+			upstreamCommit: manifest.upstreamCommit,
+			upstreamVersion: manifest.upstreamVersion,
+			compatibilityEpoch: manifest.compatibilityEpoch,
+			changed: false,
+			sensitivePaths: [],
+		};
+		requireCandidate(candidate);
+		const temporaryRoot = await ensureAutoBotPrivateDirectory(path.join(recoveryRoot, "t"));
+		const environment = await createPinnedBunCommandEnvironment(
+			path.join(recoveryRoot, "bp"),
+			config.runnerBun,
+			config.runnerBunVersion,
+			commandEnvironment(config, temporaryRoot),
+		);
+		const integrationRef = await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+		await verifyPublishedRelease(
+			config,
+			candidate,
+			tag,
+			recoveryRoot,
+			environment,
+			{ expectedEnvelope: channel.path, canonicalRef: integrationRef },
+			recorder,
+		);
+		const recheckedChannel = await readChannelEnvelope(
+			config,
+			trusted,
+			path.join(recoveryRoot, "rechecked-channel-envelope.json"),
+		);
+		if (!recheckedChannel) {
+			throw new AutoBotReleaseError("Signed channel disappeared during completed publication recovery");
+		}
+		await compareExactBytes(channel.path, recheckedChannel.path, "Rechecked signed channel envelope");
+		await assertCompletedReleaseChain(config, sequence, tag, forkCommit);
+		await fetchAndAssertReleaseTag(config, sourceRoot, tag, forkCommit, recorder);
+		await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+		return {
+			forkCommit,
+			upstreamCommit: manifest.upstreamCommit,
+			upstreamVersion: manifest.upstreamVersion,
+			compatibilityEpoch: manifest.compatibilityEpoch,
+			releaseSequence: sequence,
+			tag,
+		};
+	} finally {
+		await fs.rm(recoveryRoot, { recursive: true, force: true });
+	}
+}
+
+async function stageNativeAddons(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+): Promise<readonly NativeAddonReuseEvidence[]> {
+	const sourceRoot = candidate.sourceRoot;
+	const inputDirectory = await requireDirectory(config.nativeAddonDirectory, "Native addon directory");
+	if (!sameCanonicalPath(inputDirectory, config.nativeAddonDirectory)) {
+		throw new AutoBotReleaseError("Native addon directory must use its canonical path without aliases");
+	}
+	if (isInside(sourceRoot, inputDirectory) || isInside(inputDirectory, sourceRoot)) {
+		throw new AutoBotReleaseError("Native addon directory must be separate from the candidate checkout");
+	}
+	const nativeRoot = path.join(sourceRoot, "packages", "natives");
+	const nativeDirectory = path.join(nativeRoot, "native");
+	const canonicalNativeDirectory = await requireDirectory(nativeDirectory, "Candidate native staging directory");
+	if (!sameCanonicalPath(nativeDirectory, canonicalNativeDirectory)) {
+		throw new AutoBotReleaseError("Candidate native staging directory must be a real canonical directory");
+	}
+	const packageJson = await readJson(path.join(nativeRoot, "package.json"), "candidate native package");
+	if (!isRecord(packageJson)) throw new AutoBotReleaseError("Candidate native package metadata must be an object");
+	const version = requireUpstreamVersion(
+		requireString(packageJson.version, "Candidate native package version"),
+		"Candidate native package version",
+	);
+	if (version !== candidate.upstreamVersion) {
+		throw new AutoBotReleaseError("Candidate native package version does not match the approved upstream version");
+	}
+	const expectedSentinel = versionSentinelFor(version);
+	const descriptors = [
+		{ filename: "pi_natives.win32-x64-baseline.node", variant: "baseline" as const, required: true },
+		{ filename: "pi_natives.win32-x64-modern.node", variant: "modern" as const, required: false },
+	] as const;
+	const evidence: NativeAddonReuseEvidence[] = [];
+	for (const descriptor of descriptors) {
+		const destination = path.join(nativeDirectory, descriptor.filename);
+		const existingDestination = await fs.lstat(destination).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (existingDestination) {
+			if (!existingDestination.isFile() || existingDestination.isSymbolicLink()) {
+				throw new AutoBotReleaseError(`Candidate ${descriptor.variant} native staging path is not a real file`);
+			}
+			await fs.rm(destination);
+		}
+		const source = path.join(inputDirectory, descriptor.filename);
+		const sourceStat = await fs.lstat(source).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (!sourceStat) {
+			if (descriptor.required) {
+				throw new AutoBotReleaseError(`Required ${descriptor.variant} native addon is missing`);
+			}
+			continue;
+		}
+		if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+			throw new AutoBotReleaseError(`${descriptor.variant} native addon must be a real regular file`);
+		}
+		const canonicalSource = await requireCanonicalImportableFile(source, `${descriptor.variant} native addon`);
+		const before = await hashFile(canonicalSource);
+		const bytes = await fs.readFile(canonicalSource);
+		if (!containsVersionSentinel(bytes, expectedSentinel)) {
+			throw new AutoBotReleaseError(
+				`${descriptor.variant} native addon does not contain the exact ${version} version sentinel`,
+			);
+		}
+		const staged = await copyOwnedPrivateFile(canonicalSource, destination, `${descriptor.variant} native addon`);
+		const after = await hashFile(staged);
+		if (after.sha256 !== before.sha256 || after.size !== before.size) {
+			throw new AutoBotReleaseError(`${descriptor.variant} native addon changed while it was staged`);
+		}
+		evidence.push({
+			filename: descriptor.filename,
+			version,
+			variant: descriptor.variant,
+			size: after.size,
+			sha256: after.sha256,
+			origin: "local-reuse",
+			producerSourceCommit: null,
+		});
+	}
+	return evidence;
+}
+
+async function qualifyNativeLoader(
 	config: LocalAutomationConfig,
 	sourceRoot: string,
+	stageRoot: string,
 	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
-	const nativesRoot = path.join(sourceRoot, "packages", "natives");
-	const nativeDirectory = path.join(nativesRoot, "native");
-	const baseline = path.join(nativeDirectory, "pi_natives.win32-x64-baseline.node");
-	const modern = path.join(nativeDirectory, "pi_natives.win32-x64-modern.node");
-	// Removal makes the post-build canonical-name check evidence of this invocation,
-	// rather than a stale zero-exit script or an earlier host build.
-	await fs.rm(baseline, { force: true });
-	await fs.rm(modern, { force: true });
-	const buildEnvironment: NodeJS.ProcessEnv = {
-		...environment,
-		CARGO_TARGET_DIR: path.join(config.workRoot, "cargo-target"),
-		OMP_NATIVE_CARGO_PROFILE: "ci",
-		OMP_NATIVE_TARGET_VARIANT: "baseline",
-	};
-	delete buildEnvironment.RUSTFLAGS;
-	delete buildEnvironment.CARGO_ENCODED_RUSTFLAGS;
-	await candidateBuildStage("Windows x64 baseline native addon build failed", () =>
-		runQuiet("Windows x64 baseline native addon build", [config.compilerBun, "scripts/build-bindings.ts"], {
-			cwd: nativesRoot,
-			env: buildEnvironment,
-		}),
+	const probe = path.join(stageRoot, "native-probe.mjs");
+	const nativeEntrypoint = path.join(sourceRoot, "packages", "natives", "native", "index.js");
+	await Bun.write(
+		probe,
+		`import { pathToFileURL } from "node:url";
+const native = await import(pathToFileURL(process.argv[2]).href);
+if (native.visibleWidth("x", 4) !== 1) throw new Error("native application contract mismatch");
+`,
 	);
-	await candidateBuildStage("Windows x64 baseline native addon was not produced", async () => {
-		await requireRegularFile(baseline, "Windows x64 baseline native addon");
-		if (await Bun.file(modern).exists()) {
-			throw new AutoBotReleaseError("Baseline native build unexpectedly produced a modern native addon");
-		}
-	});
+	const loaders =
+		path.resolve(config.runnerBun).toLowerCase() === path.resolve(config.compilerBun).toLowerCase()
+			? [{ executable: config.compilerBun, kind: "native-addon-reuse-check" as const }]
+			: [
+					{ executable: config.compilerBun, kind: "native-addon-reuse-check" as const },
+					{ executable: config.runnerBun, kind: "runner-loader-compatibility-check" as const },
+				];
+	for (const loader of loaders) {
+		await runQuiet(
+			recorder,
+			loader.kind,
+			`Reused baseline native loader check (${path.basename(loader.executable)})`,
+			bunCommand(loader.executable, probe, nativeEntrypoint),
+			{
+				cwd: sourceRoot,
+				env: { ...environment, PI_NATIVE_VARIANT: "baseline" },
+				captureOutput: true,
+			},
+		);
+	}
 }
 
 async function buildCandidateAssets(
@@ -903,20 +1720,47 @@ async function buildCandidateAssets(
 	identity: ReleaseBuildIdentity,
 	stageRoot: string,
 	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
 ): Promise<CandidateAssets> {
 	const sourceRoot = candidate.sourceRoot;
-	const candidateEnvironment = await createCandidateBuildEnvironment(stageRoot, environment);
-	const inputs = path.join(stageRoot, "release-inputs");
+	const baseCandidateEnvironment = await createCandidateBuildEnvironment(stageRoot, environment);
+	const candidateEnvironment = await createPinnedBunCommandEnvironment(
+		path.join(stageRoot, "br"),
+		config.runnerBun,
+		config.runnerBunVersion,
+		baseCandidateEnvironment,
+	);
+	const compilerCommandEnvironment = await createPinnedBunCommandEnvironment(
+		path.join(stageRoot, "bc"),
+		config.compilerBun,
+		config.compilerBunVersion,
+		baseCandidateEnvironment,
+	);
+	const inputs = path.join(stageRoot, "i");
 	await fs.mkdir(inputs);
-	await runQuiet("Candidate dependency installation", [config.runnerBun, "install", "--frozen-lockfile"], {
-		cwd: sourceRoot,
-		env: candidateEnvironment,
-	});
-	await candidateBuildStage("Browser relay build failed", () =>
-		runQuiet("Browser relay build", [config.runnerBun, "--cwd=packages/browser-relay", "run", "build"], {
+	await runQuiet(
+		recorder,
+		"candidate-dependency-installation",
+		"Candidate dependency installation",
+		bunCommand(config.compilerBun, "install", "--frozen-lockfile"),
+		{
 			cwd: sourceRoot,
-			env: candidateEnvironment,
-		}),
+			env: compilerCommandEnvironment,
+			captureOutput: true,
+		},
+	);
+	await candidateBuildStage("Browser relay build failed", () =>
+		runQuiet(
+			recorder,
+			"browser-relay-build",
+			"Browser relay build",
+			bunCommand(config.compilerBun, "--cwd=packages/browser-relay", "run", "build"),
+			{
+				cwd: sourceRoot,
+				env: compilerCommandEnvironment,
+				captureOutput: true,
+			},
+		),
 	);
 	await candidateBuildStage("Browser relay build did not produce its required embedded assets", async () => {
 		await Promise.all([
@@ -941,21 +1785,31 @@ async function buildCandidateAssets(
 		]);
 	});
 	await candidateBuildStage("Collab web build failed", () =>
-		runQuiet("Collab web build", [config.runnerBun, "--cwd=packages/collab-web", "run", "build"], {
-			cwd: sourceRoot,
-			env: candidateEnvironment,
-		}),
+		runQuiet(
+			recorder,
+			"collab-web-build",
+			"Collab web build",
+			bunCommand(config.compilerBun, "--cwd=packages/collab-web", "run", "build"),
+			{
+				cwd: sourceRoot,
+				env: compilerCommandEnvironment,
+				captureOutput: true,
+			},
+		),
 	);
-	await buildWindowsBaselineAddon(config, sourceRoot, candidateEnvironment);
+	const nativeAddons = await stageNativeAddons(config, candidate);
+	await qualifyNativeLoader(config, sourceRoot, stageRoot, compilerCommandEnvironment, recorder);
 	const compilerEnvironment: NodeJS.ProcessEnv = {
-		...candidateEnvironment,
+		...compilerCommandEnvironment,
 		OMP_AUTOBOT_BUILD_IDENTITY: JSON.stringify(identity),
 	};
 	await candidateBuildStage("Windows x64 runtime compilation failed", () =>
 		runQuiet(
+			recorder,
+			"runtime-compilation",
 			"Windows x64 runtime compilation",
-			[config.compilerBun, "scripts/ci-release-build-binaries.ts", "--targets", RELEASE_TARGET],
-			{ cwd: sourceRoot, env: compilerEnvironment },
+			bunCommand(config.compilerBun, "scripts/ci-release-build-binaries.ts", "--targets", RELEASE_TARGET),
+			{ cwd: sourceRoot, env: compilerEnvironment, captureOutput: true },
 		),
 	);
 	const builtRuntime = path.join(sourceRoot, "packages", "coding-agent", "binaries", "omp-windows-x64.exe");
@@ -964,17 +1818,32 @@ async function buildCandidateAssets(
 		await requireRegularFile(builtRuntime, "Windows x64 runtime");
 		await fs.copyFile(builtRuntime, runtime, fsConstants.COPYFILE_EXCL);
 	});
-	const smokeRoot = path.join(stageRoot, "candidate-environment", "runtime-smoke");
+	const smokeRoot = path.join(stageRoot, "s");
 	try {
 		const smokeEnvironment: NodeJS.ProcessEnv = {
 			...(await createPrivateCommandEnvironment(smokeRoot, candidateEnvironment)),
 			PI_NATIVE_VARIANT: "baseline",
 		};
-		await candidateBuildStage("Windows x64 runtime --version check failed", () =>
-			runQuiet("Windows x64 runtime version check", [runtime, "--version"], { env: smokeEnvironment }),
+		const reportedVersion = await candidateBuildStage("Windows x64 runtime --version check failed", () =>
+			runText("Windows x64 runtime version check", [runtime, "--version"], { env: smokeEnvironment }),
+		);
+		if (reportedVersion.trim() !== `omp/${candidate.upstreamVersion}`) {
+			throw new LocalBuildFailure("Windows x64 runtime version does not match the approved upstream version");
+		}
+		await candidateBuildStage("Windows x64 compiled application check failed", () =>
+			runQuiet(
+				recorder,
+				"compiled-runtime-application-check",
+				"Windows x64 compiled application help check",
+				[runtime, "--help"],
+				{ env: smokeEnvironment, captureOutput: true },
+			),
 		);
 		await candidateBuildStage("Windows x64 runtime fresh-home smoke test failed", () =>
-			runQuiet("Windows x64 runtime smoke test", [runtime, "--smoke-test"], { env: smokeEnvironment }),
+			runQuiet(recorder, "runtime-smoke-test", "Windows x64 runtime smoke test", [runtime, "--smoke-test"], {
+				env: smokeEnvironment,
+				captureOutput: true,
+			}),
 		);
 		const reportedIdentity = await candidateBuildStage("Windows x64 runtime identity check failed", () =>
 			runText("Windows x64 runtime identity check", [runtime, "--autobot-build-identity"], {
@@ -1000,54 +1869,26 @@ async function buildCandidateAssets(
 	const bootstrap = path.join(inputs, "omp-bootstrap-win32-x64.exe");
 	await candidateBuildStage("Windows x64 bootstrap compilation failed", () =>
 		runQuiet(
+			recorder,
+			"bootstrap-compilation",
 			"Windows x64 bootstrap compilation",
-			[config.runnerBun, "scripts/autobot-build-bootstrap.ts", "--target", RELEASE_TARGET, "--out", bootstrap],
+			bunCommand(
+				config.compilerBun,
+				"scripts/autobot-build-bootstrap.ts",
+				"--target",
+				RELEASE_TARGET,
+				"--out",
+				bootstrap,
+			),
 			{
 				cwd: sourceRoot,
-				env: { ...candidateEnvironment, AUTOBOT_COMPILER_BUN: config.compilerBun },
+				env: { ...compilerCommandEnvironment, AUTOBOT_COMPILER_BUN: config.compilerBun },
+				captureOutput: true,
 			},
 		),
 	);
 	await candidateBuildStage("Windows x64 bootstrap output was not produced", () =>
 		requireRegularFile(bootstrap, "Windows x64 bootstrap"),
-	);
-	await candidateBuildStage("Focused coding-agent runtime checks failed", () =>
-		runQuiet("Focused coding-agent runtime checks", [config.runnerBun, "run", "ci:test:coding-agent:runtime"], {
-			cwd: sourceRoot,
-			env: candidateEnvironment,
-		}),
-	);
-	await candidateBuildStage("Focused collab web checks failed", () =>
-		runQuiet("Focused collab web checks", [config.runnerBun, "--cwd=packages/collab-web", "test"], {
-			cwd: sourceRoot,
-			env: candidateEnvironment,
-		}),
-	);
-	await candidateBuildStage("Focused release contract checks failed", () =>
-		runQuiet(
-			"Focused release contract checks",
-			[config.runnerBun, "test", "scripts/autobot-release-security.test.ts"],
-			{
-				cwd: sourceRoot,
-				env: candidateEnvironment,
-			},
-		),
-	);
-	await candidateBuildStage("Focused installer contract checks failed", () =>
-		runQuiet("Focused installer contract checks", [config.runnerBun, "test", "scripts/autobot-install.test.ts"], {
-			cwd: sourceRoot,
-			env: candidateEnvironment,
-		}),
-	);
-	await candidateBuildStage("Candidate execution environment isolation checks failed", () =>
-		runQuiet(
-			"Candidate execution environment isolation checks",
-			[config.runnerBun, "test", "tests/autobot-local-release-environment.test.ts"],
-			{
-				cwd: sourceRoot,
-				env: candidateEnvironment,
-			},
-		),
 	);
 	const webBundleId = await candidateBuildStage("Collab web bundle identity derivation failed", () =>
 		deriveManagedBundleId(
@@ -1067,7 +1908,7 @@ async function buildCandidateAssets(
 			out: webArchive,
 		}),
 	);
-	return { runtime, bootstrap, webArchive, webBundleId };
+	return { runtime, bootstrap, webArchive, webBundleId, nativeAddons };
 }
 
 async function buildCoordinatorAsset(
@@ -1075,6 +1916,7 @@ async function buildCoordinatorAsset(
 	candidate: LocalCandidate,
 	stageRoot: string,
 	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
 ): Promise<CoordinatorAsset> {
 	const coordinatorRoot = await requireDirectory(config.coordinatorRoot, "Coordinator source root");
 	if (isInside(candidate.sourceRoot, coordinatorRoot) || isInside(coordinatorRoot, candidate.sourceRoot)) {
@@ -1102,18 +1944,32 @@ async function buildCoordinatorAsset(
 	) {
 		throw new AutoBotReleaseError("Coordinator source origin must be a credential-free HTTPS repository URL");
 	}
-	const inputs = path.join(stageRoot, "release-inputs");
+	const inputs = path.join(stageRoot, "i");
 	const artifact = path.join(inputs, COORDINATOR_CLIENT_FILENAME);
-	const coordinatorEnvironment: NodeJS.ProcessEnv = {
-		...environment,
-		OMP_AUTOBOT_SDK_ROOT: candidate.sourceRoot,
-		OMP_AUTOBOT_SDK_COMMIT: candidate.forkCommit,
-	};
-	await runQuiet("Coordinator SDK preparation", [config.runnerBun, "run", "ci:prepare:autobot-sdk"], {
-		cwd: coordinatorRoot,
-		env: coordinatorEnvironment,
-	});
+	const coordinatorEnvironment = await createPinnedBunCommandEnvironment(
+		path.join(stageRoot, "bq"),
+		config.compilerBun,
+		config.compilerBunVersion,
+		{
+			...environment,
+			OMP_AUTOBOT_SDK_ROOT: candidate.sourceRoot,
+			OMP_AUTOBOT_SDK_COMMIT: candidate.forkCommit,
+		},
+	);
 	await runQuiet(
+		recorder,
+		"coordinator-sdk-preparation",
+		"Coordinator SDK preparation",
+		bunCommand(config.compilerBun, "run", "ci:prepare:autobot-sdk"),
+
+		{
+			cwd: coordinatorRoot,
+			env: coordinatorEnvironment,
+		},
+	);
+	await runQuiet(
+		recorder,
+		"coordinator-extension-build",
 		"Coordinator extension build",
 		[
 			config.compilerBun,
@@ -1147,6 +2003,50 @@ async function buildCoordinatorAsset(
 	await writeJsonAtomic(provenancePath, provenance);
 	return { artifact, provenance: provenancePath, provenanceSha256: (await hashFile(provenancePath)).sha256 };
 }
+async function writeLocalProvenanceEvidence(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	stageRoot: string,
+	coordinator: CoordinatorAsset,
+	bunSupport: string,
+	nativeAddons: readonly NativeAddonReuseEvidence[],
+): Promise<void> {
+	const coordinatorProvenance = parseCoordinatorClientProvenance(
+		await readJson(coordinator.provenance, "local coordinator provenance"),
+	);
+	const [runner, compiler] = await Promise.all([hashFile(config.runnerBun), hashFile(config.compilerBun)]);
+	await writeJsonAtomic(path.join(stageRoot, "local-provenance.json"), {
+		schemaVersion: 1,
+		source: {
+			forkCommit: candidate.forkCommit,
+			upstreamCommit: candidate.upstreamCommit,
+			upstreamVersion: candidate.upstreamVersion,
+			releaseRepository: config.repository,
+		},
+		toolchains: {
+			toolingRequirement: bunSupport,
+			runner: {
+				role: "publisher-and-loader-runtime",
+				version: config.runnerBunVersion,
+				sha256: runner.sha256,
+				size: runner.size,
+			},
+			compiler: {
+				role: "application-asset-build-tooling",
+				version: config.compilerBunVersion,
+				sha256: compiler.sha256,
+				size: compiler.size,
+			},
+		},
+		nativeAddons,
+		coordinator: {
+			repository: coordinatorProvenance.source.repository,
+			commit: coordinatorProvenance.source.commit,
+			artifactSha256: coordinatorProvenance.artifact.sha256,
+			provenanceSha256: coordinator.provenanceSha256,
+		},
+	});
+}
 
 function releaseAssetUrl(repository: string, tag: string, filename: string): string {
 	return `https://github.com/${repository}/releases/download/${tag}/${filename}`;
@@ -1160,6 +2060,7 @@ async function assembleBundle(
 	coordinator: CoordinatorAsset,
 	stageRoot: string,
 	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
 ): Promise<AssembledBundle> {
 	const inputs: readonly AssetInput[] = [
 		{
@@ -1194,6 +2095,8 @@ async function assembleBundle(
 	const root = path.join(stageRoot, "bundle");
 	const publisherRoot = path.resolve(import.meta.dir, "..");
 	await runQuiet(
+		recorder,
+		"release-assembly",
 		"Release assembly",
 		[
 			config.runnerBun,
@@ -1222,6 +2125,44 @@ async function assembleBundle(
 	return { root, signedEnvelope: path.join(root, "signed-envelope.json") };
 }
 
+async function verifyLocalBundle(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	bundle: AssembledBundle,
+	coordinatorSourceSha256: string,
+	previous: ChannelEnvelope | undefined,
+	integrationRef: string,
+	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
+): Promise<void> {
+	const publisherRoot = path.resolve(import.meta.dir, "..");
+	const verifyArgs = [
+		config.runnerBun,
+		path.join(publisherRoot, "scripts", "autobot-release-verify.ts"),
+		"--envelope",
+		bundle.signedEnvelope,
+		"--asset-index",
+		path.join(bundle.root, "asset-index.json"),
+		"--provenance",
+		path.join(bundle.root, "provenance.json"),
+		"--coordinator-source",
+		path.join(bundle.root, "coordinator-source.json"),
+		"--coordinator-source-sha256",
+		coordinatorSourceSha256,
+		"--trusted-key",
+		`${config.keyId}=${config.publicKeyPath}`,
+		"--source-root",
+		candidate.sourceRoot,
+		"--canonical-ref",
+		integrationRef,
+	];
+	if (previous) verifyArgs.push("--previous-envelope", previous.path);
+	await runQuiet(recorder, "local-signed-release-verification", "Local signed release verification", verifyArgs, {
+		cwd: publisherRoot,
+		env: environment,
+	});
+}
+
 async function signAndVerifyLocalBundle(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
@@ -1230,6 +2171,7 @@ async function signAndVerifyLocalBundle(
 	previous: ChannelEnvelope | undefined,
 	integrationRef: string,
 	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
 	const publisherRoot = path.resolve(import.meta.dir, "..");
 	const signArgs = [
@@ -1254,29 +2196,20 @@ async function signAndVerifyLocalBundle(
 	];
 	if (previous) signArgs.push("--previous-envelope", previous.path);
 	else signArgs.push("--allow-initial");
-	await runQuiet("Release signing", signArgs, { cwd: publisherRoot, env: environment });
-	const verifyArgs = [
-		config.runnerBun,
-		path.join(publisherRoot, "scripts", "autobot-release-verify.ts"),
-		"--envelope",
-		bundle.signedEnvelope,
-		"--asset-index",
-		path.join(bundle.root, "asset-index.json"),
-		"--provenance",
-		path.join(bundle.root, "provenance.json"),
-		"--coordinator-source",
-		path.join(bundle.root, "coordinator-source.json"),
-		"--coordinator-source-sha256",
+	await runQuiet(recorder, "release-signing", "Release signing", signArgs, {
+		cwd: publisherRoot,
+		env: environment,
+	});
+	await verifyLocalBundle(
+		config,
+		candidate,
+		bundle,
 		coordinator.provenanceSha256,
-		"--trusted-key",
-		`${config.keyId}=${config.publicKeyPath}`,
-		"--source-root",
-		candidate.sourceRoot,
-		"--canonical-ref",
+		previous,
 		integrationRef,
-	];
-	if (previous) verifyArgs.push("--previous-envelope", previous.path);
-	await runQuiet("Local signed release verification", verifyArgs, { cwd: publisherRoot, env: environment });
+		environment,
+		recorder,
+	);
 }
 
 async function publishVerifiedDraft(
@@ -1284,8 +2217,9 @@ async function publishVerifiedDraft(
 	candidate: LocalCandidate,
 	chain: ReleaseChain,
 	bundle: AssembledBundle,
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
-	await runQuiet("GitHub draft release creation", [
+	await runQuiet(recorder, "github-draft-release-creation", "GitHub draft release creation", [
 		"gh",
 		"release",
 		"create",
@@ -1304,7 +2238,7 @@ async function publishVerifiedDraft(
 	const payloads = assetIndex.assets.map(asset => path.join(bundle.root, asset.file));
 	if (payloads.length !== 4)
 		throw new AutoBotReleaseError("Local bundle does not contain exactly four payload assets");
-	await runQuiet("GitHub release upload", [
+	await runQuiet(recorder, "github-release-upload", "GitHub release upload", [
 		"gh",
 		"release",
 		"upload",
@@ -1320,11 +2254,13 @@ async function advanceChannelLast(
 	config: LocalAutomationConfig,
 	bundle: AssembledBundle,
 	stageRoot: string,
+	previous: ChannelEnvelope | undefined,
 	trusted: TrustedKeySet,
+	recorder: LocalCommandRecorder,
 ): Promise<void> {
-	await runQuiet("GitHub Git credential setup", ["gh", "auth", "setup-git"]);
+	await runQuiet(recorder, "github-git-credential-setup", "GitHub Git credential setup", ["gh", "auth", "setup-git"]);
 	const channelRoot = path.join(stageRoot, "channel-repository");
-	await runQuiet("Signed channel clone", [
+	await runQuiet(recorder, "signed-channel-clone", "Signed channel clone", [
 		"git",
 		"clone",
 		"--depth=1",
@@ -1336,9 +2272,45 @@ async function advanceChannelLast(
 	const destination = path.resolve(channelRoot, config.channelPath);
 	if (!isInside(channelRoot, destination))
 		throw new AutoBotReleaseError("Configured channel path escapes its repository");
+	const currentChannel = await fs.lstat(destination).catch(error => {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new AutoBotReleaseError("Cloned signed channel path cannot be inspected", { cause: error });
+	});
+	const trackedChannel = await runText(
+		"Cloned signed channel tree check",
+		["git", "ls-tree", "--name-only", "-z", "HEAD", "--", config.channelPath],
+		{ cwd: channelRoot },
+	);
+	if (previous) {
+		if (
+			trackedChannel !== `${config.channelPath}\0` ||
+			!currentChannel?.isFile() ||
+			currentChannel.isSymbolicLink()
+		) {
+			throw new AutoBotReleaseError("Cloned signed channel does not contain the expected predecessor envelope");
+		}
+		const committedChannel = path.join(stageRoot, "cloned-channel-envelope.json");
+		await writeCommandOutput(
+			"Cloned signed channel blob read",
+			["git", "cat-file", "blob", `HEAD:${config.channelPath}`],
+			committedChannel,
+			{ cwd: channelRoot },
+		);
+		await compareExactBytes(previous.path, committedChannel, "Cloned signed channel predecessor");
+	} else if (trackedChannel !== "" || currentChannel) {
+		throw new AutoBotReleaseError("Initial signed channel path is no longer absent");
+	}
 	await fs.mkdir(path.dirname(destination), { recursive: true });
 	await fs.copyFile(bundle.signedEnvelope, destination);
-	await runQuiet("Signed channel staging", ["git", "add", "--", config.channelPath], { cwd: channelRoot });
+	await runQuiet(
+		recorder,
+		"signed-channel-staging",
+		"Signed channel staging",
+		["git", "add", "--", config.channelPath],
+		{
+			cwd: channelRoot,
+		},
+	);
 	const stagedNames = await runText(
 		"Signed channel staged path check",
 		["git", "diff", "--cached", "--name-only", "-z"],
@@ -1359,13 +2331,21 @@ async function advanceChannelLast(
 	}
 	if (diffExitCode !== 1) throw new AutoBotReleaseError("Signed channel change could not be inspected");
 	await runQuiet(
+		recorder,
+		"signed-channel-commit",
 		"Signed channel commit",
 		["git", "commit", "--no-gpg-sign", "-m", "chore(autobot): promote signed release", "--", config.channelPath],
 		{ cwd: channelRoot },
 	);
-	await runQuiet("Signed channel push", ["git", "push", "origin", `HEAD:refs/heads/${config.channelBranch}`], {
-		cwd: channelRoot,
-	});
+	await runQuiet(
+		recorder,
+		"signed-channel-push",
+		"Signed channel push",
+		["git", "push", "origin", `HEAD:refs/heads/${config.channelBranch}`],
+		{
+			cwd: channelRoot,
+		},
+	);
 	const confirmed = await readChannelEnvelope(
 		config,
 		trusted,
@@ -1374,21 +2354,428 @@ async function advanceChannelLast(
 	if (!confirmed) throw new AutoBotReleaseError("Signed channel disappeared after its promotion push");
 	await compareExactBytes(bundle.signedEnvelope, confirmed.path, "Promoted signed channel envelope");
 }
+async function assertSingleMatchingDraft(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	chain: ReleaseChain,
+): Promise<void> {
+	const drafts = (await listGitHubReleases(config.repository)).filter(release => release.draft);
+	if (
+		drafts.length !== 1 ||
+		drafts[0]?.sequence !== chain.sequence ||
+		drafts[0]?.tag !== chain.tag ||
+		drafts[0]?.targetCommit !== candidate.forkCommit
+	) {
+		throw new AutoBotReleaseError("GitHub draft state changed before publication");
+	}
+}
+async function assertSingleMatchingPublished(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	chain: ReleaseChain,
+): Promise<void> {
+	const releases = await listGitHubReleases(config.repository);
+	const matching = releases.filter(release => release.sequence === chain.sequence);
+	if (
+		releases.some(release => release.draft) ||
+		matching.length !== 1 ||
+		matching[0]?.draft ||
+		matching[0]?.tag !== chain.tag ||
+		matching[0]?.targetCommit !== candidate.forkCommit
+	) {
+		throw new AutoBotReleaseError("Published release state changed before channel recovery");
+	}
+}
 
+async function assertCurrentChannelPredecessor(
+	config: LocalAutomationConfig,
+	chain: ReleaseChain,
+	stageRoot: string,
+	trusted: TrustedKeySet,
+): Promise<void> {
+	const current = await readChannelEnvelope(
+		config,
+		trusted,
+		path.join(stageRoot, "prepublication-channel-envelope.json"),
+	);
+	if (chain.previous) {
+		if (!current) throw new AutoBotReleaseError("Signed channel predecessor disappeared before publication");
+		await compareExactBytes(chain.previous.path, current.path, "Current signed channel predecessor");
+	} else if (current) {
+		throw new AutoBotReleaseError("Initial signed channel is no longer absent");
+	}
+}
+
+async function finalizeVerifiedRelease(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	chain: ReleaseChain,
+	bundle: AssembledBundle,
+	stageRoot: string,
+	environment: NodeJS.ProcessEnv,
+	trusted: TrustedKeySet,
+	draftExists: boolean,
+	alreadyPublished: boolean,
+	recorder: LocalCommandRecorder,
+): Promise<void> {
+	await assertOperatorGitCommitIdentity(stageRoot);
+	if (!alreadyPublished) {
+		await createAndAssertReleaseTag(config, candidate, chain.tag, recorder);
+		if (!draftExists) await publishVerifiedDraft(config, candidate, chain, bundle, recorder);
+	}
+	const publishedIntegrationRef = await assertIntegrationRef(config, candidate, candidate.sourceRoot, recorder);
+	await verifyPublishedRelease(
+		config,
+		candidate,
+		chain.tag,
+		stageRoot,
+		environment,
+		{
+			localBundle: bundle.root,
+			previousEnvelope: chain.previous?.path,
+			canonicalRef: publishedIntegrationRef,
+		},
+		recorder,
+	);
+	await assertIntegrationRef(config, candidate, candidate.sourceRoot, recorder);
+	await assertCurrentChannelPredecessor(config, chain, stageRoot, trusted);
+	if (alreadyPublished) {
+		await assertSingleMatchingPublished(config, candidate, chain);
+	} else {
+		await assertSingleMatchingDraft(config, candidate, chain);
+		await runQuiet(recorder, "github-draft-release-publication", "GitHub draft release publication", [
+			"gh",
+			"release",
+			"edit",
+			chain.tag,
+			"--repo",
+			config.repository,
+			"--draft=false",
+		]);
+	}
+	await advanceChannelLast(config, bundle, stageRoot, chain.previous, trusted, recorder);
+}
 /**
- * Build and publish one fully verified Windows x64 AutoBot release.
+ * Build and publish one fully verified Windows x64 AutoBot release from
+ * application source plus separately trusted native addon bytes.
  *
- * Candidate build/check failures alone use LocalBuildFailure so the controller
- * can route only those failures through the disposable local OMP repair path.
+ * Application build/smoke failures alone use LocalBuildFailure so the
+ * controller can route those failures through the disposable local OMP repair
+ * path. Native input validation and loader failures remain non-repairable.
  */
+
 export async function buildAndPublishLocalRelease(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
-): Promise<{
-	readonly kind: "published" | "unchanged";
+	recorder: LocalCommandRecorder,
+	options: LocalReleaseOptions = { mode: "publish" },
+): Promise<LocalReleaseResult> {
+	requirePublisherConfiguration(config);
+	requireCandidate(candidate);
+	if (options.mode !== "verify" && options.mode !== "publish") {
+		throw new AutoBotReleaseError("Local release mode must be verify or publish");
+	}
+	if (process.platform !== "win32" || process.arch !== "x64") {
+		throw new AutoBotReleaseError("Local AutoBot publication is restricted to a Windows x64 host");
+	}
+	const sourceRoot = await requireDirectory(candidate.sourceRoot, "Candidate source root");
+	await assertCleanCommittedCheckout(sourceRoot, "Candidate source", candidate.forkCommit);
+	const coordinatorRoot = await requireDirectory(config.coordinatorRoot, "Coordinator source root");
+	const nativeAddonDirectory = await requireDirectory(config.nativeAddonDirectory, "Native addon directory");
+	if (!sameCanonicalPath(nativeAddonDirectory, config.nativeAddonDirectory)) {
+		throw new AutoBotReleaseError("Native addon directory must use its canonical path without aliases");
+	}
+	if (
+		isInside(sourceRoot, coordinatorRoot) ||
+		isInside(coordinatorRoot, sourceRoot) ||
+		isInside(sourceRoot, nativeAddonDirectory) ||
+		isInside(nativeAddonDirectory, sourceRoot) ||
+		isInside(coordinatorRoot, nativeAddonDirectory) ||
+		isInside(nativeAddonDirectory, coordinatorRoot)
+	) {
+		throw new AutoBotReleaseError("Candidate, coordinator, and native addon inputs must be distinct directories");
+	}
+	await Promise.all([
+		requireConfiguredFile(config.runnerBun, "Runner Bun"),
+		requireConfiguredFile(config.compilerBun, "Compiler Bun"),
+		requireConfiguredFile(config.privateKeyPath, "Private signing key"),
+		requireConfiguredFile(config.publicKeyPath, "Trusted public key"),
+		assertExactBun(config.runnerBun, config.runnerBunVersion, "Runner Bun"),
+		assertExactBun(config.compilerBun, config.compilerBunVersion, "Compiler Bun"),
+	]);
+	const bunSupport = await assertDeclaredToolingBunSupport(sourceRoot, config.compilerBunVersion);
+	const workRoot = requireAbsolutePath(config.workRoot, "Work root");
+	if (
+		isInside(sourceRoot, workRoot) ||
+		isInside(coordinatorRoot, workRoot) ||
+		isInside(nativeAddonDirectory, workRoot) ||
+		isInside(workRoot, nativeAddonDirectory)
+	) {
+		throw new AutoBotReleaseError("Owned release staging root must be separate from all release inputs");
+	}
+	await fs.mkdir(workRoot, { recursive: true });
+	const stageRoot = await ensureAutoBotPrivateDirectory(await fs.mkdtemp(path.join(workRoot, "autobot-release-r-")));
+	requireBoundedWindowsPath(stageRoot, "Owned release staging directory");
+	if (isInside(sourceRoot, stageRoot) || isInside(coordinatorRoot, stageRoot)) {
+		await fs.rm(stageRoot, { recursive: true, force: true });
+		throw new AutoBotReleaseError("Owned release staging directory must be outside both source checkouts");
+	}
+	let completed = false;
+	try {
+		// Security-sensitive fixtures need the owned staging root's private ancestry,
+		// not the workstation's potentially shared temporary directory.
+		const temporaryRoot = path.join(stageRoot, "t");
+		await ensureAutoBotPrivateDirectory(temporaryRoot);
+		const environment = await createPinnedBunCommandEnvironment(
+			path.join(stageRoot, "bp"),
+			config.runnerBun,
+			config.runnerBunVersion,
+			commandEnvironment(config, temporaryRoot),
+		);
+		const plan = await readCandidateReleasePlan(config, sourceRoot, stageRoot, environment, recorder);
+		assertPlanMatchesCandidate(plan, candidate);
+		const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
+		const chain = await establishReleaseChain(config, stageRoot, trusted);
+		if (chain.previous && chain.previousRelease) {
+			await verifyPublishedRelease(
+				config,
+				candidate,
+				chain.previousRelease.tag,
+				stageRoot,
+				environment,
+				{
+					expectedEnvelope: chain.previous.path,
+					historicalPredecessor: true,
+				},
+				recorder,
+			);
+			if (options.mode === "publish" && isPublishedCandidate(chain.previous.verified.manifest, candidate)) {
+				completed = true;
+				return { kind: "unchanged", forkCommit: candidate.forkCommit };
+			}
+		}
+		if (options.mode === "publish") await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+		const identity: ReleaseBuildIdentity = {
+			schemaVersion: AUTO_BOT_RELEASE_SCHEMA_VERSION,
+			releaseSequence: chain.sequence,
+			upstreamVersion: candidate.upstreamVersion,
+			forkCommit: candidate.forkCommit,
+			upstreamCommit: candidate.upstreamCommit,
+			sessionFormatVersion: AUTO_BOT_SESSION_FORMAT_VERSION,
+			collabProtocolVersion: AUTO_BOT_COLLAB_PROTOCOL_VERSION,
+			compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH,
+		};
+		const assets = await buildCandidateAssets(config, candidate, identity, stageRoot, environment, recorder);
+		const coordinator = await buildCoordinatorAsset(config, candidate, stageRoot, environment, recorder);
+		await assertCleanCommittedCheckout(sourceRoot, "Candidate source", candidate.forkCommit);
+		await writeLocalProvenanceEvidence(config, candidate, stageRoot, coordinator, bunSupport, assets.nativeAddons);
+		const bundle = await assembleBundle(
+			config,
+			candidate,
+			chain,
+			assets,
+			coordinator,
+			stageRoot,
+			environment,
+			recorder,
+		);
+		const integrationRef =
+			options.mode === "publish"
+				? await assertIntegrationRef(config, candidate, sourceRoot, recorder)
+				: requireCommit(
+						await gitText(sourceRoot, "Verified candidate local HEAD", [
+							"rev-parse",
+							"--verify",
+							"HEAD^{commit}",
+						]),
+						"Verified candidate local HEAD",
+					);
+		await signAndVerifyLocalBundle(
+			config,
+			candidate,
+			bundle,
+			coordinator,
+			chain.previous,
+			options.mode === "publish" ? integrationRef : "HEAD",
+			environment,
+			recorder,
+		);
+		if (options.mode === "verify") {
+			return {
+				kind: "verified",
+				forkCommit: candidate.forkCommit,
+				releaseSequence: chain.sequence,
+				tag: chain.tag,
+				preservedStageRoot: stageRoot,
+			};
+		}
+		await finalizeVerifiedRelease(
+			config,
+			candidate,
+			chain,
+			bundle,
+			stageRoot,
+			environment,
+			trusted,
+			false,
+			false,
+			recorder,
+		);
+		completed = true;
+		return { kind: "published", forkCommit: candidate.forkCommit, releaseSequence: chain.sequence, tag: chain.tag };
+	} finally {
+		if (completed) await fs.rm(stageRoot, { recursive: true, force: true });
+	}
+}
+
+async function assertPreparedCoordinatorIdentity(config: LocalAutomationConfig, bundleRoot: string): Promise<string> {
+	const coordinatorRoot = await requireDirectory(config.coordinatorRoot, "Coordinator source root");
+	const coordinatorCommit = await assertCleanCommittedCheckout(coordinatorRoot, "Coordinator source");
+	const repository = await gitText(coordinatorRoot, "Coordinator source origin check", [
+		"remote",
+		"get-url",
+		"origin",
+	]);
+	const coordinatorSourcePath = path.join(bundleRoot, "coordinator-source.json");
+	const provenance = parseCoordinatorClientProvenance(
+		await readJson(coordinatorSourcePath, "prepared coordinator source provenance"),
+	);
+	if (provenance.source.commit !== coordinatorCommit || provenance.source.repository !== repository) {
+		throw new AutoBotReleaseError(
+			"Prepared coordinator provenance does not match the current clean coordinator checkout",
+		);
+	}
+	const artifact = await hashFile(path.join(bundleRoot, "assets", provenance.artifact.filename));
+	if (artifact.sha256 !== provenance.artifact.sha256 || artifact.size !== provenance.artifact.size) {
+		throw new AutoBotReleaseError("Prepared coordinator artifact does not match its pinned source provenance");
+	}
+	return (await hashFile(coordinatorSourcePath)).sha256;
+}
+
+function assertPreparedManifest(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	chain: ReleaseChain,
+	index: AssetIndex,
+	verified: VerifiedReleaseEnvelope,
+): void {
+	if (!isPublishedCandidate(verified.manifest, candidate)) {
+		throw new AutoBotReleaseError("Prepared signed manifest does not match the approved candidate identity");
+	}
+	if (verified.manifest.releaseSequence !== chain.sequence || chain.tag !== requireReleaseTag(chain.sequence)) {
+		throw new AutoBotReleaseError("Prepared signed manifest does not match the next release sequence");
+	}
+	assertCompleteAutoBotReleaseTopology(verified.manifest.assets);
+	for (const indexed of index.assets) {
+		const manifestAsset = verified.manifest.assets.find(
+			asset => asset.kind === indexed.kind && asset.target === indexed.target,
+		);
+		if (!manifestAsset) throw new AutoBotReleaseError("Prepared signed manifest is missing an indexed asset");
+		const expectedUrl = releaseAssetUrl(config.repository, chain.tag, path.basename(indexed.file));
+		if (manifestAsset.url !== expectedUrl) {
+			throw new AutoBotReleaseError("Prepared signed manifest has an unexpected release asset URL");
+		}
+	}
+}
+export interface PreparedLocalReleaseIdentity {
 	readonly forkCommit: string;
-	readonly releaseSequence?: number;
-	readonly tag?: string;
+	readonly upstreamCommit: string;
+	readonly upstreamVersion: string;
+	readonly compatibilityEpoch: number;
+}
+
+/**
+ * Fully admit an explicitly selected signed stage before the controller mutates
+ * the integration ref. This is read-only and never rebuilds or re-signs.
+ */
+export async function admitPreparedLocalRelease(
+	config: LocalAutomationConfig,
+	preservedStageRoot: string,
+	sourcePath: string,
+	recorder: LocalCommandRecorder,
+): Promise<PreparedLocalReleaseIdentity> {
+	requirePublisherConfiguration(config);
+	if (typeof recorder.record !== "function") {
+		throw new AutoBotReleaseError("Prepared release admission requires a command recorder");
+	}
+	await Promise.all([
+		requireConfiguredFile(config.runnerBun, "Runner Bun"),
+		requireConfiguredFile(config.publicKeyPath, "Trusted public key"),
+		assertExactBun(config.runnerBun, config.runnerBunVersion, "Runner Bun"),
+	]);
+	const sourceRoot = await requireDirectory(sourcePath, "Prepared candidate source root");
+	const stageRoot = await requirePreparedStage(config, preservedStageRoot);
+	if (isInside(sourceRoot, stageRoot)) {
+		throw new AutoBotReleaseError("Prepared release stage must be outside the candidate source checkout");
+	}
+	const planPath = await requireCanonicalImportableFile(
+		path.join(stageRoot, "release-plan.json"),
+		"Prepared release plan",
+	);
+	const plan = parseCandidateReleasePlan(await readJson(planPath, "prepared release plan"));
+	const bundleRoot = path.join(stageRoot, "bundle");
+	const index = await admitPreparedSourceBundle(bundleRoot);
+	const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
+	const envelopePath = path.join(bundleRoot, "signed-envelope.json");
+	const verified = await readVerifiedEnvelope(envelopePath, trusted);
+	await verifyIndexedAssets(verified.manifest, path.join(bundleRoot, "asset-index.json"));
+	const [manifestBytes, coordinatorSourceSha256] = await Promise.all([
+		Bun.file(path.join(bundleRoot, "manifest.json")).arrayBuffer(),
+		assertPreparedCoordinatorIdentity(config, bundleRoot),
+	]);
+	if (!Buffer.from(manifestBytes).equals(Buffer.from(verified.envelope.payload, "utf8"))) {
+		throw new AutoBotReleaseError("Prepared manifest bytes do not match the signed envelope payload");
+	}
+	await assertCleanCommittedCheckout(sourceRoot, "Prepared candidate source", plan.forkCommit);
+	const candidate: LocalCandidate = {
+		sourceRoot,
+		forkCommit: plan.forkCommit,
+		upstreamCommit: plan.upstreamCommit,
+		upstreamVersion: plan.upstreamVersion,
+		compatibilityEpoch: plan.compatibilityEpoch,
+		changed: true,
+		sensitivePaths: [],
+	};
+	assertPlanMatchesCandidate(plan, candidate);
+	const sequence = requirePositiveSafeInteger(verified.manifest.releaseSequence, "Prepared release sequence");
+	assertPreparedManifest(config, candidate, { sequence, tag: requireReleaseTag(sequence) }, index, verified);
+	const provenanceHash = await hashFile(path.join(bundleRoot, "coordinator-source.json"));
+	if (provenanceHash.sha256 !== coordinatorSourceSha256) {
+		throw new AutoBotReleaseError("Prepared coordinator provenance changed during admission");
+	}
+	const bundle: AssembledBundle = { root: bundleRoot, signedEnvelope: envelopePath };
+	await verifyLocalBundle(
+		config,
+		candidate,
+		bundle,
+		coordinatorSourceSha256,
+		undefined,
+		"HEAD",
+		sanitizeCandidateEnvironment(commandEnvironment(config, stageRoot)),
+		recorder,
+	);
+	return {
+		forkCommit: plan.forkCommit,
+		upstreamCommit: plan.upstreamCommit,
+		upstreamVersion: plan.upstreamVersion,
+		compatibilityEpoch: plan.compatibilityEpoch,
+	};
+}
+
+/**
+ * Publish an explicitly selected, retained and already-signed local release stage.
+ * The caller owns the prepared stage; this function never rebuilds, re-signs, or removes it.
+ */
+export async function publishPreparedLocalRelease(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	preservedStageRoot: string,
+	recorder: LocalCommandRecorder,
+): Promise<{
+	readonly kind: "published";
+	readonly forkCommit: string;
+	readonly releaseSequence: number;
+	readonly tag: string;
 }> {
 	requirePublisherConfiguration(config);
 	requireCandidate(candidate);
@@ -1403,90 +2790,124 @@ export async function buildAndPublishLocalRelease(
 	}
 	await Promise.all([
 		requireConfiguredFile(config.runnerBun, "Runner Bun"),
-		requireConfiguredFile(config.compilerBun, "Compiler Bun"),
-		requireConfiguredFile(config.privateKeyPath, "Private signing key"),
 		requireConfiguredFile(config.publicKeyPath, "Trusted public key"),
 		assertExactBun(config.runnerBun, config.runnerBunVersion, "Runner Bun"),
-		assertExactBun(config.compilerBun, config.compilerBunVersion, "Compiler Bun"),
 	]);
-	const workRoot = requireAbsolutePath(config.workRoot, "Work root");
-	if (isInside(sourceRoot, workRoot) || isInside(coordinatorRoot, workRoot)) {
-		throw new AutoBotReleaseError("Owned release staging root must not be nested inside either source checkout");
-	}
-	await fs.mkdir(workRoot, { recursive: true });
-	const stageRoot = await fs.realpath(await fs.mkdtemp(path.join(workRoot, "autobot-release-")));
+	const stageRoot = await requirePreparedStage(config, preservedStageRoot);
 	if (isInside(sourceRoot, stageRoot) || isInside(coordinatorRoot, stageRoot)) {
-		await fs.rm(stageRoot, { recursive: true, force: true });
-		throw new AutoBotReleaseError("Owned release staging directory must be outside both source checkouts");
+		throw new AutoBotReleaseError("Prepared release stage must be outside both source checkouts");
 	}
+	const sourcePlanPath = path.join(stageRoot, "release-plan.json");
+	await requireCanonicalImportableFile(sourcePlanPath, "Prepared release plan");
+	const sourceBundleRoot = path.join(stageRoot, "bundle");
+	const sourceIndex = await admitPreparedSourceBundle(sourceBundleRoot);
+	const workRoot = await assertAutoBotPrivateDirectory(config.workRoot);
+	const recoveryRoot = await ensureAutoBotPrivateDirectory(
+		await fs.mkdtemp(path.join(workRoot, "autobot-release-x-")),
+	);
+	const snapshotRoot = await ensureAutoBotPrivateDirectory(path.join(recoveryRoot, "prepared-snapshot"));
+	const planPath = await copyOwnedPrivateFile(
+		sourcePlanPath,
+		path.join(snapshotRoot, "release-plan.json"),
+		"Prepared release plan",
+	);
+	const plan = parseCandidateReleasePlan(await readJson(planPath, "prepared release plan snapshot"));
+	assertPlanMatchesCandidate(plan, candidate);
+	const bundleRoot = await ensureAutoBotPrivateDirectory(path.join(snapshotRoot, "bundle"));
+	const assetsRoot = await ensureAutoBotPrivateDirectory(path.join(bundleRoot, "assets"));
+	for (const metadata of RELEASE_METADATA_FILES) {
+		await copyOwnedPrivateFile(
+			path.join(sourceBundleRoot, metadata),
+			path.join(bundleRoot, metadata),
+			`Prepared ${metadata}`,
+		);
+	}
+	for (const asset of sourceIndex.assets) {
+		await copyOwnedPrivateFile(
+			path.join(sourceBundleRoot, asset.file),
+			path.join(assetsRoot, path.basename(asset.file)),
+			`Prepared ${asset.file}`,
+		);
+	}
+	const bundle: AssembledBundle = {
+		root: bundleRoot,
+		signedEnvelope: path.join(bundleRoot, "signed-envelope.json"),
+	};
+	const index = await requireExactLocalBundle(bundleRoot);
+	const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
+	const verified = await readVerifiedEnvelope(bundle.signedEnvelope, trusted);
+	await verifyIndexedAssets(verified.manifest, path.join(bundleRoot, "asset-index.json"));
+	const manifestBytes = Buffer.from(await Bun.file(path.join(bundleRoot, "manifest.json")).arrayBuffer());
+	const signedManifestBytes = Buffer.from(verified.envelope.payload, "utf8");
+	if (!manifestBytes.equals(signedManifestBytes)) {
+		throw new AutoBotReleaseError("Prepared manifest bytes do not match the signed envelope payload");
+	}
+	const expectedSequence = requirePositiveSafeInteger(verified.manifest.releaseSequence, "Prepared release sequence");
+	const expectedTag = requireReleaseTag(expectedSequence);
+	const expectedDraft: ExpectedDraft = {
+		sequence: expectedSequence,
+		tag: expectedTag,
+		targetCommit: candidate.forkCommit,
+	};
+	const coordinatorSourceSha256 = await assertPreparedCoordinatorIdentity(config, bundleRoot);
 	let completed = false;
 	try {
-		// Security-sensitive fixtures need the owned staging root's private ancestry,
-		// not the workstation's potentially shared temporary directory.
-		const temporaryRoot = path.join(stageRoot, "tmp");
-		await fs.mkdir(temporaryRoot);
-		const environment = commandEnvironment(config, temporaryRoot);
-		const plan = await readCandidateReleasePlan(config, sourceRoot, stageRoot, environment);
-		assertPlanMatchesCandidate(plan, candidate);
-		const trusted = await loadTrustedKeys([`${config.keyId}=${config.publicKeyPath}`]);
-		const chain = await establishReleaseChain(config, stageRoot, trusted);
+		const temporaryRoot = await ensureAutoBotPrivateDirectory(path.join(recoveryRoot, "t"));
+		const environment = await createPinnedBunCommandEnvironment(
+			path.join(recoveryRoot, "bp"),
+			config.runnerBun,
+			config.runnerBunVersion,
+			commandEnvironment(config, temporaryRoot),
+		);
+		const chain = await establishReleaseChain(config, recoveryRoot, trusted, expectedDraft);
+		assertPreparedManifest(config, candidate, chain, index, verified);
 		if (chain.previous && chain.previousRelease) {
-			await verifyPublishedRelease(config, candidate, chain.previousRelease.tag, stageRoot, environment, {
-				expectedEnvelope: chain.previous.path,
-				historicalPredecessor: true,
-			});
-			if (isPublishedCandidate(chain.previous.verified.manifest, candidate)) {
-				completed = true;
-				return { kind: "unchanged", forkCommit: candidate.forkCommit };
-			}
+			await verifyPublishedRelease(
+				config,
+				candidate,
+				chain.previousRelease.tag,
+				recoveryRoot,
+				environment,
+				{
+					expectedEnvelope: chain.previous.path,
+					historicalPredecessor: true,
+				},
+				recorder,
+			);
 		}
-		await assertIntegrationRef(config, candidate, sourceRoot);
-		const identity: ReleaseBuildIdentity = {
-			schemaVersion: AUTO_BOT_RELEASE_SCHEMA_VERSION,
-			releaseSequence: chain.sequence,
-			upstreamVersion: candidate.upstreamVersion,
-			forkCommit: candidate.forkCommit,
-			upstreamCommit: candidate.upstreamCommit,
-			sessionFormatVersion: AUTO_BOT_SESSION_FORMAT_VERSION,
-			collabProtocolVersion: AUTO_BOT_COLLAB_PROTOCOL_VERSION,
-			compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH,
-		};
-		const assets = await buildCandidateAssets(config, candidate, identity, stageRoot, environment);
-		const coordinator = await buildCoordinatorAsset(config, candidate, stageRoot, environment);
-		await assertCleanCommittedCheckout(sourceRoot, "Candidate source", candidate.forkCommit);
-		const bundle = await assembleBundle(config, candidate, chain, assets, coordinator, stageRoot, environment);
-		const integrationRef = await assertIntegrationRef(config, candidate, sourceRoot);
-		await signAndVerifyLocalBundle(
+		const integrationRef = await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+		await verifyLocalBundle(
 			config,
 			candidate,
 			bundle,
-			coordinator,
+			coordinatorSourceSha256,
 			chain.previous,
 			integrationRef,
 			environment,
+			recorder,
 		);
-		await assertOperatorGitCommitIdentity(stageRoot);
-		await publishVerifiedDraft(config, candidate, chain, bundle);
-		const publishedIntegrationRef = await assertIntegrationRef(config, candidate, sourceRoot);
-		await verifyPublishedRelease(config, candidate, chain.tag, stageRoot, environment, {
-			localBundle: bundle.root,
-			previousEnvelope: chain.previous?.path,
-			canonicalRef: publishedIntegrationRef,
-		});
-		await assertIntegrationRef(config, candidate, sourceRoot);
-		await runQuiet("GitHub draft release publication", [
-			"gh",
-			"release",
-			"edit",
-			chain.tag,
-			"--repo",
-			config.repository,
-			"--draft=false",
-		]);
-		await advanceChannelLast(config, bundle, stageRoot, trusted);
+		await assertCleanCommittedCheckout(sourceRoot, "Candidate source", candidate.forkCommit);
+		await assertPreparedCoordinatorIdentity(config, bundleRoot);
+		await finalizeVerifiedRelease(
+			config,
+			candidate,
+			chain,
+			bundle,
+			recoveryRoot,
+			environment,
+			trusted,
+			chain.matchingDraft !== undefined,
+			chain.matchingPublished !== undefined,
+			recorder,
+		);
 		completed = true;
-		return { kind: "published", forkCommit: candidate.forkCommit, releaseSequence: chain.sequence, tag: chain.tag };
+		return {
+			kind: "published",
+			forkCommit: candidate.forkCommit,
+			releaseSequence: chain.sequence,
+			tag: chain.tag,
+		};
 	} finally {
-		if (completed) await fs.rm(stageRoot, { recursive: true, force: true });
+		if (completed) await fs.rm(recoveryRoot, { recursive: true, force: true });
 	}
 }

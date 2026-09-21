@@ -89,13 +89,10 @@ describe("managed room discovery", () => {
 			stage: "payload",
 			code: "invalid-envelope",
 		});
-		expect(
-			managedRoomReplacement(
-				{ pcs: [{ pcId: "local" }], sessions: [] },
-				current,
-				route,
-			),
-		).toEqual({ stage: "session", code: "session-missing" });
+		expect(managedRoomReplacement({ pcs: [{ pcId: "local" }], sessions: [] }, current, route)).toEqual({
+			stage: "session",
+			code: "session-missing",
+		});
 		expect(
 			managedRoomReplacement(
 				{ pcs: [{ pcId: "local" }], sessions: [{ pcId: "local", sessionId: "session-a" }] },

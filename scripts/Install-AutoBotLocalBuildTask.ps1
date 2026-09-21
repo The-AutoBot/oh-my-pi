@@ -6,7 +6,6 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath,
 
-    [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$BunPath
 )
@@ -47,6 +46,21 @@ function Resolve-ExistingFile {
     return $item.FullName
 }
 
+function Resolve-ConfiguredBunPath {
+    param([Parameter(Mandatory = $true)][string]$ResolvedConfigPath)
+
+    try {
+        $parsed = Get-Content -LiteralPath $ResolvedConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $property = $parsed.PSObject.Properties["runnerBun"]
+        if ($null -eq $property -or -not ($property.Value -is [string]) -or [string]::IsNullOrWhiteSpace($property.Value)) {
+            throw "invalid"
+        }
+        return Resolve-ExistingFile -Path $property.Value -Label "Configured runner"
+    } catch {
+        throw "The configured runner is unavailable."
+    }
+}
+
 function Test-ExactOwnedAction {
     param(
         [Parameter(Mandatory = $true)]$Task,
@@ -78,10 +92,16 @@ $repoRoot = $repoItem.FullName
 $launcherPath = Resolve-ExistingFile -Path (Join-Path -Path $scriptsRoot -ChildPath "Invoke-AutoBotLocalBuild.ps1") -Label "Local launcher"
 $null = Resolve-ExistingFile -Path (Join-Path -Path $scriptsRoot -ChildPath "autobot-local.ts") -Label "Local pipeline"
 $resolvedConfigPath = Resolve-ExistingFile -Path $ConfigPath -Label "ConfigPath"
-$resolvedBunPath = Resolve-ExistingFile -Path $BunPath -Label "BunPath"
+$resolvedBunPath = Resolve-ConfiguredBunPath -ResolvedConfigPath $resolvedConfigPath
+if (-not [string]::IsNullOrEmpty($BunPath)) {
+    $resolvedAssertedBunPath = Resolve-ExistingFile -Path $BunPath -Label "BunPath"
+    if (-not [string]::Equals($resolvedAssertedBunPath, $resolvedBunPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "BunPath does not match the configured runner."
+    }
+}
 $windowsPowerShellPath = Resolve-ExistingFile -Path (Join-Path -Path $env:WINDIR -ChildPath "System32\WindowsPowerShell\v1.0\powershell.exe") -Label "Windows PowerShell"
 
-$arguments = '-NoProfile -NonInteractive -File "{0}" -ConfigPath "{1}" -BunPath "{2}"' -f $launcherPath, $resolvedConfigPath, $resolvedBunPath
+$arguments = '-NoProfile -NonInteractive -File "{0}" -ConfigPath "{1}"' -f $launcherPath, $resolvedConfigPath
 $action = New-ScheduledTaskAction -Execute $windowsPowerShellPath -Argument $arguments -WorkingDirectory $repoRoot
 
 # The daily trigger plus its one-day repetition pattern produces one run per

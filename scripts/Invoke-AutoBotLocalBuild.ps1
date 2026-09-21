@@ -1,14 +1,18 @@
 # AutoBot Local Build launcher
-# Runs the fixed local pipeline once with the caller-pinned Bun and config paths.
+# Runs the fixed local pipeline once with the config-authorized Bun runtime.
 
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath,
 
-    [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string]$BunPath
+    [string]$BunPath,
+
+    [switch]$VerifyOnly,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$PublishPrepared
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +50,41 @@ function Resolve-ExistingFile {
     return $item.FullName
 }
 
+function Resolve-ConfiguredBunPath {
+    param([Parameter(Mandatory = $true)][string]$ResolvedConfigPath)
+
+    try {
+        $parsed = Get-Content -LiteralPath $ResolvedConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $property = $parsed.PSObject.Properties["runnerBun"]
+        if ($null -eq $property -or -not ($property.Value -is [string]) -or [string]::IsNullOrWhiteSpace($property.Value)) {
+            throw "invalid"
+        }
+        return Resolve-ExistingFile -Path $property.Value -Label "Configured runner"
+    } catch {
+        throw "The configured runner is unavailable."
+    }
+}
+function Resolve-ExistingDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if ($Path -notmatch '^[A-Za-z]:[\\/]' -and $Path -notmatch '^\\\\[^\\/]+[\\/][^\\/]+') {
+        throw "$Label must be an absolute existing directory."
+    }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch {
+        throw "$Label must be an absolute existing directory."
+    }
+    if (-not $item.PSIsContainer -or -not ($item -is [System.IO.DirectoryInfo])) {
+        throw "$Label must be an absolute existing directory."
+    }
+    return $item.FullName
+}
+
+
 function Get-InvocationMutexName {
     param([Parameter(Mandatory = $true)][string]$ResolvedConfigPath)
 
@@ -78,8 +117,27 @@ function Invoke-AutoBotLocalBuild {
 
     try {
         $resolvedConfigPath = Resolve-ExistingFile -Path $ConfigPath -Label "ConfigPath"
-        $resolvedBunPath = Resolve-ExistingFile -Path $BunPath -Label "BunPath"
+        $resolvedBunPath = Resolve-ConfiguredBunPath -ResolvedConfigPath $resolvedConfigPath
+        if (-not [string]::IsNullOrEmpty($BunPath)) {
+            $resolvedAssertedBunPath = Resolve-ExistingFile -Path $BunPath -Label "BunPath"
+            if (-not [string]::Equals($resolvedAssertedBunPath, $resolvedBunPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "BunPath does not match the configured runner."
+            }
+        }
+        if ($VerifyOnly -and -not [string]::IsNullOrEmpty($PublishPrepared)) {
+            throw "VerifyOnly and PublishPrepared are mutually exclusive."
+        }
+        $resolvedPreparedStage = $null
+        if (-not [string]::IsNullOrEmpty($PublishPrepared)) {
+            $resolvedPreparedStage = Resolve-ExistingDirectory -Path $PublishPrepared -Label "PublishPrepared"
+        }
         $pipelinePath = Resolve-ExistingFile -Path (Join-Path -Path $PSScriptRoot -ChildPath "autobot-local.ts") -Label "Local pipeline"
+        $pipelineArguments = @($pipelinePath, "--config", $resolvedConfigPath)
+        if ($VerifyOnly) {
+            $pipelineArguments += "--verify-only"
+        } elseif ($null -ne $resolvedPreparedStage) {
+            $pipelineArguments += @("--publish-prepared", $resolvedPreparedStage)
+        }
 
         try {
             $repoItem = Get-Item -LiteralPath (Split-Path -Path $PSScriptRoot -Parent) -Force -ErrorAction Stop
@@ -114,7 +172,7 @@ function Invoke-AutoBotLocalBuild {
             $previousErrorActionPreference = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             try {
-                & $resolvedBunPath $pipelinePath "--config" $resolvedConfigPath 1>$null 2>$null
+                & $resolvedBunPath @pipelineArguments 1>$null 2>$null
                 $pipelineExitCode = $LASTEXITCODE
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference

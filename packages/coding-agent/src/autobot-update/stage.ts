@@ -96,7 +96,11 @@ function runtimeExecutableName(): string {
 	return process.platform === "win32" ? "omp.exe" : "omp";
 }
 
-function requiredAsset(manifest: AutoBotReleaseManifest, kind: AutoBotReleaseAsset["kind"], target: string): AutoBotReleaseAsset {
+function requiredAsset(
+	manifest: AutoBotReleaseManifest,
+	kind: AutoBotReleaseAsset["kind"],
+	target: string,
+): AutoBotReleaseAsset {
 	const asset = manifest.assets.find(candidate => candidate.kind === kind && candidate.target === target);
 	if (!asset) throw new Error(`Signed AutoBot release is missing ${kind}/${target}`);
 	return asset;
@@ -127,7 +131,8 @@ async function runManagedBinary(binaryPath: string, argument: string): Promise<s
 		stderr: "ignore",
 	});
 	const output = await new Response(processHandle.stdout).text();
-	if (output.length > MAX_RUNTIME_IDENTITY_BYTES) throw new Error("AutoBot managed binary identity response is too large");
+	if (output.length > MAX_RUNTIME_IDENTITY_BYTES)
+		throw new Error("AutoBot managed binary identity response is too large");
 	if ((await processHandle.exited) !== 0) throw new Error("AutoBot managed binary rejected its identity check");
 	return output.trim();
 }
@@ -149,13 +154,14 @@ async function verifyBootstrapVersion(bootstrapPath: string, target: string): Pr
 	}
 	let identity: AutoBotBootstrapIdentity;
 	try {
-		identity = parseAutoBotBootstrapIdentity(JSON.parse(await runManagedBinary(bootstrapPath, "--autobot-bootstrap-identity")));
+		identity = parseAutoBotBootstrapIdentity(
+			JSON.parse(await runManagedBinary(bootstrapPath, "--autobot-bootstrap-identity")),
+		);
 	} catch (error) {
 		throw new Error("Staged AutoBot bootstrap did not provide a valid embedded identity", { cause: error });
 	}
 	if (identity.target !== target) throw new Error("Staged AutoBot bootstrap identity has the wrong target");
 }
-
 
 async function inspectWebBundleArchive(archivePath: string): Promise<ReadonlySet<string>> {
 	const archive = await openArchive(archivePath, { limits: COLLAB_WEB_ARCHIVE_LIMITS });
@@ -172,7 +178,8 @@ async function inspectWebBundleArchive(archivePath: string): Promise<ReadonlySet
 			}
 			continue;
 		}
-		if (entry.storage?.type !== "member") throw new Error("AutoBot collaboration bundle may contain only regular files and directories");
+		if (entry.storage?.type !== "member")
+			throw new Error("AutoBot collaboration bundle may contain only regular files and directories");
 		if (entry.path !== "managed-bundle.json" && !isAutoBotCollabWebFilePath(entry.path)) {
 			throw new Error("AutoBot collaboration bundle has an unsupported path");
 		}
@@ -224,7 +231,8 @@ async function verifyExtractedWebBundle(
 	let declaredContentBytes = 0;
 	const files = inventory.files.map((value, index) => {
 		const file = WebBundleFileSchema.assert(value);
-		if (!isAutoBotCollabWebFilePath(file.path)) throw new Error(`AutoBot collaboration bundle file ${index} has an unsupported path`);
+		if (!isAutoBotCollabWebFilePath(file.path))
+			throw new Error(`AutoBot collaboration bundle file ${index} has an unsupported path`);
 		if (!/^[0-9a-f]{64}$/.test(file.sha256)) throw new Error("AutoBot collaboration bundle file digest is invalid");
 		declaredContentBytes += file.size;
 		if (!Number.isSafeInteger(declaredContentBytes) || declaredContentBytes > AUTO_BOT_MAX_COLLAB_ARCHIVE_BYTES) {
@@ -242,13 +250,14 @@ async function verifyExtractedWebBundle(
 	if (
 		expectedFiles.size !== files.length + 1 ||
 		expectedFiles.size !== archiveFiles.size ||
-		[...expectedFiles].some((filePath) => !archiveFiles.has(filePath))
+		[...expectedFiles].some(filePath => !archiveFiles.has(filePath))
 	) {
 		throw new Error("AutoBot collaboration bundle archive does not exactly match its inventory");
 	}
 	for (const file of files) {
 		const filePath = path.resolve(destinationPath, file.path);
-		if (!pathIsInside(destinationPath, filePath)) throw new Error("AutoBot collaboration bundle file escapes its root");
+		if (!pathIsInside(destinationPath, filePath))
+			throw new Error("AutoBot collaboration bundle file escapes its root");
 		const stat = await fs.lstat(filePath);
 		if (!stat.isFile()) throw new Error("AutoBot collaboration bundle inventory references a non-file");
 		if (stat.size !== file.size || (await sha256File(filePath)) !== file.sha256) {
@@ -301,11 +310,18 @@ async function validateExistingSlot(
 		throw new Error("Existing AutoBot slot conflicts with the signed release");
 	}
 	const storedManifest = serializeAutoBotReleaseManifest(parseAutoBotReleaseManifest(marker.manifest));
-	if (storedManifest !== serializeAutoBotReleaseManifest(manifest)) throw new Error("Existing AutoBot slot manifest conflicts with the signed release");
+	if (storedManifest !== serializeAutoBotReleaseManifest(manifest))
+		throw new Error("Existing AutoBot slot manifest conflicts with the signed release");
 	const runtimePath = path.join(slotPath, runtimeExecutableName());
-	if ((await sha256File(runtimePath)) !== marker.runtimeSha256) throw new Error("Existing AutoBot runtime slot integrity check failed");
+	if ((await sha256File(runtimePath)) !== marker.runtimeSha256)
+		throw new Error("Existing AutoBot runtime slot integrity check failed");
 	const bootstrapPath = path.join(autoBotBootstrapSlotPath(paths, slotId), runtimeExecutableName());
-	const coordinatorClientPath = path.join(slotPath, "assets", "coordinator-client", "omp-session-coordinator-extension.mjs");
+	const coordinatorClientPath = path.join(
+		slotPath,
+		"assets",
+		"coordinator-client",
+		"omp-session-coordinator-extension.mjs",
+	);
 	const collabWebPath = path.join(slotPath, "assets", "collab-web", manifest.webBundleId);
 	const provenancePath = path.join(collabWebPath, "_provenance");
 	const collabArchivePath = path.join(provenancePath, "collab-web.tar.gz");
@@ -367,18 +383,38 @@ export async function stageVerifiedAutoBotRelease(
 		await ensurePrivateDirectory(tempBootstrapSlot);
 		const runtimePath = path.join(tempSlot, runtimeExecutableName());
 		const bootstrapPath = path.join(tempBootstrapSlot, runtimeExecutableName());
-		const coordinatorClientPath = path.join(tempSlot, "assets", "coordinator-client", "omp-session-coordinator-extension.mjs");
+		const coordinatorClientPath = path.join(
+			tempSlot,
+			"assets",
+			"coordinator-client",
+			"omp-session-coordinator-extension.mjs",
+		);
 		const webArchivePath = path.join(tempSlot, "collab-web.tar.gz");
 		const collabWebPath = path.join(tempSlot, "assets", "collab-web", release.manifest.webBundleId);
-		await downloadVerifiedAutoBotAsset({ asset: runtime, destinationPath: runtimePath, allowedOrigins: release.allowedArtifactOrigins, deps });
-		await downloadVerifiedAutoBotAsset({ asset: bootstrap, destinationPath: bootstrapPath, allowedOrigins: release.allowedArtifactOrigins, deps });
+		await downloadVerifiedAutoBotAsset({
+			asset: runtime,
+			destinationPath: runtimePath,
+			allowedOrigins: release.allowedArtifactOrigins,
+			deps,
+		});
+		await downloadVerifiedAutoBotAsset({
+			asset: bootstrap,
+			destinationPath: bootstrapPath,
+			allowedOrigins: release.allowedArtifactOrigins,
+			deps,
+		});
 		await downloadVerifiedAutoBotAsset({
 			asset: coordinatorClient,
 			destinationPath: coordinatorClientPath,
 			allowedOrigins: release.allowedArtifactOrigins,
 			deps,
 		});
-		await downloadVerifiedAutoBotAsset({ asset: collabWeb, destinationPath: webArchivePath, allowedOrigins: release.allowedArtifactOrigins, deps });
+		await downloadVerifiedAutoBotAsset({
+			asset: collabWeb,
+			destinationPath: webArchivePath,
+			allowedOrigins: release.allowedArtifactOrigins,
+			deps,
+		});
 		await verifyRuntimeIdentity(runtimePath, release.manifest);
 		await verifyBootstrapVersion(bootstrapPath, target);
 		await verifyAndExtractWebBundle(webArchivePath, collabWebPath, release.manifest, release.envelopeJson);
@@ -396,7 +432,12 @@ export async function stageVerifiedAutoBotRelease(
 			slotId,
 			runtimePath: path.join(slotPath, runtimeExecutableName()),
 			bootstrapPath: path.join(bootstrapSlot, runtimeExecutableName()),
-			coordinatorClientPath: path.join(slotPath, "assets", "coordinator-client", "omp-session-coordinator-extension.mjs"),
+			coordinatorClientPath: path.join(
+				slotPath,
+				"assets",
+				"coordinator-client",
+				"omp-session-coordinator-extension.mjs",
+			),
 			collabWebPath: path.join(slotPath, "assets", "collab-web", release.manifest.webBundleId),
 			manifest: release.manifest,
 			payloadSha256: release.payloadSha256,

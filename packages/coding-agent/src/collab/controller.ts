@@ -432,10 +432,7 @@ export class CollabController {
 		this.#preparedUpdates.delete(reservation);
 	}
 
-	#discardPreparedUpdate(
-		reservation: CollabUpdateReservation,
-		reason: "aborted" | "expired" | "unsafe",
-	): void {
+	#discardPreparedUpdate(reservation: CollabUpdateReservation, reason: "aborted" | "expired" | "unsafe"): void {
 		const prepared = this.#preparedUpdates.get(reservation);
 		if (!prepared) return;
 		prepared.cancelled = true;
@@ -573,13 +570,7 @@ export class CollabController {
 			const current = this.host;
 			if (current && (current.access === "control" || options.access === "view")) return current;
 			if (current) await this.#stopHost(current, "restarting with control access", "user");
-			return this.#launch(
-				options.access,
-				stopEpoch,
-				options.relay,
-				options.webUrl,
-				authorizedDuringStartupFence,
-			);
+			return this.#launch(options.access, stopEpoch, options.relay, options.webUrl, authorizedDuringStartupFence);
 		});
 		// Report manual failures to the caller without poisoning later rotations.
 		this.#ops = started.then(
@@ -588,7 +579,6 @@ export class CollabController {
 		);
 		return started;
 	}
-
 
 	async ensure(options: CollabStartOptions): Promise<CollabEnsureResult> {
 		// Extension ensure is automatic authority and must never override `/collab stop`.
@@ -635,7 +625,6 @@ export class CollabController {
 			if (host.stopped && this.#host === host) this.#host = undefined;
 		}
 	}
-
 
 	/** Resolves once no stop/start sequence is in flight. */
 	idle(): Promise<void> {

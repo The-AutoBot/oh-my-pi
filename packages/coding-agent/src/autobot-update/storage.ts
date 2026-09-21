@@ -36,14 +36,17 @@ async function replaceAutoBotFileAtomically(tempPath: string, targetPath: string
 			try {
 				await fs.rename(backupPath, targetPath);
 			} catch (restoreError) {
-				throw new Error("Cannot restore the AutoBot state file after a failed replacement", { cause: restoreError });
+				throw new Error("Cannot restore the AutoBot state file after a failed replacement", {
+					cause: restoreError,
+				});
 			}
 			throw replaceError;
 		}
 		try {
 			await fs.rm(backupPath);
 		} catch (cleanupError) {
-			if (!isEnoent(cleanupError)) throw new Error("Cannot finalize the AutoBot state file replacement", { cause: cleanupError });
+			if (!isEnoent(cleanupError))
+				throw new Error("Cannot finalize the AutoBot state file replacement", { cause: cleanupError });
 		}
 	}
 }

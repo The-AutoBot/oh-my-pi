@@ -162,7 +162,12 @@ function parsePhase(value: unknown, nonce: string): AutoBotHandoffPhaseRecord {
 	) {
 		throw new Error("AutoBot handoff phase is invalid");
 	}
-	return { schemaVersion: 1, nonce, phase: phase.phase, updatedAt: canonicalTimestamp(phase.updatedAt, "AutoBot handoff phase") };
+	return {
+		schemaVersion: 1,
+		nonce,
+		phase: phase.phase,
+		updatedAt: canonicalTimestamp(phase.updatedAt, "AutoBot handoff phase"),
+	};
 }
 
 function parseActivation(value: unknown, request: AutoBotRestartRequest): AutoBotActivationSignal {
@@ -212,7 +217,10 @@ export function readAutoBotHandoffSync(paths: AutoBotPaths, handoffPath: string)
 	}
 }
 
-export async function readAutoBotHandoff(paths: AutoBotPaths, handoffPath: string): Promise<AutoBotHandoffRecord | undefined> {
+export async function readAutoBotHandoff(
+	paths: AutoBotPaths,
+	handoffPath: string,
+): Promise<AutoBotHandoffRecord | undefined> {
 	const raw = await readJsonIfPresent(handoffPath);
 	return raw === undefined ? undefined : validateHandoffPaths(paths, parseAutoBotHandoffRecord(raw));
 }
@@ -375,10 +383,7 @@ export interface AutoBotRuntimePromotionExpectation {
 	readonly processId: number;
 }
 
-function parseRuntimePromotion(
-	value: unknown,
-	expected: AutoBotRuntimePromotionExpectation,
-): AutoBotRuntimePromotion {
+function parseRuntimePromotion(value: unknown, expected: AutoBotRuntimePromotionExpectation): AutoBotRuntimePromotion {
 	const promotion = PromotionSchema.assert(value);
 	const target = parseAutoBotRestartTarget(promotion.target);
 	if (
@@ -563,7 +568,9 @@ export async function hasAutoBotRuntimePromotion(expected: AutoBotRuntimePromoti
 		const raw = await readJsonIfPresent(autoBotSignalPath(expected.paths, expected.handoff.nonce, "promoted"));
 		if (raw === undefined) return false;
 		parseRuntimePromotion(raw, expected);
-		return expected.role !== "candidate" || (await hasAutoBotActivationAcknowledgement(expected.paths, expected.handoff));
+		return (
+			expected.role !== "candidate" || (await hasAutoBotActivationAcknowledgement(expected.paths, expected.handoff))
+		);
 	} catch {
 		return false;
 	}
@@ -647,7 +654,11 @@ export async function readAutoBotHandoffPhase(
 	return raw === undefined ? undefined : parsePhase(raw, nonce);
 }
 
-export async function writeAutoBotHandoffPhase(paths: AutoBotPaths, nonce: string, phase: AutoBotHandoffPhase): Promise<void> {
+export async function writeAutoBotHandoffPhase(
+	paths: AutoBotPaths,
+	nonce: string,
+	phase: AutoBotHandoffPhase,
+): Promise<void> {
 	await writeJsonAtomically(autoBotPhasePath(paths, nonce), {
 		schemaVersion: 1,
 		nonce,
@@ -698,7 +709,10 @@ export async function readAutoBotActivation(
 	return raw === undefined ? undefined : parseActivation(raw, request);
 }
 
-export async function writeAutoBotActivationAcknowledgement(paths: AutoBotPaths, request: AutoBotRestartRequest): Promise<void> {
+export async function writeAutoBotActivationAcknowledgement(
+	paths: AutoBotPaths,
+	request: AutoBotRestartRequest,
+): Promise<void> {
 	await writeAutoBotHandoffPhase(paths, request.nonce, "activation-acknowledged");
 	await writeJsonAtomically(autoBotSignalPath(paths, request.nonce, "activation-ack"), {
 		protocolVersion: AUTO_BOT_HANDOFF_PROTOCOL_VERSION,
@@ -708,7 +722,10 @@ export async function writeAutoBotActivationAcknowledgement(paths: AutoBotPaths,
 	});
 }
 
-export async function hasAutoBotActivationAcknowledgement(paths: AutoBotPaths, request: AutoBotRestartRequest): Promise<boolean> {
+export async function hasAutoBotActivationAcknowledgement(
+	paths: AutoBotPaths,
+	request: AutoBotRestartRequest,
+): Promise<boolean> {
 	const raw = await readJsonIfPresent(autoBotSignalPath(paths, request.nonce, "activation-ack"));
 	if (raw === undefined) return false;
 	const acknowledgement = AcknowledgementSchema.assert(raw);
@@ -723,7 +740,10 @@ export async function hasAutoBotActivationAcknowledgement(paths: AutoBotPaths, r
 	return true;
 }
 
-export async function writeAutoBotCandidateRejection(paths: AutoBotPaths, request: AutoBotRestartRequest): Promise<void> {
+export async function writeAutoBotCandidateRejection(
+	paths: AutoBotPaths,
+	request: AutoBotRestartRequest,
+): Promise<void> {
 	const phase = await readAutoBotHandoffPhase(paths, request.nonce);
 	if (!phase) throw new Error("AutoBot handoff phase is missing");
 	if (phase.phase !== "activation-sent" && phase.phase !== "activation-acknowledged") {
@@ -736,7 +756,10 @@ export async function writeAutoBotCandidateRejection(paths: AutoBotPaths, reques
 	});
 }
 
-export async function hasAutoBotCandidateRejection(paths: AutoBotPaths, request: AutoBotRestartRequest): Promise<boolean> {
+export async function hasAutoBotCandidateRejection(
+	paths: AutoBotPaths,
+	request: AutoBotRestartRequest,
+): Promise<boolean> {
 	const raw = await readJsonIfPresent(autoBotSignalPath(paths, request.nonce, "rejected"));
 	if (raw === undefined) return false;
 	parseRejected(raw, request);
@@ -750,10 +773,7 @@ export async function hasAutoBotCandidateRejection(paths: AutoBotPaths, request:
  */
 export async function authorizeAutoBotRestartExit(request: AutoBotRestartRequest): Promise<void> {
 	const environment = readAuthenticatedAutoBotEnvironment();
-	if (
-		!environment ||
-		(environment.role !== "active" && !(await hasAutoBotStartupHandoffPromotion()))
-	) {
+	if (!environment || (environment.role !== "active" && !(await hasAutoBotStartupHandoffPromotion()))) {
 		throw new Error("Only an authenticated active or promoted AutoBot runtime can authorize a restart exit");
 	}
 	await withAutoBotHandoffLock(environment.paths, async () => {
@@ -843,7 +863,8 @@ class CandidateHandoff implements AutoBotRestartCandidate {
 			const phase = await readAutoBotHandoffPhase(this.#paths, this.request.nonce);
 			if (!phase) throw new Error("AutoBot handoff phase is missing");
 			if (phase.phase === "candidate-rejected") throw new Error("AutoBot candidate handoff was rejected");
-			if (phase.phase === "prepared") await writeAutoBotHandoffPhase(this.#paths, this.request.nonce, "candidate-ready");
+			if (phase.phase === "prepared")
+				await writeAutoBotHandoffPhase(this.#paths, this.request.nonce, "candidate-ready");
 			if (phase.phase === "prepared" || phase.phase === "candidate-ready") {
 				await writeAutoBotCandidateReady(this.#paths, {
 					protocolVersion: AUTO_BOT_HANDOFF_PROTOCOL_VERSION,
@@ -865,7 +886,8 @@ class CandidateHandoff implements AutoBotRestartCandidate {
 	}
 
 	async acknowledgeActivation(): Promise<void> {
-		if (!this.#activationObserved) throw new Error("AutoBot candidate may not acknowledge activation before receiving it");
+		if (!this.#activationObserved)
+			throw new Error("AutoBot candidate may not acknowledge activation before receiving it");
 		await this.#withOwnedHandoff(() => writeAutoBotActivationAcknowledgement(this.#paths, this.request));
 	}
 

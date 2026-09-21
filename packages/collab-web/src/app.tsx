@@ -10,11 +10,7 @@ import { Toasts } from "./components/shell/Toasts";
 import { Transcript } from "./components/transcript/Transcript";
 import { GuestClient, type GuestRestartPreparationHandler } from "./lib/client";
 import { usePhoneMic } from "./lib/use-phone-mic";
-import {
-	createManagedDraftScope,
-	RestartDraftRegistry,
-	type RestartDraftScope,
-} from "./lib/restart-drafts";
+import { createManagedDraftScope, RestartDraftRegistry, type RestartDraftScope } from "./lib/restart-drafts";
 import { useGuestSnapshot } from "./lib/use-guest";
 import {
 	managedLeaveHref,
@@ -43,7 +39,6 @@ interface Creds {
 	name: string;
 }
 
-
 function storedName(): string {
 	try {
 		return localStorage.getItem(NAME_KEY) ?? "guest";
@@ -70,7 +65,9 @@ export function App(): ReactNode {
 	const credsRef = useRef<Creds | null>(null);
 	const managedReloadGuardRef = useRef<() => boolean>(() => true);
 	const verifiedManagedRouteRef = useRef<string | null>(null);
-	const [managedRoute, setManagedRoute] = useState(() => managedRoomRoute(new URLSearchParams(window.location.search)));
+	const [managedRoute, setManagedRoute] = useState(() =>
+		managedRoomRoute(new URLSearchParams(window.location.search)),
+	);
 	const prepareManagedReload = useCallback(() => managedReloadGuardRef.current(), []);
 	const registerManagedReloadGuard = useCallback((guard: (() => boolean) | null): void => {
 		managedReloadGuardRef.current = guard ?? (() => true);
@@ -263,9 +260,7 @@ function useManagedRoomDiscovery(
 
 		const scheduleRetry = (backoff: boolean): void => {
 			setMessage("Waiting for the session room to reconnect.");
-			delayMs = backoff
-				? Math.min(delayMs * 2, ROOM_DISCOVERY_MAX_DELAY_MS)
-				: ROOM_DISCOVERY_INITIAL_DELAY_MS;
+			delayMs = backoff ? Math.min(delayMs * 2, ROOM_DISCOVERY_MAX_DELAY_MS) : ROOM_DISCOVERY_INITIAL_DELAY_MS;
 			schedule();
 		};
 
@@ -462,13 +457,15 @@ function Session({
 			setDraftRecoveryVersion(version => version + 1);
 		};
 		const resolveScope = (scopePromise: Promise<RestartDraftScope | null>): void => {
-			void Promise.all([scopePromise, client.editorDraftCapabilityFingerprint()]).then(([scope, capabilityFingerprint]) => {
-				if (!scope || !capabilityFingerprint) {
-					deactivate();
-					return;
-				}
-				activate(scope, capabilityFingerprint);
-			});
+			void Promise.all([scopePromise, client.editorDraftCapabilityFingerprint()]).then(
+				([scope, capabilityFingerprint]) => {
+					if (!scope || !capabilityFingerprint) {
+						deactivate();
+						return;
+					}
+					activate(scope, capabilityFingerprint);
+				},
+			);
 		};
 		const sessionId = snap.header?.id;
 		if (!sessionId) {

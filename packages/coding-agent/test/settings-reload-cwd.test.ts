@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { getProjectAgentDir, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { getProjectAgentDir, removeSyncWithRetries, removeWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
@@ -226,10 +227,13 @@ describe("Settings.reloadForCwd", () => {
 			);
 		});
 
-		afterEach(() => {
+		afterEach(async () => {
 			resetSettingsForTest();
+			AgentStorage.close();
+			// Native SQLite handle release needs an event-loop turn, not fake timer advancement.
+			await Bun.sleep(0);
 			if (fs.existsSync(testDir)) {
-				removeSyncWithRetries(testDir);
+				await removeWithRetries(testDir);
 			}
 		});
 

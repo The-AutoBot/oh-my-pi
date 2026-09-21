@@ -13,10 +13,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
-import {
-	COLLAB_RESTART_CAPABILITY_UPDATE,
-	COLLAB_RESTART_PREPARATION_CAPABILITY,
-} from "@oh-my-pi/pi-wire";
+import { COLLAB_RESTART_CAPABILITY_UPDATE, COLLAB_RESTART_PREPARATION_CAPABILITY } from "@oh-my-pi/pi-wire";
 import type {
 	BusChannel,
 	CollabUiRequest,
@@ -539,7 +536,6 @@ export class CollabHost {
 		return this.#hostId;
 	}
 
-
 	get connectionState(): CollabConnectionState {
 		return this.#connectionState;
 	}
@@ -607,7 +603,9 @@ export class CollabHost {
 			this.#ctx.session.isAborting ||
 			this.#ctx.session.queuedMessageCount > 0 ||
 			this.#guestAgentOperations > 0 ||
-			AgentRegistry.global().list().some(ref => ref.kind === "sub" && ref.status === "running")
+			AgentRegistry.global()
+				.list()
+				.some(ref => ref.kind === "sub" && ref.status === "running")
 		) {
 			return { safe: false, reason: "session-busy" };
 		}
@@ -732,7 +730,9 @@ export class CollabHost {
 			this.#ctx.session.isAborting ||
 			this.#ctx.session.queuedMessageCount > 0 ||
 			this.#guestAgentOperations > 0 ||
-			AgentRegistry.global().list().some(ref => ref.kind === "sub" && ref.status === "running")
+			AgentRegistry.global()
+				.list()
+				.some(ref => ref.kind === "sub" && ref.status === "running")
 		) {
 			this.#cancelRestartRequest(request, "unsafe", "session-busy");
 			return false;
@@ -830,11 +830,7 @@ export class CollabHost {
 			generation: this.#generation,
 			...details,
 		};
-		if (
-			stage === "ready-timeout" ||
-			details.state === "terminal" ||
-			details.state === "connection-handler-failed"
-		) {
+		if (stage === "ready-timeout" || details.state === "terminal" || details.state === "connection-handler-failed") {
 			logger.warn("Collab host lifecycle", fields);
 		} else {
 			logger.info("Collab host lifecycle", fields);
@@ -1022,14 +1018,11 @@ export class CollabHost {
 		socket.onClose = (_reason, willReconnect, closeCode) => {
 			this.#relayConnected = false;
 			if (this.#stopped) return;
-			this.#logLifecycle(
-				opened ? (willReconnect ? "reconnect" : "recovery") : "initial-open",
-				{
-					state: willReconnect ? "closed" : "terminal",
-					willReconnect,
-					...(closeCode === undefined ? {} : { closeCode }),
-				},
-			);
+			this.#logLifecycle(opened ? (willReconnect ? "reconnect" : "recovery") : "initial-open", {
+				state: willReconnect ? "closed" : "terminal",
+				willReconnect,
+				...(closeCode === undefined ? {} : { closeCode }),
+			});
 			if (!opened) {
 				firstOpen.reject(collabUnavailableError("connection-unavailable"));
 				return;
@@ -1126,9 +1119,7 @@ export class CollabHost {
 			// flight: withdraw it here too (close is idempotent) and refuse to
 			// finish startup instead of installing a dead host that stays discoverable.
 			if (publication) {
-				await publication
-					.close()
-					.catch(err => this.#logFailure("registry-withdrawal", err));
+				await publication.close().catch(err => this.#logFailure("registry-withdrawal", err));
 			}
 			if (this.#stopping) throw new CollabHostStoppedError("collab host stopped during startup");
 			throw new Error("relay connection closed during startup");
@@ -1205,9 +1196,7 @@ export class CollabHost {
 			// close() removes discovery metadata synchronously before awaiting the
 			// server shutdown, so a stopped room disappears from lists immediately;
 			// awaiting it lets a successor room reuse the same instance endpoint.
-			await publication
-				.close()
-				.catch(err => this.#logFailure("registry-withdrawal", err));
+			await publication.close().catch(err => this.#logFailure("registry-withdrawal", err));
 		}
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
@@ -1440,7 +1429,13 @@ export class CollabHost {
 		const ready = this.#ctx.session.isSessionTransitioning
 			? "the session transition completes"
 			: "the host finishes starting up";
-		this.#sendLiveInputLease(fromPeer, requestId, "unavailable", undefined, `live input is unavailable until ${ready}`);
+		this.#sendLiveInputLease(
+			fromPeer,
+			requestId,
+			"unavailable",
+			undefined,
+			`live input is unavailable until ${ready}`,
+		);
 		return true;
 	}
 
@@ -1750,12 +1745,7 @@ export class CollabHost {
 		peer.restartDirtyVersion++;
 	}
 
-	#handleRestartReady(
-		requestId: unknown,
-		status: unknown,
-		reason: unknown,
-		fromPeer: number,
-	): void {
+	#handleRestartReady(requestId: unknown, status: unknown, reason: unknown, fromPeer: number): void {
 		if (!isRestartRequestId(requestId)) return;
 		const request = this.#restartRequest;
 		const peer = this.#peers.get(fromPeer);
@@ -2044,7 +2034,8 @@ export class CollabHost {
 		const remoteLease = this.#remoteLiveInputLease;
 		if (remoteLease) void this.#stopRemoteLiveInput(remoteLease, "revoked", "relay room was recreated");
 		const restartRequest = this.#restartRequest;
-		if (this.#peers.size === 0 && this.#unnegotiatedPeers.size === 0 && this.#pendingUi.size === 0 && !restartRequest) return;
+		if (this.#peers.size === 0 && this.#unnegotiatedPeers.size === 0 && this.#pendingUi.size === 0 && !restartRequest)
+			return;
 		// Identities first: relay peer IDs may be reissued before any queued
 		if (this.#peers.size > 0 || this.#unnegotiatedPeers.size > 0) {
 			this.#restartIncompatibleAfterRoomRecreation = true;
@@ -2215,14 +2206,11 @@ export class CollabHost {
 		}
 	}
 
-
 	#trackGuestAgentOperation(operation: Promise<unknown>, fail: (error: unknown) => void): void {
 		this.#guestAgentOperations++;
-		void operation
-			.catch(fail)
-			.finally(() => {
-				this.#guestAgentOperations--;
-			});
+		void operation.catch(fail).finally(() => {
+			this.#guestAgentOperations--;
+		});
 	}
 	/** Incremental transcript read mirroring the hub's readFileIncremental contract. */
 	async #handleFetchTranscript(reqId: number, agentId: string, fromByte: number, fromPeer: number): Promise<void> {

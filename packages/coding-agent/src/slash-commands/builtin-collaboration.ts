@@ -429,7 +429,8 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 			}
 			try {
 				// Stop stale/ending ownership and cancel pending starts, not a live room.
-				if (!ctx.collabController.host) await ctx.collabController.stop("joining another session", "session-switch");
+				if (!ctx.collabController.host)
+					await ctx.collabController.stop("joining another session", "session-switch");
 				// Recheck after teardown: a concurrent manual start may have won.
 				if (ctx.collabController.host) {
 					ctx.showError("Stop hosting first (/collab stop)");

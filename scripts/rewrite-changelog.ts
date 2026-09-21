@@ -48,7 +48,7 @@ import {
 
 const DEFAULT_MODEL = "openai-codex/gpt-5.6-luna";
 /** Tried in order after the primary model fails (quota exhaustion, auth, hard API errors). */
-const FALLBACK_MODELS = [];
+const FALLBACK_MODELS: readonly string[] = [];
 
 // --------------------------------------------------------------------------
 // Prompts
@@ -106,9 +106,7 @@ async function openModel(modelSpec: string): Promise<RewriteModel> {
 	try {
 		const apiKey = await storage.getApiKey(provider);
 		if (!apiKey) {
-			throw new Error(
-				`no credentials for provider "${provider}" via ${storage.sourceLabel ?? "auth storage"} (check broker or run \`omp login\`)`,
-			);
+			throw new Error(`no credentials for provider "${provider}" (check broker or run \`omp login\`)`);
 		}
 		return { model, apiKey, spec: modelSpec };
 	} finally {

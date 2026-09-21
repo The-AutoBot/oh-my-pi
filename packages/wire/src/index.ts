@@ -348,7 +348,6 @@ export type CollabRestartBlockReason =
 /** A host may release a prepared guest without stopping the room. */
 export type CollabRestartCancelReason = "aborted" | "expired" | "unsafe";
 
-
 export type GuestFrame =
 	| {
 			t: "hello";

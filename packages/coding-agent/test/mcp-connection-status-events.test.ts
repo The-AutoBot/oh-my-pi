@@ -75,6 +75,7 @@ describe("MCPManager connection status events", () => {
 
 			expect(result.errors.has("broken")).toBe(true);
 			const message = result.errors.get("broken");
+			if (typeof message !== "string") throw new Error("Expected broken MCP server to report a string error");
 			expect(events).toEqual([
 				{ type: "connecting", serverNames: ["broken"] },
 				{

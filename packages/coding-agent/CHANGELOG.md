@@ -11,10 +11,14 @@
 ### Changed
 
 - Maintained collaboration builds use pinned Bun 1.4.0 with a matching source-built native addon through the maintained build scripts, preserving compiled `import.meta` startup.
+- Local Windows builds now compile the application with existing, exact-version native addons, record their hashes and unknown producing source commit, and smoke-test the output in an isolated profile without rebuilding native code or running broad per-build qualification suites.
+- Signed local producers now require `nativeAddonDirectory`; application asset compilation, executable identity checks, signing, immutable prepared publication, and update/recovery safeguards remain separate from native rebuilding.
 - Managed AutoBot updates now run serially at safe idle and resume the exact persisted session/profile/cwd/current model without replaying the original prompt. The broker reservation is 390 seconds (270-second execution floor plus 120-second pre-commit margin); candidates have a 60-second ready deadline.
 
 ### Fixed
 
+- Local publishers now recover stale integration checkpoints only from fully verified completed signed releases, retain published source identity across interrupted preparations, and preserve an already-shipped upstream base until an official stable descendant is available.
+- Scheduled local publishers now use the configured Bun runtime directly; explicit mismatched runtime paths are rejected before execution or registration.
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
 - Prevented standby AutoBot candidates from exposing session title changes before acquiring activation ownership.
@@ -32,6 +36,7 @@
 - Fixed live subagent messages getting stuck behind persisted-agent discovery, and roster discovery looping on dot-named transcripts.
 - Fixed llama.cpp discovery of PrismML Bonsai 2 27B GGUFs: built-in and custom-named providers now share catalog rules for chat-completions routing and the Qwen 3.8 thinking ladder (`low`/`medium`/`xhigh`), including cached models.
 
+- Fixed Windows session enumeration in indexed and in-memory storage when journal paths use native backslash separators.
 ## [18.2.6] - 2026-09-18
 
 ### Fixed

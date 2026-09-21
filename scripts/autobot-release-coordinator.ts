@@ -34,7 +34,9 @@ function requireHttpsRepository(value: unknown): string {
 		throw new AutoBotReleaseError("Coordinator source repository must be an explicit HTTPS URL", { cause: error });
 	}
 	if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash) {
-		throw new AutoBotReleaseError("Coordinator source repository must be an HTTPS URL without credentials, query, or fragment");
+		throw new AutoBotReleaseError(
+			"Coordinator source repository must be an HTTPS URL without credentials, query, or fragment",
+		);
 	}
 	return repository;
 }
@@ -47,14 +49,16 @@ export function parseCoordinatorClientProvenance(value: unknown): CoordinatorCli
 			throw new AutoBotReleaseError(`Coordinator source provenance has an unsupported field: ${key}`);
 		}
 	}
-	if (value.schemaVersion !== 1) throw new AutoBotReleaseError("Coordinator source provenance schemaVersion must be 1");
+	if (value.schemaVersion !== 1)
+		throw new AutoBotReleaseError("Coordinator source provenance schemaVersion must be 1");
 	if (!isRecord(value.source)) throw new AutoBotReleaseError("Coordinator source provenance source must be an object");
 	for (const key of Object.keys(value.source)) {
 		if (!["repository", "commit"].includes(key)) {
 			throw new AutoBotReleaseError(`Coordinator source provenance source has an unsupported field: ${key}`);
 		}
 	}
-	if (!isRecord(value.artifact)) throw new AutoBotReleaseError("Coordinator source provenance artifact must be an object");
+	if (!isRecord(value.artifact))
+		throw new AutoBotReleaseError("Coordinator source provenance artifact must be an object");
 	for (const key of Object.keys(value.artifact)) {
 		if (!["filename", "sha256", "size"].includes(key)) {
 			throw new AutoBotReleaseError(`Coordinator source provenance artifact has an unsupported field: ${key}`);
@@ -68,11 +72,17 @@ export function parseCoordinatorClientProvenance(value: unknown): CoordinatorCli
 		schemaVersion: 1,
 		source: {
 			repository: requireHttpsRepository(value.source.repository),
-			commit: requireCommit(requireString(value.source.commit, "Coordinator source commit"), "Coordinator source commit"),
+			commit: requireCommit(
+				requireString(value.source.commit, "Coordinator source commit"),
+				"Coordinator source commit",
+			),
 		},
 		artifact: {
 			filename: COORDINATOR_CLIENT_FILENAME,
-			sha256: requireSha256(requireString(value.artifact.sha256, "Coordinator artifact SHA-256"), "Coordinator artifact SHA-256"),
+			sha256: requireSha256(
+				requireString(value.artifact.sha256, "Coordinator artifact SHA-256"),
+				"Coordinator artifact SHA-256",
+			),
 			size: requirePositiveSafeInteger(value.artifact.size, "Coordinator artifact size"),
 		},
 	};

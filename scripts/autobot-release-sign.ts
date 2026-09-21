@@ -2,10 +2,7 @@
 
 import * as path from "node:path";
 import { AUTO_BOT_COMPATIBILITY_EPOCH } from "../packages/coding-agent/src/autobot-update/contract.ts";
-import {
-	COORDINATOR_CLIENT_TARGET,
-	parseCoordinatorClientProvenance,
-} from "./autobot-release-coordinator.ts";
+import { COORDINATOR_CLIENT_TARGET, parseCoordinatorClientProvenance } from "./autobot-release-coordinator.ts";
 import {
 	AutoBotReleaseError,
 	assertKnownOptions,
@@ -50,12 +47,15 @@ async function main(): Promise<void> {
 	const manifestPath = path.resolve(requiredOption(args, "manifest"));
 	const indexPath = path.resolve(requiredOption(args, "asset-index"));
 	const outputPath = path.resolve(requiredOption(args, "out"));
-	if (await Bun.file(outputPath).exists()) throw new AutoBotReleaseError(`Refusing to overwrite signed envelope: ${outputPath}`);
+	if (await Bun.file(outputPath).exists())
+		throw new AutoBotReleaseError(`Refusing to overwrite signed envelope: ${outputPath}`);
 	const manifest = parseUnsignedManifest(await readJson(manifestPath, "unsigned release manifest"));
 	assertCompleteAutoBotReleaseTopology(manifest.assets);
 	await verifyIndexedAssets(manifest, indexPath);
 	if (manifest.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH) {
-		throw new AutoBotReleaseError("Unsigned release compatibility epoch does not match the trusted producer contract");
+		throw new AutoBotReleaseError(
+			"Unsigned release compatibility epoch does not match the trusted producer contract",
+		);
 	}
 	const assetIndex = parseAssetIndex(await readJson(indexPath, "asset index"));
 	const webAsset = manifest.assets.find(asset => asset.kind === "collab-web" && asset.target === "web");
@@ -88,7 +88,9 @@ async function main(): Promise<void> {
 		coordinatorAsset.sha256 !== coordinatorSource.artifact.sha256 ||
 		coordinatorAsset.size !== coordinatorSource.artifact.size
 	) {
-		throw new AutoBotReleaseError("Signed coordinator-client asset does not match the trusted pinned coordinator provenance");
+		throw new AutoBotReleaseError(
+			"Signed coordinator-client asset does not match the trusted pinned coordinator provenance",
+		);
 	}
 	const previousEnvelope = optionalOption(args, "previous-envelope");
 	const allowInitial = hasOption(args, "allow-initial");
@@ -96,7 +98,9 @@ async function main(): Promise<void> {
 		if (allowInitial) throw new AutoBotReleaseError("--allow-initial cannot be used with --previous-envelope");
 		const trusted = await loadTrustedKeys(repeatedOption(args, "trusted-key"));
 		if (trusted.keys.size === 0) {
-			throw new AutoBotReleaseError("--previous-envelope requires at least one locally configured --trusted-key keyId=public-key-path");
+			throw new AutoBotReleaseError(
+				"--previous-envelope requires at least one locally configured --trusted-key keyId=public-key-path",
+			);
 		}
 		const previous = await readVerifiedEnvelope(path.resolve(previousEnvelope), trusted);
 		assertReleaseSequenceAfter(manifest, previous.manifest);

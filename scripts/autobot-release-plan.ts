@@ -46,7 +46,9 @@ async function latestIntegratedUpstreamCommit(sourceRoot: string, forkCommit: st
 		const commit = requireCommit(candidateCommit ?? "", "Candidate merge commit");
 		const parents = (await gitOutput(sourceRoot, ["show", "-s", "--format=%P", commit])).split(" ");
 		if (parents.length !== 2) {
-			throw new AutoBotReleaseError(`AutoBot candidate ${commit} must retain its canonical and upstream merge parents`);
+			throw new AutoBotReleaseError(
+				`AutoBot candidate ${commit} must retain its canonical and upstream merge parents`,
+			);
 		}
 		const upstreamCommit = requireCommit(parents[1] ?? "", "Candidate upstream parent");
 		if (!upstreamCommit.startsWith(match[1] ?? "")) {
@@ -80,7 +82,10 @@ async function main(): Promise<void> {
 	assertKnownOptions(args, ["source-root", "out"]);
 	const sourceRoot = path.resolve(requiredOption(args, "source-root"));
 	const output = path.resolve(requiredOption(args, "out"));
-	const forkCommit = requireCommit(await gitOutput(sourceRoot, ["rev-parse", "--verify", "HEAD^{commit}"]), "Canonical fork commit");
+	const forkCommit = requireCommit(
+		await gitOutput(sourceRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
+		"Canonical fork commit",
+	);
 	const upstreamCommit = await latestIntegratedUpstreamCommit(sourceRoot, forkCommit);
 	if (!upstreamCommit) {
 		const deferred: DeferredReleasePlan = {
@@ -101,7 +106,9 @@ async function main(): Promise<void> {
 		compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH,
 	};
 	await writeJsonAtomic(output, plan);
-	console.log(`Planned AutoBot release source ${plan.forkCommit.slice(0, 12)} from upstream ${plan.upstreamCommit.slice(0, 12)}`);
+	console.log(
+		`Planned AutoBot release source ${plan.forkCommit.slice(0, 12)} from upstream ${plan.upstreamCommit.slice(0, 12)}`,
+	);
 }
 
 if (import.meta.main) {

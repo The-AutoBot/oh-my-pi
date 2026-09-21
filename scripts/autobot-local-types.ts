@@ -10,6 +10,7 @@ export interface LocalAutomationConfig {
 	readonly runnerBunVersion: string;
 	readonly compilerBun: string;
 	readonly compilerBunVersion: string;
+	readonly nativeAddonDirectory: string;
 	readonly ompExecutable: string;
 	readonly coordinatorRoot: string;
 	readonly keyId: string;
@@ -21,6 +22,26 @@ export interface LocalAutomationConfig {
 	readonly allowInitial: boolean;
 	readonly maxOmpAttempts: number;
 	readonly ompMaxTime: string;
+}
+
+/** The exact published release/tag observed from the configured official source. */
+export interface OfficialUpstreamRelease {
+	readonly tag: string;
+	readonly ref: string;
+	readonly commit: string;
+}
+
+export interface ObservedOfficialUpstreamRelease extends OfficialUpstreamRelease {
+	readonly version: string;
+}
+
+/**
+ * The source identity retained by the candidate. This can be newer than the
+ * current official observation when an upstream release endpoint moves backward.
+ */
+export interface EffectiveUpstreamBase {
+	readonly commit: string;
+	readonly version: string;
 }
 
 export interface LocalCandidate {

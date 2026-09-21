@@ -181,7 +181,12 @@ export class AgentLifecycleManager {
 	 * the caller can defer rather than racing an in-flight agent attachment.
 	 */
 	beginAutoBotUpdateBarrier(): AutoBotUpdateLifecycleBarrier | undefined {
-		if (this.#disposed || this.#autoBotUpdateBarrier !== undefined || this.#parks.size > 0 || this.#revivals.size > 0) {
+		if (
+			this.#disposed ||
+			this.#autoBotUpdateBarrier !== undefined ||
+			this.#parks.size > 0 ||
+			this.#revivals.size > 0
+		) {
 			return undefined;
 		}
 		const token = Symbol("autobot-update");

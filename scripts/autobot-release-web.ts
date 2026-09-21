@@ -118,7 +118,9 @@ function assertBundleFileSize(value: unknown, label: string): number {
 
 function assertManagedBundleInventoryLimits(files: readonly ManagedBundleFile[]): void {
 	if (files.length > AUTO_BOT_MAX_COLLAB_WEB_FILES) {
-		throw new AutoBotReleaseError(`managed-bundle.json cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} files`);
+		throw new AutoBotReleaseError(
+			`managed-bundle.json cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} files`,
+		);
 	}
 	let totalBytes = 0;
 	for (const file of files) {
@@ -166,7 +168,7 @@ function readTarHeaderSize(header: Uint8Array): number {
 
 function assertManagedBundleTarEntryLimit(archive: Uint8Array): void {
 	let entries = 0;
-	for (let offset = 0; offset + TAR_BLOCK_BYTES <= archive.byteLength; ) {
+	for (let offset = 0; offset + TAR_BLOCK_BYTES <= archive.byteLength;) {
 		const header = archive.subarray(offset, offset + TAR_BLOCK_BYTES);
 		if (header.every(byte => byte === 0)) break;
 		if (++entries > AUTO_BOT_MAX_COLLAB_WEB_ARCHIVE_ENTRIES) {
@@ -203,9 +205,12 @@ async function assertManagedBundleArchiveSize(archivePath: string): Promise<void
 		assertManagedBundleTarEntryLimit(expanded);
 	} catch (error) {
 		if (error instanceof AutoBotReleaseError) throw error;
-		throw new AutoBotReleaseError("Collab web archive is invalid or exceeds the expanded coordinator admission limit", {
-			cause: error,
-		});
+		throw new AutoBotReleaseError(
+			"Collab web archive is invalid or exceeds the expanded coordinator admission limit",
+			{
+				cause: error,
+			},
+		);
 	}
 }
 
@@ -220,7 +225,8 @@ async function collectFiles(root: string, relative = ""): Promise<string[]> {
 			files.push(...(await collectFiles(root, child)));
 			continue;
 		}
-		if (!entry.isFile()) throw new AutoBotReleaseError(`Web bundle input must not contain links or special files: ${child}`);
+		if (!entry.isFile())
+			throw new AutoBotReleaseError(`Web bundle input must not contain links or special files: ${child}`);
 		files.push(child);
 	}
 	return files;
@@ -269,7 +275,8 @@ export async function deriveManagedBundleId(dist: string, publicDirectory?: stri
 		const publicStat = await fs.lstat(publicRoot).catch(error => {
 			throw new AutoBotReleaseError(`Collab web public directory does not exist: ${publicRoot}`, { cause: error });
 		});
-		if (!publicStat.isDirectory()) throw new AutoBotReleaseError(`Collab web public path is not a directory: ${publicRoot}`);
+		if (!publicStat.isDirectory())
+			throw new AutoBotReleaseError(`Collab web public path is not a directory: ${publicRoot}`);
 		for (const relative of await collectFiles(publicRoot)) {
 			assertBundleFilePath(`public/${relative}`);
 			const hashed = await hashFile(path.join(publicRoot, relative));
@@ -288,7 +295,10 @@ function parseInventoryFile(value: unknown, index: number): ManagedBundleFile {
 	}
 	return {
 		path: assertBundleFilePath(requireString(value.path, `managed-bundle.files[${index}].path`)),
-		sha256: requireSha256(requireString(value.sha256, `managed-bundle.files[${index}].sha256`), "Managed bundle file hash"),
+		sha256: requireSha256(
+			requireString(value.sha256, `managed-bundle.files[${index}].sha256`),
+			"Managed bundle file hash",
+		),
 		size: assertBundleFileSize(value.size, `managed-bundle.files[${index}].size`),
 	};
 }
@@ -298,19 +308,29 @@ export function parseManagedBundleInventory(value: unknown): ManagedBundleInvent
 	if (!isRecord(value)) throw new AutoBotReleaseError("managed-bundle.json must be an object");
 	for (const key of Object.keys(value)) {
 		if (
-			!["schemaVersion", "bundleId", "sessionFormatVersion", "collabProtocolVersion", "compatibilityEpoch", "source", "files"].includes(
-				key,
-			)
+			![
+				"schemaVersion",
+				"bundleId",
+				"sessionFormatVersion",
+				"collabProtocolVersion",
+				"compatibilityEpoch",
+				"source",
+				"files",
+			].includes(key)
 		) {
 			throw new AutoBotReleaseError(`managed-bundle.json has an unsupported field: ${key}`);
 		}
 	}
 	if (value.schemaVersion !== 1) throw new AutoBotReleaseError("managed-bundle.json schemaVersion must be 1");
 	if (value.sessionFormatVersion !== AUTO_BOT_SESSION_FORMAT_VERSION) {
-		throw new AutoBotReleaseError(`managed-bundle.json sessionFormatVersion must be ${AUTO_BOT_SESSION_FORMAT_VERSION}`);
+		throw new AutoBotReleaseError(
+			`managed-bundle.json sessionFormatVersion must be ${AUTO_BOT_SESSION_FORMAT_VERSION}`,
+		);
 	}
 	if (value.collabProtocolVersion !== AUTO_BOT_COLLAB_PROTOCOL_VERSION) {
-		throw new AutoBotReleaseError(`managed-bundle.json collabProtocolVersion must be ${AUTO_BOT_COLLAB_PROTOCOL_VERSION}`);
+		throw new AutoBotReleaseError(
+			`managed-bundle.json collabProtocolVersion must be ${AUTO_BOT_COLLAB_PROTOCOL_VERSION}`,
+		);
 	}
 	if (value.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH) {
 		throw new AutoBotReleaseError(`managed-bundle.json compatibilityEpoch must be ${AUTO_BOT_COMPATIBILITY_EPOCH}`);
@@ -325,14 +345,17 @@ export function parseManagedBundleInventory(value: unknown): ManagedBundleInvent
 		throw new AutoBotReleaseError("managed-bundle.json files must be a non-empty array");
 	}
 	if (value.files.length > AUTO_BOT_MAX_COLLAB_WEB_FILES) {
-		throw new AutoBotReleaseError(`managed-bundle.json cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} files`);
+		throw new AutoBotReleaseError(
+			`managed-bundle.json cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} files`,
+		);
 	}
 	const files = value.files.map(parseInventoryFile);
 	const seen = new Set<string>();
 	let priorPath = "";
 	for (const file of files) {
 		if (seen.has(file.path)) throw new AutoBotReleaseError(`managed-bundle.json duplicates file ${file.path}`);
-		if (priorPath.localeCompare(file.path) >= 0) throw new AutoBotReleaseError("managed-bundle.json files must be sorted by path");
+		if (priorPath.localeCompare(file.path) >= 0)
+			throw new AutoBotReleaseError("managed-bundle.json files must be sorted by path");
 		seen.add(file.path);
 		priorPath = file.path;
 	}
@@ -345,11 +368,17 @@ export function parseManagedBundleInventory(value: unknown): ManagedBundleInvent
 		compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH,
 		source: {
 			forkCommit: assertBundleSourceValue(
-				requireCommit(requireString(value.source.forkCommit, "managed-bundle.json source forkCommit"), "Managed bundle fork commit"),
+				requireCommit(
+					requireString(value.source.forkCommit, "managed-bundle.json source forkCommit"),
+					"Managed bundle fork commit",
+				),
 				"Managed bundle fork commit",
 			),
 			upstreamCommit: assertBundleSourceValue(
-				requireCommit(requireString(value.source.upstreamCommit, "managed-bundle.json source upstreamCommit"), "Managed bundle upstream commit"),
+				requireCommit(
+					requireString(value.source.upstreamCommit, "managed-bundle.json source upstreamCommit"),
+					"Managed bundle upstream commit",
+				),
 				"Managed bundle upstream commit",
 			),
 			upstreamVersion: assertBundleSourceValue(
@@ -373,7 +402,10 @@ function assertInventoryExpectation(inventory: ManagedBundleInventory, expected:
 	}
 }
 
-async function validateExtractedBundle(root: string, expected?: ManagedBundleExpectation): Promise<ManagedBundleInventory> {
+async function validateExtractedBundle(
+	root: string,
+	expected?: ManagedBundleExpectation,
+): Promise<ManagedBundleInventory> {
 	const inventoryPath = path.join(root, "managed-bundle.json");
 	const inventoryStat = await requireRegularFile(inventoryPath, "managed-bundle.json");
 	if (inventoryStat.size > AUTO_BOT_MAX_COLLAB_WEB_INVENTORY_BYTES) {
@@ -381,13 +413,18 @@ async function validateExtractedBundle(root: string, expected?: ManagedBundleExp
 			`managed-bundle.json exceeds the ${AUTO_BOT_MAX_COLLAB_WEB_INVENTORY_BYTES}-byte coordinator admission limit`,
 		);
 	}
-	const inventory = parseManagedBundleInventory(parseJson(await Bun.file(inventoryPath).text(), "managed-bundle.json"));
+	const inventory = parseManagedBundleInventory(
+		parseJson(await Bun.file(inventoryPath).text(), "managed-bundle.json"),
+	);
 	if (expected) assertInventoryExpectation(inventory, expected);
 	const actualFiles = await collectFiles(root);
 	const expectedFiles = ["managed-bundle.json", ...inventory.files.map(file => file.path)].sort((left, right) =>
 		left.localeCompare(right),
 	);
-	if (actualFiles.length !== expectedFiles.length || actualFiles.some((file, index) => file !== expectedFiles[index])) {
+	if (
+		actualFiles.length !== expectedFiles.length ||
+		actualFiles.some((file, index) => file !== expectedFiles[index])
+	) {
 		throw new AutoBotReleaseError("Collab web archive files do not exactly match managed-bundle.json");
 	}
 	for (const file of inventory.files) {
@@ -433,7 +470,9 @@ export async function verifyManagedBundleArchive(
 			throw new AutoBotReleaseError(`Collab web archive contains a non-regular entry: ${rawEntry}`);
 		}
 		if (entryType === "-" && ++archiveFileCount > AUTO_BOT_MAX_COLLAB_WEB_FILES + 1) {
-			throw new AutoBotReleaseError(`Collab web archive cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} inventory files`);
+			throw new AutoBotReleaseError(
+				`Collab web archive cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} inventory files`,
+			);
 		}
 		const entry = rawEntry.startsWith("./") ? rawEntry.slice(2) : rawEntry;
 		if (entry === "") continue;
@@ -442,7 +481,9 @@ export async function verifyManagedBundleArchive(
 		}
 		const normalized = entry.endsWith("/") ? entry.slice(0, -1) : entry;
 		if (utf8ByteLength(normalized) > AUTO_BOT_MAX_COLLAB_WEB_PATH_BYTES) {
-			throw new AutoBotReleaseError(`Collab web archive path exceeds ${AUTO_BOT_MAX_COLLAB_WEB_PATH_BYTES} bytes: ${entry}`);
+			throw new AutoBotReleaseError(
+				`Collab web archive path exceeds ${AUTO_BOT_MAX_COLLAB_WEB_PATH_BYTES} bytes: ${entry}`,
+			);
 		}
 		if (pathSegmentCount(normalized) > AUTO_BOT_MAX_COLLAB_WEB_PATH_SEGMENTS) {
 			throw new AutoBotReleaseError(
@@ -488,7 +529,10 @@ export async function createManagedBundle(options: CreateManagedBundleOptions): 
 	const output = path.resolve(options.out);
 	assertBundleId(options.bundleId);
 	const forkCommit = assertBundleSourceValue(requireCommit(options.forkCommit, "Fork commit"), "Fork commit");
-	const upstreamCommit = assertBundleSourceValue(requireCommit(options.upstreamCommit, "Upstream commit"), "Upstream commit");
+	const upstreamCommit = assertBundleSourceValue(
+		requireCommit(options.upstreamCommit, "Upstream commit"),
+		"Upstream commit",
+	);
 	const upstreamVersion = assertBundleSourceValue(options.upstreamVersion, "Upstream version");
 	const outputRelative = path.relative(source, output);
 	if (outputRelative === "" || (!outputRelative.startsWith("..") && !path.isAbsolute(outputRelative))) {
@@ -508,7 +552,9 @@ export async function createManagedBundle(options: CreateManagedBundleOptions): 
 		if (options.publicDirectory) {
 			const publicDirectory = path.resolve(options.publicDirectory);
 			const publicStat = await fs.lstat(publicDirectory).catch(error => {
-				throw new AutoBotReleaseError(`Collab web public directory does not exist: ${publicDirectory}`, { cause: error });
+				throw new AutoBotReleaseError(`Collab web public directory does not exist: ${publicDirectory}`, {
+					cause: error,
+				});
 			});
 			if (!publicStat.isDirectory()) {
 				throw new AutoBotReleaseError(`Collab web public path is not a directory: ${publicDirectory}`);
@@ -517,7 +563,9 @@ export async function createManagedBundle(options: CreateManagedBundleOptions): 
 		}
 		const sourceFiles = await collectFiles(staged);
 		if (sourceFiles.length > AUTO_BOT_MAX_COLLAB_WEB_FILES) {
-			throw new AutoBotReleaseError(`Collab web dist cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} files`);
+			throw new AutoBotReleaseError(
+				`Collab web dist cannot contain more than ${AUTO_BOT_MAX_COLLAB_WEB_FILES} files`,
+			);
 		}
 		if (sourceFiles.includes(MANAGED_BUNDLE_INVENTORY_FILE)) {
 			throw new AutoBotReleaseError("Collab web dist must not already contain managed-bundle.json");
@@ -529,7 +577,8 @@ export async function createManagedBundle(options: CreateManagedBundleOptions): 
 			files.push({ path: relative, ...hashed });
 		}
 		assertManagedBundleInventoryLimits(files);
-		if (!files.some(file => file.path === "index.html")) throw new AutoBotReleaseError("Collab web dist is missing index.html");
+		if (!files.some(file => file.path === "index.html"))
+			throw new AutoBotReleaseError("Collab web dist is missing index.html");
 		const inventory: ManagedBundleInventory = {
 			schemaVersion: 1,
 			bundleId: options.bundleId,
@@ -547,12 +596,24 @@ export async function createManagedBundle(options: CreateManagedBundleOptions): 
 		assertManagedBundleManifestSize(inventoryContents);
 		await writeTextAtomic(path.join(staged, "managed-bundle.json"), inventoryContents);
 		await fs.mkdir(path.dirname(output), { recursive: true });
-		if (await Bun.file(output).exists()) throw new AutoBotReleaseError(`Refusing to overwrite collab web archive: ${output}`);
+		if (await Bun.file(output).exists())
+			throw new AutoBotReleaseError(`Refusing to overwrite collab web archive: ${output}`);
 		// The coordinator admits only ustar file/directory entries; GNU/PAX extensions are unavailable.
 		const tarArguments =
 			process.platform === "win32"
 				? ["tar", "--format=ustar", "--mtime", "1970-01-01 00:00:00 UTC", "-czf", output, "."]
-				: ["tar", "--format=ustar", "--sort=name", "--mtime=@0", "--owner=0", "--group=0", "--numeric-owner", "-czf", output, "."];
+				: [
+						"tar",
+						"--format=ustar",
+						"--sort=name",
+						"--mtime=@0",
+						"--owner=0",
+						"--group=0",
+						"--numeric-owner",
+						"-czf",
+						output,
+						".",
+					];
 		await runCommand(tarArguments, { cwd: staged, env: { ...Bun.env, GZIP: "-n" } });
 		archiveCreated = true;
 		await verifyManagedBundleArchive(output, { ...options, compatibilityEpoch: AUTO_BOT_COMPATIBILITY_EPOCH });
@@ -567,7 +628,15 @@ export async function createManagedBundle(options: CreateManagedBundleOptions): 
 
 async function main(): Promise<void> {
 	const args = parseCliArgs(process.argv.slice(2));
-	assertKnownOptions(args, ["dist", "public", "out", "web-bundle-id", "fork-commit", "upstream-commit", "upstream-version"]);
+	assertKnownOptions(args, [
+		"dist",
+		"public",
+		"out",
+		"web-bundle-id",
+		"fork-commit",
+		"upstream-commit",
+		"upstream-version",
+	]);
 	const output = requiredOption(args, "out");
 	const inventory = await createManagedBundle({
 		dist: requiredOption(args, "dist"),
