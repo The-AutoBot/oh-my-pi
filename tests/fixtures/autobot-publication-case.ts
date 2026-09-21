@@ -141,9 +141,10 @@ try {
 		coordinatorSource,
 		`${JSON.stringify({ schemaVersion: 1, source: { repository: "https://github.com/example/omp-session-coordinator.git", commit: coordinatorCommit }, artifact: { filename: COORDINATOR_CLIENT_FILENAME, sha256: await sha256(coordinatorAsset), size: (await fs.stat(coordinatorAsset)).size } }, null, "\t")}\n`,
 	);
-	const subsequent = scenario === "subsequent-autocrlf";
-	const tag = subsequent ? "autobot-r2" : "autobot-r1";
-	const releaseSequence = subsequent ? 2 : 1;
+	const thirdRelease = scenario.startsWith("third-release-");
+	const subsequent = scenario === "subsequent-autocrlf" || thirdRelease;
+	const releaseSequence = thirdRelease ? 3 : subsequent ? 2 : 1;
+	const tag = `autobot-r${releaseSequence}`;
 	const coordinatorSha = await sha256(coordinatorSource);
 	const script = (name: string, args: string[]): void => {
 		run([process.execPath, path.join(repoRoot, "scripts", name), ...args], repoRoot);
@@ -162,18 +163,20 @@ try {
 			asset("collab-web", "web", web),
 		];
 	};
+	const previousBundles: string[] = [];
 	let previousBundle: string | undefined;
-	if (subsequent) {
-		previousBundle = path.join(stage, "previous-bundle");
-		const previousInputs = path.join(inputs, "previous-asset-inputs.json");
-		await write(previousInputs, JSON.stringify(assetRows("autobot-r1")));
+	for (let priorSequence = 1; priorSequence < releaseSequence; priorSequence += 1) {
+		const priorTag = `autobot-r${priorSequence}`;
+		const priorBundle = path.join(stage, `previous-bundle-${priorSequence}`);
+		const previousInputs = path.join(inputs, `previous-asset-inputs-${priorSequence}.json`);
+		await write(previousInputs, JSON.stringify(assetRows(priorTag)));
 		script("autobot-release-assemble.ts", [
 			"--out",
-			previousBundle,
+			priorBundle,
 			"--assets",
 			previousInputs,
 			"--release-sequence",
-			"1",
+			String(priorSequence),
 			"--upstream-version",
 			"18.2.3",
 			"--fork-commit",
@@ -187,27 +190,36 @@ try {
 			"--coordinator-source-sha256",
 			coordinatorSha,
 		]);
-		script("autobot-release-sign.ts", [
+		const priorSignArgs = [
 			"--manifest",
-			path.join(previousBundle, "manifest.json"),
+			path.join(priorBundle, "manifest.json"),
 			"--asset-index",
-			path.join(previousBundle, "asset-index.json"),
+			path.join(priorBundle, "asset-index.json"),
 			"--out",
-			path.join(previousBundle, "signed-envelope.json"),
+			path.join(priorBundle, "signed-envelope.json"),
 			"--key-id",
 			"fixture",
 			"--private-key",
 			privateKeyPath,
 			"--coordinator-source",
-			path.join(previousBundle, "coordinator-source.json"),
+			path.join(priorBundle, "coordinator-source.json"),
 			"--coordinator-source-sha256",
 			coordinatorSha,
-			"--allow-initial",
-		]);
-		await fs.copyFile(
-			path.join(previousBundle, "signed-envelope.json"),
-			path.join(channelSeed, "signed-envelope.json"),
-		);
+		];
+		if (previousBundle) {
+			priorSignArgs.push(
+				"--previous-envelope",
+				path.join(previousBundle, "signed-envelope.json"),
+				"--trusted-key",
+				`fixture=${publicKeyPath}`,
+			);
+		} else priorSignArgs.push("--allow-initial");
+		script("autobot-release-sign.ts", priorSignArgs);
+		previousBundles.push(priorBundle);
+		previousBundle = priorBundle;
+	}
+	if (previousBundle) {
+		await fs.copyFile(path.join(previousBundle, "signed-envelope.json"), path.join(channelSeed, "signed-envelope.json"));
 		commit(channelSeed, "publish predecessor channel");
 		git(channelSeed, "push", "origin", "HEAD:refs/heads/main");
 	}
@@ -299,29 +311,33 @@ try {
 		target_commitish: forkCommit,
 		assets,
 	};
-	const releases = scenario === "fresh" ? [] : [draft];
+	const releases = scenario === "fresh" || scenario === "third-release-history" ? [] : [draft];
 	if (subsequent) {
-		if (!previousBundle) throw new Error("subsequent release fixture omitted its predecessor");
-		const previousAssets = path.join(root, "predecessor-assets");
-		await fs.mkdir(previousAssets);
-		for (const metadata of [
-			"manifest.json",
-			"asset-index.json",
-			"provenance.json",
-			"coordinator-source.json",
-			"signed-envelope.json",
-		]) {
-			await fs.copyFile(path.join(previousBundle, metadata), path.join(previousAssets, metadata));
+		for (let index = 0; index < previousBundles.length; index += 1) {
+			const priorSequence = index + 1;
+			const priorBundle = previousBundles[index];
+			if (!priorBundle) throw new Error(`release fixture omitted predecessor ${priorSequence}`);
+			const previousAssets = path.join(root, `predecessor-assets-${priorSequence}`);
+			await fs.mkdir(previousAssets);
+			for (const metadata of [
+				"manifest.json",
+				"asset-index.json",
+				"provenance.json",
+				"coordinator-source.json",
+				"signed-envelope.json",
+			]) {
+				await fs.copyFile(path.join(priorBundle, metadata), path.join(previousAssets, metadata));
+			}
+			for (const entry of await fs.readdir(path.join(priorBundle, "assets"))) {
+				await fs.copyFile(path.join(priorBundle, "assets", entry), path.join(previousAssets, entry));
+			}
+			releases.splice(index, 0, {
+				tag_name: `autobot-r${priorSequence}`,
+				draft: false,
+				target_commitish: forkCommit,
+				assets: previousAssets,
+			});
 		}
-		for (const entry of await fs.readdir(path.join(previousBundle, "assets"))) {
-			await fs.copyFile(path.join(previousBundle, "assets", entry), path.join(previousAssets, entry));
-		}
-		releases.splice(0, releases.length, {
-			tag_name: "autobot-r1",
-			draft: false,
-			target_commitish: forkCommit,
-			assets: previousAssets,
-		});
 	}
 	const state = {
 		releases,
@@ -342,6 +358,14 @@ try {
 	if (scenario === "recovery-foreign-release") {
 		releases.push({
 			tag_name: "autobot-r2",
+			draft: false,
+			target_commitish: forkCommit,
+			assets,
+		});
+	}
+	if (scenario === "third-release-future") {
+		releases.push({
+			tag_name: "autobot-r4",
 			draft: false,
 			target_commitish: forkCommit,
 			assets,
@@ -378,8 +402,10 @@ try {
 	}
 	await write(statePath, JSON.stringify(state));
 	if (subsequent) {
-		git(source, "tag", "autobot-r1", forkCommit);
-		git(source, "push", "origin", "refs/tags/autobot-r1:refs/tags/autobot-r1");
+		for (let priorSequence = 1; priorSequence < releaseSequence; priorSequence += 1) {
+			git(source, "tag", `autobot-r${priorSequence}`, forkCommit);
+			git(source, "push", "origin", `refs/tags/autobot-r${priorSequence}:refs/tags/autobot-r${priorSequence}`);
+		}
 	} else if (scenario === "matching") {
 		// Deliberately absent: a GitHub draft does not create a Git tag.
 	} else if (scenario === "conflicting-tag") {
@@ -412,7 +438,7 @@ try {
 	}
 	process.env.HOME = root;
 	process.env.USERPROFILE = root;
-	if (subsequent) {
+	if (scenario === "subsequent-autocrlf") {
 		if (!previousBundle) throw new Error("subsequent release fixture omitted its predecessor");
 		const checkoutProbe = path.join(root, "autocrlf-checkout");
 		git(root, "clone", "--depth=1", "--branch", "main", channelGit, checkoutProbe);
@@ -519,10 +545,12 @@ try {
 		"recovery-wrong-target",
 		"recovery-draft",
 		"recovery-foreign-release",
+		"third-release-future",
 	].includes(scenario);
 	if (rejecting) {
 		if (!failure) throw new Error(`${scenario} unexpectedly published`);
-		if (!recovery && !finalState.releases[0]?.draft) throw new Error(`${scenario} changed draft state`);
+		if (!recovery && !finalState.releases.find(release => release.tag_name === tag)?.draft)
+			throw new Error(`${scenario} changed draft state`);
 		if (git(channelGit, "rev-parse", "refs/heads/main") !== beforeChannel)
 			throw new Error(`${scenario} changed channel`);
 		if (finalState.log.some(value => value.startsWith("publish:"))) throw new Error(`${scenario} published draft`);
@@ -535,7 +563,7 @@ try {
 		if (scenario === "recovery-complete" && JSON.stringify(finalState.releases) !== recoveryReleaseState) {
 			throw new Error("completed publication recovery changed observable release metadata or assets");
 		}
-		const expectedReleaseCount = subsequent ? 2 : 1;
+		const expectedReleaseCount = releaseSequence;
 		if (
 			finalState.releases.length !== expectedReleaseCount ||
 			finalState.releases.at(-1)?.tag_name !== tag ||
@@ -599,7 +627,9 @@ try {
 			record =>
 				forbidden[record.commandKind] &&
 				!(
-					(scenario === "fresh" || scenario === "subsequent-autocrlf") &&
+					(scenario === "fresh" ||
+						scenario === "subsequent-autocrlf" ||
+						scenario === "third-release-history") &&
 					record.commandKind === "github-release-upload"
 				),
 		)
