@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- Reduced Windows managed-launcher startup delays by batching lock-storage permission checks while preserving fresh ownership, ACL, and reparse-point validation across transaction boundaries.
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
 
