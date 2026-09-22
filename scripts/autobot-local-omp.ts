@@ -9,7 +9,8 @@ import {
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { parseRepairIntent } from "./autobot-publication-boundary.ts";
 import type { RepairIntent } from "./autobot-publication-boundary.ts";
-import type { LocalAutomationConfig } from "./autobot-local-types.ts";
+import { REPAIRABLE_STEP_IDS, REPAIRABLE_STEP_SOURCE_PATHS } from "./autobot-local-types.ts";
+import type { FailedStepContext, LocalAutomationConfig, RepairableStepId } from "./autobot-local-types.ts";
 import type { LocalCommandRecorder } from "./autobot-local.ts";
 
 export interface LocalOmpRequest {
@@ -19,6 +20,7 @@ export interface LocalOmpRequest {
 	readonly upstreamCommit: string;
 	readonly sensitivePaths: readonly string[];
 	readonly diagnostics?: string;
+	readonly failedStepContext?: FailedStepContext;
 }
 
 export interface LocalOmpResult {
@@ -510,6 +512,39 @@ function normalizedAffectedPaths(value: unknown): string[] {
 	return [...new Set(value.map(normalizeAffectedPath))].sort();
 }
 
+function validatedFailedStepContext(request: LocalOmpRequest): FailedStepContext | null {
+	const value: unknown = request.failedStepContext;
+	if (request.reason !== "build-failure") {
+		if (value !== undefined) throw new Error("Local OMP request contains unexpected failed-step context");
+		return null;
+	}
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("Local OMP build repair requires failed-step context");
+	}
+	const keys = Object.keys(value);
+	if (
+		keys.length !== 2 ||
+		!keys.includes("stepId") ||
+		!keys.includes("permittedSourcePaths")
+	) {
+		throw new Error("Local OMP failed-step context contains invalid fields");
+	}
+	const candidate = value as { readonly stepId?: unknown; readonly permittedSourcePaths?: unknown };
+	if (!REPAIRABLE_STEP_IDS.some(stepId => stepId === candidate.stepId)) {
+		throw new Error("Local OMP failed-step context contains an invalid step identity");
+	}
+	const stepId = candidate.stepId as RepairableStepId;
+	const expectedSourcePaths = REPAIRABLE_STEP_SOURCE_PATHS[stepId];
+	if (
+		!Array.isArray(candidate.permittedSourcePaths) ||
+		candidate.permittedSourcePaths.length !== expectedSourcePaths.length ||
+		candidate.permittedSourcePaths.some((sourcePath, index) => sourcePath !== expectedSourcePaths[index])
+	) {
+		throw new Error("Local OMP failed-step context contains an invalid source scope");
+	}
+	return { stepId, permittedSourcePaths: expectedSourcePaths };
+}
+
 function sanitizeDiagnostics(value: unknown): string | undefined {
 	if (value === undefined || value === "") return undefined;
 	if (typeof value !== "string") throw new Error("Local OMP request contains invalid diagnostics");
@@ -548,6 +583,7 @@ function privateContextContents(
 	request: LocalOmpRequest,
 	context: Pick<PrivateContext, "intentNonce" | "intentPath" | "scratchDirectory">,
 	compatibilityEvidence: CompatibilityEvidence | null,
+	failedStepContext: FailedStepContext | null,
 ): string {
 	if (request.reason !== "conflicts" && request.reason !== "compatibility" && request.reason !== "build-failure") {
 		throw new Error("Local OMP request contains an invalid reason");
@@ -561,9 +597,10 @@ function privateContextContents(
 				reason: request.reason,
 				forkCommit: requireCommit(request.forkCommit),
 				upstreamCommit: requireCommit(request.upstreamCommit),
-				affectedPaths,
+				affectedPaths: request.reason === "build-failure" ? [] : affectedPaths,
 				diagnostics: sanitizeDiagnostics(request.diagnostics) ?? null,
 				compatibilityEvidence,
+				failedStepContext,
 				repairIntent: {
 					schemaVersion: 1,
 					path: context.intentPath,
@@ -582,6 +619,7 @@ async function createPrivateContext(
 	workRoot: string,
 	request: LocalOmpRequest,
 	compatibilityEvidence: CompatibilityEvidence | null,
+	failedStepContext: FailedStepContext | null,
 ): Promise<PrivateContext> {
 	let directory: string | undefined;
 	try {
@@ -594,7 +632,12 @@ async function createPrivateContext(
 		const contextPath = path.join(directory, "context.md");
 		await fs.writeFile(
 			contextPath,
-			privateContextContents(request, { intentNonce, intentPath, scratchDirectory }, compatibilityEvidence),
+			privateContextContents(
+				request,
+				{ intentNonce, intentPath, scratchDirectory },
+				compatibilityEvidence,
+				failedStepContext,
+			),
 			{
 				encoding: "utf8",
 				mode: 0o600,
@@ -829,6 +872,7 @@ export async function runLocalOmp(
 	if (process.platform !== "win32" || process.arch !== "x64") {
 		throw new Error("Local OMP automation supports Windows x64 only");
 	}
+	const failedStepContext = validatedFailedStepContext(request);
 	const worktree = await ownedWorktree(config.workRoot, request.cwd);
 	const executable = await requireRegularFile(config.ompExecutable, "Local OMP executable is unavailable");
 	await requireRegularFile(presetPath, "Local OMP integration preset is unavailable");
@@ -841,7 +885,7 @@ export async function runLocalOmp(
 		request.reason === "compatibility"
 			? await deriveCompatibilityEvidence(worktree, normalizedForkCommit, normalizedUpstreamCommit, affectedPaths)
 			: null;
-	const context = await createPrivateContext(config.workRoot, request, compatibilityEvidence);
+	const context = await createPrivateContext(config.workRoot, request, compatibilityEvidence, failedStepContext);
 	let result: LocalOmpResult | undefined;
 	let failure: Error | undefined;
 	try {

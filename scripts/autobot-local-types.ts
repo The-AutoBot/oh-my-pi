@@ -54,3 +54,48 @@ export interface LocalCandidate {
 	readonly changed: boolean;
 	readonly sensitivePaths: readonly string[];
 }
+
+export const REPAIRABLE_STEP_IDS = [
+	"browser-relay-build",
+	"browser-relay-output",
+	"collab-web-build",
+	"runtime-compilation",
+	"runtime-output",
+	"runtime-version-check",
+	"runtime-application-check",
+	"runtime-smoke-test",
+	"runtime-identity-check",
+	"bootstrap-compilation",
+	"bootstrap-output",
+	"collab-web-bundle-identity",
+	"collab-web-packaging",
+] as const;
+
+/** Closed identities for application build and smoke steps eligible for source repair. */
+export type RepairableStepId = (typeof REPAIRABLE_STEP_IDS)[number];
+
+/**
+ * Controller-derived source boundary for one failed application step.
+ * It never carries commands or permission to skip or resume pipeline steps.
+ */
+export interface FailedStepContext {
+	readonly stepId: RepairableStepId;
+	readonly permittedSourcePaths: readonly string[];
+}
+
+/** The only application source roots a failed step can authorize for repair. */
+export const REPAIRABLE_STEP_SOURCE_PATHS: Readonly<Record<RepairableStepId, readonly string[]>> = Object.freeze({
+	"browser-relay-build": Object.freeze(["packages/browser-relay/extension"]),
+	"browser-relay-output": Object.freeze(["packages/browser-relay/extension"]),
+	"collab-web-build": Object.freeze(["packages/collab-web/src", "packages/collab-web/public"]),
+	"runtime-compilation": Object.freeze(["packages/coding-agent/src"]),
+	"runtime-output": Object.freeze(["packages/coding-agent/src"]),
+	"runtime-version-check": Object.freeze(["packages/coding-agent/src"]),
+	"runtime-application-check": Object.freeze(["packages/coding-agent/src"]),
+	"runtime-smoke-test": Object.freeze(["packages/coding-agent/src"]),
+	"runtime-identity-check": Object.freeze(["packages/coding-agent/src"]),
+	"bootstrap-compilation": Object.freeze(["packages/coding-agent/src"]),
+	"bootstrap-output": Object.freeze(["packages/coding-agent/src"]),
+	"collab-web-bundle-identity": Object.freeze(["packages/collab-web/src", "packages/collab-web/public"]),
+	"collab-web-packaging": Object.freeze(["packages/collab-web/src", "packages/collab-web/public"]),
+});

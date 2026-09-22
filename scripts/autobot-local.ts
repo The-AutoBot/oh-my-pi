@@ -63,13 +63,25 @@ import {
 	redactSensitiveCommandOutput,
 } from "./autobot-local-release.ts";
 import type { CommandOutputRedactionPolicy, CompletedLocalReleaseIdentity } from "./autobot-local-release.ts";
+import { REPAIRABLE_STEP_SOURCE_PATHS } from "./autobot-local-types.ts";
 import type {
 	EffectiveUpstreamBase,
+	FailedStepContext,
 	LocalAutomationConfig,
 	LocalCandidate,
 	ObservedOfficialUpstreamRelease,
 	OfficialUpstreamRelease,
+	RepairableStepId,
 } from "./autobot-local-types.ts";
+
+const REPAIR_PROTECTED_SOURCE_COMPONENT = /(?:^|[-_.])(?:provenance|trust|manifest)(?:[-_.]|$)/i;
+const REPAIR_PROTECTED_SOURCE_PREFIXES = [
+	"packages/coding-agent/src/autobot-update",
+	"packages/coding-agent/src/security",
+	"packages/coding-agent/src/autobot-bootstrap.ts",
+	"packages/coding-agent/src/autobot-runtime.ts",
+	"packages/coding-agent/src/session/acp-permission-gate.ts",
+] as const;
 
 const CANONICAL_REPOSITORY = "The-AutoBot/oh-my-pi";
 const CONFIG_SCHEMA_VERSION = 1 as const;
@@ -274,6 +286,51 @@ export function hasRetainedPublishedCheckpoint(
 	return publishedForkCommit !== undefined && publishedForkCommit === observedCommit;
 }
 
+
+/** Derive the immutable application-source boundary for one repairable failed step. */
+export function deriveFailedStepContext(stepId: RepairableStepId): FailedStepContext {
+	if (!Object.prototype.hasOwnProperty.call(REPAIRABLE_STEP_SOURCE_PATHS, stepId)) {
+		throw new AutoBotReleaseError("Local build failure has an unknown repairable step identity");
+	}
+	return Object.freeze({
+		stepId,
+		permittedSourcePaths: REPAIRABLE_STEP_SOURCE_PATHS[stepId],
+	});
+}
+
+/** Reject a declared build repair that is not source-local to its failed application step. */
+export function assertBuildRepairScope(intent: RepairIntent, context: FailedStepContext): void {
+	const expectedScope = Object.prototype.hasOwnProperty.call(REPAIRABLE_STEP_SOURCE_PATHS, context.stepId)
+		? REPAIRABLE_STEP_SOURCE_PATHS[context.stepId]
+		: undefined;
+	if (
+		expectedScope === undefined ||
+		expectedScope.length !== context.permittedSourcePaths.length ||
+		expectedScope.some((pathname, index) => context.permittedSourcePaths[index] !== pathname)
+	) {
+		throw new AutoBotReleaseError("Local build repair has an unknown or invalid failed-step source scope");
+	}
+	for (const pathname of intent.paths) {
+		const components = pathname.split("/");
+		const forbidden =
+			pathname.startsWith("scripts/autobot-") ||
+			pathname.startsWith("crates/") ||
+			pathname.startsWith("packages/natives/") ||
+			pathname.startsWith(".github/") ||
+			REPAIR_PROTECTED_SOURCE_PREFIXES.some(
+				protectedPath => pathname === protectedPath || pathname.startsWith(`${protectedPath}/`),
+			) ||
+			components.some(component => REPAIR_PROTECTED_SOURCE_COMPONENT.test(component));
+		const permitted = expectedScope.some(
+			sourcePath => pathname === sourcePath || pathname.startsWith(`${sourcePath}/`),
+		);
+		if (forbidden || !permitted) {
+			throw new AutoBotReleaseError(
+				`Local build repair path is outside the failed-step application source scope: ${pathname}`,
+			);
+		}
+	}
+}
 export async function assertRecoverableIntegrationHistory(
 	checkpointCommit: string,
 	targetCommit: string,
@@ -367,12 +424,18 @@ interface ManagedWorktree {
 	readonly initialized: boolean;
 }
 
+interface TrustedProducer {
+	readonly root: string;
+	readonly commit: string;
+}
+
 interface RemoteSnapshot {
 	readonly refs: ReadonlyMap<string, string>;
 }
 
 interface OmpControllerContext {
 	readonly config: LocalAutomationConfig;
+	readonly producer: TrustedProducer;
 	readonly worktree: string;
 	readonly localRef: string;
 	readonly canonicalRepository: string;
@@ -592,16 +655,34 @@ function localIntegrationBranch(integrationBranch: string): string {
 	return `autobot-local/${integrationBranch}`;
 }
 
-async function trustedProducer(): Promise<{ readonly root: string; readonly commit: string }> {
+async function assertTrustedProducerUnchanged(producer: TrustedProducer): Promise<void> {
+	const actualRoot = await fs.realpath(await gitOutput(producer.root, ["rev-parse", "--show-toplevel"]));
+	const currentCommit = requireCommit(
+		await gitOutput(producer.root, ["rev-parse", "--verify", "HEAD^{commit}"]),
+		"Trusted producer HEAD",
+	);
+	const trackedStatus = await gitOutput(producer.root, [
+		"status",
+		"--porcelain=v1",
+		"--untracked-files=no",
+	]);
+	if (!samePath(producer.root, actualRoot) || currentCommit !== producer.commit || trackedStatus !== "") {
+		throw new AutoBotReleaseError("Trusted producer checkout changed or has uncommitted tracked changes");
+	}
+}
+
+async function trustedProducer(): Promise<TrustedProducer> {
 	const root = await fs.realpath(path.resolve(import.meta.dir, ".."));
 	const actual = await fs.realpath(await gitOutput(root, ["rev-parse", "--show-toplevel"]));
 	if (!samePath(root, actual)) {
 		throw new AutoBotReleaseError("Local controller must run from its trusted producer repository root");
 	}
-	return {
+	const producer = {
 		root,
 		commit: requireCommit(await gitOutput(root, ["rev-parse", "--verify", "HEAD^{commit}"]), "Trusted producer HEAD"),
 	};
+	await assertTrustedProducerUnchanged(producer);
+	return producer;
 }
 
 async function loadLocalAutomationConfig(configPath: string, producerRoot: string): Promise<LocalAutomationConfig> {
@@ -1756,7 +1837,9 @@ async function invokeOmpGuarded(
 	reason: "conflicts" | "compatibility" | "build-failure",
 	sensitivePaths: readonly string[],
 	diagnostics: string | undefined,
+	failedStepContext?: FailedStepContext,
 ): Promise<RepairIntent> {
+	await assertTrustedProducerUnchanged(context.producer);
 	const beforeHead = await currentCommit(context.worktree, "Pre-OMP integration HEAD");
 	const localRefs = await snapshotLocalRefs(context.worktree);
 	const remoteRefs = await snapshotRemoteRefs(context.canonicalRepository);
@@ -1770,20 +1853,28 @@ async function invokeOmpGuarded(
 	let repairIntent: RepairIntent | undefined;
 	let ompError: unknown;
 	try {
-		repairIntent = (
-			await runLocalOmp(
-				context.config,
-				{
-					cwd: context.worktree,
-					reason,
-					forkCommit: beforeHead,
-					upstreamCommit: context.expectedUpstreamCommit,
-					sensitivePaths,
-					diagnostics,
-				},
-				context.commandRecorder,
-			)
-		).repairIntent;
+		const result = await runLocalOmp(
+			context.config,
+			{
+				cwd: context.worktree,
+				reason,
+				forkCommit: beforeHead,
+				upstreamCommit: context.expectedUpstreamCommit,
+				sensitivePaths,
+				diagnostics,
+				failedStepContext,
+			},
+			context.commandRecorder,
+		);
+		repairIntent = result.repairIntent;
+		if (reason === "build-failure") {
+			if (failedStepContext === undefined) {
+				throw new AutoBotReleaseError("Local build repair is missing its failed-step source scope");
+			}
+			assertBuildRepairScope(repairIntent, failedStepContext);
+		} else if (failedStepContext !== undefined) {
+			throw new AutoBotReleaseError("Non-build OMP invocation cannot carry failed-step source scope");
+		}
 	} catch (error) {
 		ompError = error;
 	}
@@ -1796,6 +1887,7 @@ async function invokeOmpGuarded(
 		await assertLocalRefsUnchanged(context.worktree, localRefs, context.localRef, beforeHead);
 		assertRemoteSnapshotsEqual(remoteRefs, await snapshotRemoteRefs(context.canonicalRepository));
 		if (reason !== "conflicts") await assertNoForbiddenWorktreeResidue(context.worktree);
+		await assertTrustedProducerUnchanged(context.producer);
 	} catch (error) {
 		postconditionError = error;
 	}
@@ -1982,6 +2074,7 @@ async function measureLocalOperation<T>(
 
 async function prepareCandidate(
 	config: LocalAutomationConfig,
+	producer: TrustedProducer,
 	managed: ManagedWorktree,
 	canonicalRepository: string,
 	canonicalRef: string,
@@ -2001,6 +2094,7 @@ async function prepareCandidate(
 	let currentHead = await currentCommit(managed.worktree, "Initial local integration HEAD");
 	const initialHead = currentHead;
 	const context = (): OmpControllerContext => ({
+		producer,
 		config,
 		worktree: managed.worktree,
 		localRef: managed.localRef,
@@ -2432,6 +2526,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			});
 			const expectedIntegrationCommit = await pushIntegrationBranch(
 				{
+					producer,
 					config,
 					worktree: managed.worktree,
 					localRef: managed.localRef,
@@ -2501,6 +2596,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 		if (!(await isAncestor(managed.worktree, producer.commit, currentHead))) {
 			await setPhase("synchronizing");
 			const producerContext: OmpControllerContext = {
+				producer,
 				config,
 				worktree: managed.worktree,
 				localRef: managed.localRef,
@@ -2531,6 +2627,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 		const prepared = await measureLocalOperation(commandRecorder, "source-synchronization", true, () =>
 			prepareCandidate(
 				config,
+				producer,
 				managed,
 				canonicalRepository,
 				canonicalRef,
@@ -2608,6 +2705,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 		});
 		let expectedIntegrationCommit = await pushIntegrationBranch(
 			{
+				producer,
 				config,
 				worktree: managed.worktree,
 				localRef: managed.localRef,
@@ -2670,6 +2768,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				return;
 			} catch (error) {
 				if (!(error instanceof LocalBuildFailure)) throw error;
+				const failedStepContext = deriveFailedStepContext(error.stepId);
 				const fingerprint = buildFailureFingerprint(publishCandidate);
 				const previousAttempts = state.buildFailure?.fingerprint === fingerprint ? state.buildFailure.attempts : 0;
 				if (previousAttempts >= config.maxOmpAttempts || ompAttempts.value >= config.maxOmpAttempts) {
@@ -2684,6 +2783,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				const repairBase = publishCandidate.forkCommit;
 				const repairIntent = await invokeOmpGuarded(
 					{
+						producer,
 						config,
 						worktree: managed.worktree,
 						localRef: managed.localRef,
@@ -2700,6 +2800,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					"build-failure",
 					publishCandidate.sensitivePaths,
 					error.diagnostics,
+					failedStepContext,
 				);
 				const repairedHead = await commitPendingChanges(
 					managed.worktree,
@@ -2747,6 +2848,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					const beforeReview = publishCandidate.forkCommit;
 					const repairIntent = await invokeOmpGuarded(
 						{
+							producer,
 							config,
 							worktree: managed.worktree,
 							localRef: managed.localRef,
@@ -2805,6 +2907,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				});
 				expectedIntegrationCommit = await pushIntegrationBranch(
 					{
+						producer,
 						config,
 						worktree: managed.worktree,
 						localRef: managed.localRef,

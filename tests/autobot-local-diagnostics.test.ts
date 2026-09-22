@@ -293,7 +293,7 @@ test("flushes nested orchestration and prior persistence timings as bounded aggr
 		failureCount: 1,
 		nested: true,
 	});
-});
+}, FAILED_COMMAND_TIMEOUT_MS);
 
 if (process.platform === "win32" && process.arch === "x64") {
 	test(
@@ -346,6 +346,10 @@ if (process.platform === "win32" && process.arch === "x64") {
 						forkCommit: "a".repeat(40),
 						upstreamCommit: "b".repeat(40),
 						sensitivePaths: [],
+						failedStepContext: {
+							stepId: "runtime-compilation",
+							permittedSourcePaths: ["packages/coding-agent/src"],
+						},
 					},
 					recorder,
 				),
@@ -367,6 +371,124 @@ if (process.platform === "win32" && process.arch === "x64") {
 				timedOut: true,
 				durationMs: expect.any(Number),
 			});
+		},
+		OMP_PROCESS_TIMEOUT_MS,
+	);
+	test(
+		"rejects invalid failed-step authority before launch and passes only the validated identity and source scope",
+		async () => {
+			const workRoot = await createPrivateRoot();
+			const worktree = path.join(workRoot, "worktree");
+			await fs.mkdir(worktree);
+			const capturePath = path.join(workRoot, "captured-build-context.json");
+			const wrapperScript = path.join(workRoot, "capture-build-context.ts");
+			await fs.writeFile(
+				wrapperScript,
+				[
+					'import * as fs from "node:fs/promises";',
+					"const contextArgument = process.argv.find(value => value.startsWith('@') && value.endsWith('context.md'));",
+					"if (contextArgument === undefined) process.exit(2);",
+					"const text = await fs.readFile(contextArgument.slice(1), 'utf8');",
+					"const context = JSON.parse(text.slice(text.indexOf('\\n') + 1));",
+					`await fs.writeFile(${JSON.stringify(capturePath)}, JSON.stringify(context));`,
+					"await fs.writeFile(context.repairIntent.path, JSON.stringify({ schemaVersion: 1, nonce: context.repairIntent.nonce, paths: [] }));",
+				].join("\n"),
+			);
+			const wrapper = path.join(workRoot, "capture-build-context.cmd");
+			await fs.writeFile(wrapper, `@echo off\r\n"${process.execPath}" "${wrapperScript}" %*\r\n`, "utf8");
+			const recorder = await createLocalCommandRecorder(workRoot);
+			const config: LocalAutomationConfig = {
+				schemaVersion: 1,
+				repository: "The-AutoBot/oh-my-pi",
+				canonicalBranch: "main",
+				integrationBranch: "autobot-local",
+				upstreamRepository: "https://github.com/example/upstream.git",
+				upstreamRef: "latest-release",
+				workRoot,
+				runnerBun: process.execPath,
+				runnerBunVersion: "0.0.0",
+				compilerBun: process.execPath,
+				compilerBunVersion: "0.0.0",
+				nativeAddonDirectory: workRoot,
+				nativeAddonProvenanceSha256: "a".repeat(64),
+				ompExecutable: wrapper,
+				coordinatorRoot: workRoot,
+				keyId: "test-key",
+				privateKeyPath: wrapper,
+				publicKeyPath: wrapper,
+				channelRepository: "The-AutoBot/channel",
+				channelBranch: "main",
+				channelPath: "signed-envelope.json",
+				allowInitial: false,
+				maxOmpAttempts: 1,
+				ompMaxTime: "30s",
+			};
+			const request = {
+				cwd: worktree,
+				reason: "build-failure" as const,
+				forkCommit: "a".repeat(40),
+				upstreamCommit: "b".repeat(40),
+				sensitivePaths: ["unrelated/general-repair-brief.ts"],
+			};
+			const invalidContexts: unknown[] = [
+				undefined,
+				{ stepId: "unknown-step", permittedSourcePaths: ["packages/coding-agent/src"] },
+				{ stepId: "runtime-compilation", permittedSourcePaths: ["packages/unknown/src"] },
+				{
+					stepId: "runtime-compilation",
+					permittedSourcePaths: ["packages/coding-agent/src"],
+					command: ["bun", "run", "build"],
+				},
+			];
+			for (const failedStepContext of invalidContexts) {
+				await expect(
+					runLocalOmp(
+						config,
+						{ ...request, failedStepContext } as Parameters<typeof runLocalOmp>[1],
+						recorder,
+					),
+				).rejects.toThrow();
+				await expect(fs.stat(capturePath)).rejects.toThrow();
+			}
+			await expect(
+				runLocalOmp(
+					config,
+					{
+						...request,
+						reason: "compatibility",
+						failedStepContext: {
+							stepId: "runtime-compilation",
+							permittedSourcePaths: ["packages/coding-agent/src"],
+						},
+					},
+					recorder,
+				),
+			).rejects.toThrow();
+			await expect(fs.stat(capturePath)).rejects.toThrow();
+
+			await expect(
+				runLocalOmp(
+					config,
+					{
+						...request,
+						failedStepContext: {
+							stepId: "runtime-compilation",
+							permittedSourcePaths: ["packages/coding-agent/src"],
+						},
+					},
+					recorder,
+				),
+			).resolves.toEqual({ repairIntent: { paths: [] } });
+			const context = JSON.parse(await fs.readFile(capturePath, "utf8"));
+			expect(context.failedStepContext).toEqual({
+				stepId: "runtime-compilation",
+				permittedSourcePaths: ["packages/coding-agent/src"],
+			});
+			expect(context.affectedPaths).toEqual([]);
+			expect(context.failedStepContext).not.toHaveProperty("command");
+			expect(context.failedStepContext).not.toHaveProperty("argv");
+			expect(context.failedStepContext).not.toHaveProperty("continuation");
+			expect(context.failedStepContext).not.toHaveProperty("skipChecks");
 		},
 		OMP_PROCESS_TIMEOUT_MS,
 	);

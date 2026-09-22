@@ -7,7 +7,16 @@ param(
     [string]$ConfigPath,
 
     [ValidateNotNullOrEmpty()]
-    [string]$BunPath
+    [string]$BunPath,
+
+    [ValidateRange(0, 59)]
+    [int]$Minute = 17,
+
+    [ValidateRange(0, 23)]
+    [int]$Hour = 21,
+
+    [ValidateSet("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")]
+    [string]$DayOfWeek = "Friday"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,8 +25,11 @@ if ($PSVersionTable.PSVersion -lt [version]"5.1") {
     throw "Windows PowerShell 5.1 or newer is required."
 }
 
-if ($null -eq (Get-Command -Name Register-ScheduledTask -ErrorAction SilentlyContinue)) {
-    throw "Windows Task Scheduler cmdlets are unavailable."
+$requiredTaskSchedulerCommands = @("Register-ScheduledTask", "Set-ScheduledTask")
+foreach ($requiredCommand in $requiredTaskSchedulerCommands) {
+    if ($null -eq (Get-Command -Name $requiredCommand -ErrorAction SilentlyContinue)) {
+        throw "Windows Task Scheduler cmdlets are unavailable."
+    }
 }
 
 function Resolve-ExistingFile {
@@ -104,20 +116,12 @@ $windowsPowerShellPath = Resolve-ExistingFile -Path (Join-Path -Path $env:WINDIR
 $arguments = '-NoProfile -NonInteractive -File "{0}" -ConfigPath "{1}"' -f $launcherPath, $resolvedConfigPath
 $action = New-ScheduledTaskAction -Execute $windowsPowerShellPath -Argument $arguments -WorkingDirectory $repoRoot
 
-# The daily trigger plus its one-day repetition pattern produces one run per
-# hour indefinitely while retaining the Task Scheduler calendar semantics.
-$now = Get-Date
-$firstRun = $now.Date.AddHours($now.Hour).AddMinutes(17)
-if ($firstRun -le $now) {
-    $firstRun = $firstRun.AddHours(1)
-}
-$trigger = New-ScheduledTaskTrigger -Daily -At $firstRun -DaysInterval 1
-$repetition = New-CimInstance -Namespace "Root/Microsoft/Windows/TaskScheduler" -ClassName "MSFT_TaskRepetitionPattern" -ClientOnly -Property @{
-    Interval = "PT1H"
-    Duration = "P1D"
-    StopAtDurationEnd = $false
-}
-$trigger.CimInstanceProperties["Repetition"].Value = $repetition
+$triggerTime = [datetime]::Today.AddHours($Hour).AddMinutes($Minute)
+$trigger = New-ScheduledTaskTrigger `
+    -Weekly `
+    -WeeksInterval 1 `
+    -DaysOfWeek $DayOfWeek `
+    -At $triggerTime
 
 $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 try {
@@ -135,7 +139,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
-    -RestartCount 0
+    -RestartCount 0 `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 72)
 
 $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue
 $isUpdate = $null -ne $existingTask
@@ -143,20 +148,23 @@ if ($isUpdate -and -not (Test-ExactOwnedAction -Task $existingTask -Execute $win
     throw "AutoBot Local Build already exists with a different action. Refusing to overwrite it."
 }
 
-$registration = @{
-    TaskName = $taskName
-    TaskPath = $taskPath
-    Action = $action
-    Trigger = $trigger
-    Settings = $settings
-    Principal = $principal
-    ErrorAction = "Stop"
-}
-
 try {
     if ($isUpdate) {
-        Register-ScheduledTask @registration -Force | Out-Null
+        Set-ScheduledTask `
+            -TaskName $taskName `
+            -TaskPath $taskPath `
+            -Trigger $trigger `
+            -ErrorAction Stop | Out-Null
     } else {
+        $registration = @{
+            TaskName = $taskName
+            TaskPath = $taskPath
+            Action = $action
+            Trigger = $trigger
+            Settings = $settings
+            Principal = $principal
+            ErrorAction = "Stop"
+        }
         Register-ScheduledTask @registration | Out-Null
     }
 } catch {

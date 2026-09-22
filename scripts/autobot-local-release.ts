@@ -48,7 +48,7 @@ import {
 } from "./autobot-release-coordinator.ts";
 import { assertCompleteAutoBotReleaseTopology } from "./autobot-release-topology.ts";
 import { createManagedBundle, deriveManagedBundleId } from "./autobot-release-web.ts";
-import type { LocalAutomationConfig, LocalCandidate } from "./autobot-local-types.ts";
+import type { LocalAutomationConfig, LocalCandidate, RepairableStepId } from "./autobot-local-types.ts";
 import type { LocalCommandKind, LocalCommandRecorder } from "./autobot-local.ts";
 
 const RELEASE_REPOSITORY = "The-AutoBot/oh-my-pi";
@@ -75,11 +75,13 @@ const CANDIDATE_AUTOLOAD_NAME =
 
 /** An application asset build or executable smoke failure that may be repaired in the isolated candidate worktree. */
 export class LocalBuildFailure extends Error {
+	public readonly stepId: RepairableStepId;
 	public readonly diagnostics: string;
 
-	public constructor(diagnostics: string, options?: ErrorOptions) {
-		super(`Local application build/smoke failed: ${diagnostics}`, options);
+	public constructor(stepId: RepairableStepId, diagnostics: string, options?: ErrorOptions) {
+		super(`Local application build/smoke failed at ${stepId}: ${diagnostics}`, options);
 		this.name = "LocalBuildFailure";
+		this.stepId = stepId;
 		this.diagnostics = diagnostics;
 	}
 }
@@ -827,12 +829,16 @@ function requireCandidate(candidate: LocalCandidate): void {
 	}
 }
 
-async function candidateBuildStage<T>(diagnostics: string, action: () => Promise<T>): Promise<T> {
+async function candidateBuildStage<T>(
+	stepId: RepairableStepId,
+	diagnostics: string,
+	action: () => Promise<T>,
+): Promise<T> {
 	try {
 		return await action();
 	} catch (error) {
 		if (error instanceof LocalBuildFailure) throw error;
-		if (error instanceof CommandExitError) throw new LocalBuildFailure(diagnostics, { cause: error });
+		if (error instanceof CommandExitError) throw new LocalBuildFailure(stepId, diagnostics, { cause: error });
 		throw error;
 	}
 }
@@ -1843,7 +1849,7 @@ async function buildCandidateAssets(
 	const inputs = path.join(stageRoot, "i");
 	await fs.mkdir(inputs);
 	await qualifyNativeLoader(config, sourceRoot, stageRoot, compilerCommandEnvironment, recorder);
-	await candidateBuildStage("Browser relay build failed", () =>
+	await candidateBuildStage("browser-relay-build", "Browser relay build failed", () =>
 		runQuiet(
 			recorder,
 			"browser-relay-build",
@@ -1856,7 +1862,7 @@ async function buildCandidateAssets(
 			},
 		),
 	);
-	await candidateBuildStage("Browser relay build did not produce its required embedded assets", async () => {
+	await candidateBuildStage("browser-relay-output", "Browser relay build did not produce its required embedded assets", async () => {
 		await Promise.all([
 			requireRegularFile(
 				path.join(sourceRoot, "packages", "browser-relay", "dist", "omp-browser-relay-extension.zip"),
@@ -1878,7 +1884,7 @@ async function buildCandidateAssets(
 			),
 		]);
 	});
-	await candidateBuildStage("Collab web build failed", () =>
+	await candidateBuildStage("collab-web-build", "Collab web build failed", () =>
 		runQuiet(
 			recorder,
 			"collab-web-build",
@@ -1895,7 +1901,7 @@ async function buildCandidateAssets(
 		...compilerCommandEnvironment,
 		OMP_AUTOBOT_BUILD_IDENTITY: JSON.stringify(identity),
 	};
-	await candidateBuildStage("Windows x64 runtime compilation failed", () =>
+	await candidateBuildStage("runtime-compilation", "Windows x64 runtime compilation failed", () =>
 		runQuiet(
 			recorder,
 			"runtime-compilation",
@@ -1906,7 +1912,7 @@ async function buildCandidateAssets(
 	);
 	const builtRuntime = path.join(sourceRoot, "packages", "coding-agent", "binaries", "omp-windows-x64.exe");
 	const runtime = path.join(inputs, "omp-win32-x64.exe");
-	await candidateBuildStage("Windows x64 runtime output was not produced", async () => {
+	await candidateBuildStage("runtime-output", "Windows x64 runtime output was not produced", async () => {
 		await requireRegularFile(builtRuntime, "Windows x64 runtime");
 		await fs.copyFile(builtRuntime, runtime, fsConstants.COPYFILE_EXCL);
 	});
@@ -1916,13 +1922,16 @@ async function buildCandidateAssets(
 			...(await createPrivateCommandEnvironment(smokeRoot, candidateEnvironment)),
 			PI_NATIVE_VARIANT: "baseline",
 		};
-		const reportedVersion = await candidateBuildStage("Windows x64 runtime --version check failed", () =>
+		const reportedVersion = await candidateBuildStage("runtime-version-check", "Windows x64 runtime --version check failed", () =>
 			runText("Windows x64 runtime version check", [runtime, "--version"], { env: smokeEnvironment }),
 		);
 		if (reportedVersion.trim() !== `omp/${candidate.upstreamVersion}`) {
-			throw new LocalBuildFailure("Windows x64 runtime version does not match the approved upstream version");
+			throw new LocalBuildFailure(
+				"runtime-version-check",
+				"Windows x64 runtime version does not match the approved upstream version",
+			);
 		}
-		await candidateBuildStage("Windows x64 compiled application check failed", () =>
+		await candidateBuildStage("runtime-application-check", "Windows x64 compiled application check failed", () =>
 			runQuiet(
 				recorder,
 				"compiled-runtime-application-check",
@@ -1931,13 +1940,13 @@ async function buildCandidateAssets(
 				{ env: smokeEnvironment, captureOutput: true },
 			),
 		);
-		await candidateBuildStage("Windows x64 runtime fresh-home smoke test failed", () =>
+		await candidateBuildStage("runtime-smoke-test", "Windows x64 runtime fresh-home smoke test failed", () =>
 			runQuiet(recorder, "runtime-smoke-test", "Windows x64 runtime smoke test", [runtime, "--smoke-test"], {
 				env: smokeEnvironment,
 				captureOutput: true,
 			}),
 		);
-		const reportedIdentity = await candidateBuildStage("Windows x64 runtime identity check failed", () =>
+		const reportedIdentity = await candidateBuildStage("runtime-identity-check", "Windows x64 runtime identity check failed", () =>
 			runText("Windows x64 runtime identity check", [runtime, "--autobot-build-identity"], {
 				env: smokeEnvironment,
 			}),
@@ -1946,20 +1955,27 @@ async function buildCandidateAssets(
 		try {
 			parsedIdentity = JSON.parse(reportedIdentity);
 		} catch (error) {
-			throw new LocalBuildFailure("Windows x64 runtime did not report valid build identity JSON", { cause: error });
+			throw new LocalBuildFailure(
+				"runtime-identity-check",
+				"Windows x64 runtime did not report valid build identity JSON",
+				{ cause: error },
+			);
 		}
 		if (
 			!isRecord(parsedIdentity) ||
 			Object.keys(parsedIdentity).length !== Object.keys(identity).length ||
 			Object.entries(identity).some(([key, value]) => parsedIdentity[key] !== value)
 		) {
-			throw new LocalBuildFailure("Windows x64 runtime build identity does not match the signed candidate identity");
+			throw new LocalBuildFailure(
+				"runtime-identity-check",
+				"Windows x64 runtime build identity does not match the signed candidate identity",
+			);
 		}
 	} finally {
 		await fs.rm(smokeRoot, { recursive: true, force: true });
 	}
 	const bootstrap = path.join(inputs, "omp-bootstrap-win32-x64.exe");
-	await candidateBuildStage("Windows x64 bootstrap compilation failed", () =>
+	await candidateBuildStage("bootstrap-compilation", "Windows x64 bootstrap compilation failed", () =>
 		runQuiet(
 			recorder,
 			"bootstrap-compilation",
@@ -1979,17 +1995,17 @@ async function buildCandidateAssets(
 			},
 		),
 	);
-	await candidateBuildStage("Windows x64 bootstrap output was not produced", () =>
+	await candidateBuildStage("bootstrap-output", "Windows x64 bootstrap output was not produced", () =>
 		requireRegularFile(bootstrap, "Windows x64 bootstrap"),
 	);
-	const webBundleId = await candidateBuildStage("Collab web bundle identity derivation failed", () =>
+	const webBundleId = await candidateBuildStage("collab-web-bundle-identity", "Collab web bundle identity derivation failed", () =>
 		deriveManagedBundleId(
 			path.join(sourceRoot, "packages", "collab-web", "dist"),
 			path.join(sourceRoot, "packages", "collab-web", "public"),
 		),
 	);
 	const webArchive = path.join(inputs, `omp-collab-web-${webBundleId}.tar.gz`);
-	await candidateBuildStage("Collab web release packaging failed", () =>
+	await candidateBuildStage("collab-web-packaging", "Collab web release packaging failed", () =>
 		createManagedBundle({
 			bundleId: webBundleId,
 			forkCommit: candidate.forkCommit,
