@@ -59,6 +59,13 @@ interface CapturedAction {
 	readonly WorkingDirectory: string;
 }
 
+interface CapturedScheduleOperation {
+	readonly operation: "register" | "set";
+	readonly dayOfWeek: string;
+	readonly hour: number;
+	readonly minute: number;
+}
+
 async function runScheduledAction(action: CapturedAction): Promise<ProcessResult> {
 	return runPowerShell(
 		[
@@ -122,17 +129,49 @@ windowsTest("a config-only scheduled action follows runner updates without re-re
 	const secondRunner = await createRunner(root, "second", secondMarker);
 	const configPath = path.join(root, "config.json");
 	const actionCapture = path.join(root, "action.json");
+	const scheduleCapture = path.join(root, "schedule.json");
 	const harnessPath = path.join(root, "install-harness.ps1");
 	await writeConfig(configPath, firstRunner);
 	await fs.writeFile(
 		harnessPath,
-		`function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument; WorkingDirectory = $WorkingDirectory } }
-function New-ScheduledTaskTrigger { param([switch]$Daily, $At, $DaysInterval) [pscustomobject]@{ CimInstanceProperties = @{ Repetition = [pscustomobject]@{ Value = $null } } } }
-function New-CimInstance { param($Namespace, $ClassName, [switch]$ClientOnly, $Property) [pscustomobject]$Property }
+		`function New-ScheduledTaskAction {
+    param($Execute, $Argument, $WorkingDirectory)
+    $script:createdAction = [pscustomobject]@{ Execute = $Execute; Arguments = $Argument; WorkingDirectory = $WorkingDirectory }
+    return $script:createdAction
+}
+function New-ScheduledTaskTrigger {
+    param([switch]$Weekly, $At, $WeeksInterval, $DaysOfWeek)
+    [pscustomobject]@{ Weekly = [bool]$Weekly; At = $At; WeeksInterval = $WeeksInterval; DaysOfWeek = [string]$DaysOfWeek }
+}
 function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) [pscustomobject]@{} }
-function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $MultipleInstances, $RestartCount) [pscustomobject]@{} }
-function Get-ScheduledTask { param($TaskName, $TaskPath, $ErrorAction) return $null }
-function Register-ScheduledTask { param($TaskName, $TaskPath, $Description, $Action, $Trigger, $Principal, $Settings, [switch]$Force, $ErrorAction) $Action | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:AUTOBOT_ACTION_CAPTURE -Encoding UTF8; return [pscustomobject]@{} }
+function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $MultipleInstances, $RestartCount, $ExecutionTimeLimit) [pscustomobject]@{} }
+function Get-ScheduledTask {
+    param($TaskName, $TaskPath, $ErrorAction)
+    if ($env:AUTOBOT_EXISTING_MODE -eq "owned") {
+        return [pscustomobject]@{ Actions = @($script:createdAction) }
+    }
+    if ($env:AUTOBOT_EXISTING_MODE -eq "foreign") {
+        return [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = "foreign.exe"; Arguments = ""; WorkingDirectory = "C:\\" }) }
+    }
+    return $null
+}
+function Write-ScheduleCapture {
+    param($Operation, $Trigger)
+    [pscustomobject]@{ operation = $Operation; dayOfWeek = [string]$Trigger.DaysOfWeek; hour = $Trigger.At.Hour; minute = $Trigger.At.Minute } |
+        ConvertTo-Json -Compress |
+        Set-Content -LiteralPath $env:AUTOBOT_SCHEDULE_CAPTURE -Encoding UTF8
+}
+function Register-ScheduledTask {
+    param($TaskName, $TaskPath, $Description, $Action, $Trigger, $Principal, $Settings, [switch]$Force, $ErrorAction)
+    $Action | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:AUTOBOT_ACTION_CAPTURE -Encoding UTF8
+    Write-ScheduleCapture -Operation "register" -Trigger $Trigger
+    return [pscustomobject]@{}
+}
+function Set-ScheduledTask {
+    param($TaskName, $TaskPath, $Trigger, $ErrorAction)
+    Write-ScheduleCapture -Operation "set" -Trigger $Trigger
+    return [pscustomobject]@{}
+}
 & ${powerShellLiteral(installerPath)} -ConfigPath ${powerShellLiteral(configPath)} -BunPath $env:AUTOBOT_INSTALL_BUN
 `,
 	);
@@ -140,15 +179,56 @@ function Register-ScheduledTask { param($TaskName, $TaskPath, $Description, $Act
 	const installation = await runPowerShell(["-File", harnessPath], {
 		...process.env,
 		AUTOBOT_ACTION_CAPTURE: actionCapture,
+		AUTOBOT_SCHEDULE_CAPTURE: scheduleCapture,
 		AUTOBOT_INSTALL_BUN: firstRunner,
 	});
 	const action = JSON.parse((await fs.readFile(actionCapture, "utf8")).replace(/^\uFEFF/, "")) as CapturedAction;
 	expect(installation.exitCode).toBe(0);
+	const initialSchedule = JSON.parse(
+		(await fs.readFile(scheduleCapture, "utf8")).replace(/^\uFEFF/, ""),
+	) as CapturedScheduleOperation;
+	expect(initialSchedule).toEqual({
+		operation: "register",
+		dayOfWeek: "Friday",
+		hour: 21,
+		minute: 17,
+	});
+
+	await fs.rm(scheduleCapture);
+	const update = await runPowerShell(["-File", harnessPath], {
+		...process.env,
+		AUTOBOT_ACTION_CAPTURE: actionCapture,
+		AUTOBOT_SCHEDULE_CAPTURE: scheduleCapture,
+		AUTOBOT_INSTALL_BUN: firstRunner,
+		AUTOBOT_EXISTING_MODE: "owned",
+	});
+	expect(update.exitCode).toBe(0);
+	const updatedSchedule = JSON.parse(
+		(await fs.readFile(scheduleCapture, "utf8")).replace(/^\uFEFF/, ""),
+	) as CapturedScheduleOperation;
+	expect(updatedSchedule).toEqual({
+		operation: "set",
+		dayOfWeek: "Friday",
+		hour: 21,
+		minute: 17,
+	});
+
+	await fs.rm(scheduleCapture);
+	const foreignUpdate = await runPowerShell(["-File", harnessPath], {
+		...process.env,
+		AUTOBOT_ACTION_CAPTURE: actionCapture,
+		AUTOBOT_SCHEDULE_CAPTURE: scheduleCapture,
+		AUTOBOT_INSTALL_BUN: firstRunner,
+		AUTOBOT_EXISTING_MODE: "foreign",
+	});
+	expect(foreignUpdate.exitCode).not.toBe(0);
+	expect(await Bun.file(scheduleCapture).exists()).toBe(false);
 
 	await fs.rm(actionCapture);
 	const rejectedInstallation = await runPowerShell(["-File", harnessPath], {
 		...process.env,
 		AUTOBOT_ACTION_CAPTURE: actionCapture,
+		AUTOBOT_SCHEDULE_CAPTURE: scheduleCapture,
 		AUTOBOT_INSTALL_BUN: secondRunner,
 	});
 	expect(rejectedInstallation.exitCode).not.toBe(0);

@@ -723,7 +723,7 @@ installation flow. Its bootstrap is immutable: it accepts only a locally
 configured signed channel and locally trusted Ed25519 public keys, then stages
 verified runtimes under its private installation root.
 
-#### Operator setup and hourly local producer
+#### Operator setup and weekly local producer
 
 The retired Actions producers have been replaced by one local, Windows x64
 producer. It is operator-run under a single Windows account with that account's
@@ -745,6 +745,9 @@ fields are rejected):
   including `refs/heads/main`, are rejected. The controller pins and
   revalidates that exact selected tag's peeled commit and coding-agent package
   version; a newer release appearing during the run does not move the pin.
+  With `latest-release`, each scheduled invocation selects the then-current
+  stable release once at the start of that run; activating the weekly task does
+  not turn that selection into a permanently pinned release.
   If that official release is an ancestor of an authenticated retained upstream
   base, the controller preserves the retained commit and its actual package
   version as signed provenance. The official tag remains a separate tracking
@@ -857,7 +860,7 @@ signed stage must all describe the same candidate:
 The two explicit modes are mutually exclusive. Omitting both retains the
 normal guarded publish route.
 
-To register, but not start, the dedicated hourly task:
+To register, but not start, the dedicated weekly task:
 
 ```powershell
 & .\scripts\Install-AutoBotLocalBuildTask.ps1 `
@@ -865,9 +868,13 @@ To register, but not start, the dedicated hourly task:
 ```
 
 The installer registers **AutoBot Local Build** for the current Windows user
-at limited, interactive privilege. It begins at the next `:17` and repeats
-hourly; Task Scheduler ignores a new instance while one is active and does not
-restart failed runs. It refuses to overwrite a task with a different action.
+at limited, interactive privilege. By default it runs every Friday at 21:17
+local time; `-DayOfWeek`, `-Hour`, and `-Minute` can select a different weekly
+schedule. Task Scheduler ignores a new instance while one is active, allows a
+run to continue on battery power, and limits it to 72 hours. Re-running the
+installer updates only the trigger of an owned task, preserving its action,
+principal, settings, security descriptor, and enabled state. It refuses to
+overwrite a task with a different action.
 
 Each run pins the protected canonical branch and upstream input, then updates
 only its owned persistent integration worktree. It retains the committed
@@ -876,15 +883,31 @@ integration and before candidate identity or compatibility review, it performs
 the narrowly scoped native release-metadata synchronization and commits only
 the exact changed Cargo workspace/lock and generated marker paths. This keeps
 the native compatibility generation stable across application-only releases
-without normalizing unrelated Rust or third-party metadata. OMP is invoked only
-to resolve an integration conflict, review a sensitive compatibility change,
-or repair an application build failure; missing, unpinned, or incompatible
-reused native inputs are never treated as a source-repair loop. OMP's zero exit
-is not trusted alone: afterward the controller independently checks the
-worktree, ancestry, refs, and remote snapshot. Added remotes or unexpected ref
-changes fail validation; the controller commits accepted fixes while retaining
-candidate ancestry. Failures outside the explicitly reviewable integration and
-application-build cases block the run rather than being repaired or retried.
+without normalizing unrelated Rust or third-party metadata. The deterministic
+controller retains the exact release plan, commands, step order, and admission
+gates; OMP never chooses commands or gains permission to skip or resume pipeline
+steps. OMP is invoked only to resolve an integration conflict, perform the
+mandatory review of a sensitive compatibility change, or repair an eligible
+application build or smoke failure.
+
+As a caller/controller integrity guard, the trusted producer checkout must keep
+the same pinned `HEAD` and have no staged or unstaged tracked changes at startup
+and immediately before and after every OMP hook. Untracked or ignored
+dependency and native-helper paths are not classified as tracked drift. This
+guard detects controller-side mutation; it is not an OS sandbox.
+
+Build repair starts only after the controller reports a closed,
+controller-derived `stepId` and its `permittedSourcePaths`. OMP may propose
+source changes only inside that scope, and the controller independently
+validates the declared paths, worktree, ancestry, refs, and remote snapshot
+before committing an accepted repair. A successful OMP exit is never sufficient
+on its own. Out-of-scope changes and control-plane, native, security,
+provenance, signing, or other non-eligible failures stop the run; missing,
+unpinned, or incompatible reused native inputs are never treated as a
+source-repair loop. Because an accepted source repair invalidates prior
+outputs, the controller reruns the existing full deterministic pipeline from
+the start for fresh outputs and reapplies every mandatory gate; it never uses
+receipts to resume or skip past the failed command.
 
 After an interrupted or separately completed publication, a stale integration
 checkpoint can recover automatically only when the current signed channel,

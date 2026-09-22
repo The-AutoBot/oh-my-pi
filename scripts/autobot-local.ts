@@ -7,6 +7,7 @@ import {
 	assertAutoBotImportableFile,
 	assertAutoBotPrivateDirectory,
 	assertAutoBotPrivateFile,
+	ensureAutoBotPrivateDirectory,
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { synchronizeNativeReleaseMetadata } from "../packages/natives/scripts/native-compatibility.ts";
 import { NativeInputError } from "../packages/natives/scripts/native-build-provenance.ts";
@@ -52,23 +53,35 @@ import {
 import type { RepairIntent } from "./autobot-publication-boundary.ts";
 import { runLocalOmp } from "./autobot-local-omp.ts";
 import {
+	admitCandidateNativeInputs,
 	admitPreparedLocalRelease,
 	authenticateCompletedLocalRelease,
 	buildAndPublishLocalRelease,
 	createCommandOutputRedactionPolicy,
 	LocalBuildFailure,
-	validateConfiguredNativeReuseInputs,
 	publishPreparedLocalRelease,
 	redactSensitiveCommandOutput,
 } from "./autobot-local-release.ts";
 import type { CommandOutputRedactionPolicy, CompletedLocalReleaseIdentity } from "./autobot-local-release.ts";
+import { REPAIRABLE_STEP_SOURCE_PATHS } from "./autobot-local-types.ts";
 import type {
 	EffectiveUpstreamBase,
+	FailedStepContext,
 	LocalAutomationConfig,
 	LocalCandidate,
 	ObservedOfficialUpstreamRelease,
 	OfficialUpstreamRelease,
+	RepairableStepId,
 } from "./autobot-local-types.ts";
+
+const REPAIR_PROTECTED_SOURCE_COMPONENT = /(?:^|[-_.])(?:provenance|trust|manifest)(?:[-_.]|$)/i;
+const REPAIR_PROTECTED_SOURCE_PREFIXES = [
+	"packages/coding-agent/src/autobot-update",
+	"packages/coding-agent/src/security",
+	"packages/coding-agent/src/autobot-bootstrap.ts",
+	"packages/coding-agent/src/autobot-runtime.ts",
+	"packages/coding-agent/src/session/acp-permission-gate.ts",
+] as const;
 
 const CANONICAL_REPOSITORY = "The-AutoBot/oh-my-pi";
 const CONFIG_SCHEMA_VERSION = 1 as const;
@@ -98,6 +111,10 @@ const LOCAL_COMMAND_KINDS = [
 	"github-release-download",
 	"downloaded-release-verification",
 	"candidate-dependency-installation",
+	"git-synchronization",
+	"source-synchronization",
+	"candidate-admission",
+	"diagnostic-persistence",
 	"browser-relay-build",
 	"collab-web-build",
 	"runtime-compilation",
@@ -122,6 +139,12 @@ const LOCAL_COMMAND_KINDS = [
 	"omp-invocation",
 ] as const;
 const LOCAL_COMMAND_OUTCOMES = ["started", "exited", "timed-out", "start-failed"] as const;
+const AGGREGATED_OPERATION_KINDS: Record<string, true> = {
+	"git-synchronization": true,
+	"source-synchronization": true,
+	"candidate-admission": true,
+	"diagnostic-persistence": true,
+};
 const MAX_OMP_ATTEMPTS = 3;
 const BUN_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const DURATION = /^([1-9]\d*(?:\.\d+)?)([smh])$/;
@@ -263,6 +286,51 @@ export function hasRetainedPublishedCheckpoint(
 	return publishedForkCommit !== undefined && publishedForkCommit === observedCommit;
 }
 
+
+/** Derive the immutable application-source boundary for one repairable failed step. */
+export function deriveFailedStepContext(stepId: RepairableStepId): FailedStepContext {
+	if (!Object.prototype.hasOwnProperty.call(REPAIRABLE_STEP_SOURCE_PATHS, stepId)) {
+		throw new AutoBotReleaseError("Local build failure has an unknown repairable step identity");
+	}
+	return Object.freeze({
+		stepId,
+		permittedSourcePaths: REPAIRABLE_STEP_SOURCE_PATHS[stepId],
+	});
+}
+
+/** Reject a declared build repair that is not source-local to its failed application step. */
+export function assertBuildRepairScope(intent: RepairIntent, context: FailedStepContext): void {
+	const expectedScope = Object.prototype.hasOwnProperty.call(REPAIRABLE_STEP_SOURCE_PATHS, context.stepId)
+		? REPAIRABLE_STEP_SOURCE_PATHS[context.stepId]
+		: undefined;
+	if (
+		expectedScope === undefined ||
+		expectedScope.length !== context.permittedSourcePaths.length ||
+		expectedScope.some((pathname, index) => context.permittedSourcePaths[index] !== pathname)
+	) {
+		throw new AutoBotReleaseError("Local build repair has an unknown or invalid failed-step source scope");
+	}
+	for (const pathname of intent.paths) {
+		const components = pathname.split("/");
+		const forbidden =
+			pathname.startsWith("scripts/autobot-") ||
+			pathname.startsWith("crates/") ||
+			pathname.startsWith("packages/natives/") ||
+			pathname.startsWith(".github/") ||
+			REPAIR_PROTECTED_SOURCE_PREFIXES.some(
+				protectedPath => pathname === protectedPath || pathname.startsWith(`${protectedPath}/`),
+			) ||
+			components.some(component => REPAIR_PROTECTED_SOURCE_COMPONENT.test(component));
+		const permitted = expectedScope.some(
+			sourcePath => pathname === sourcePath || pathname.startsWith(`${sourcePath}/`),
+		);
+		if (forbidden || !permitted) {
+			throw new AutoBotReleaseError(
+				`Local build repair path is outside the failed-step application source scope: ${pathname}`,
+			);
+		}
+	}
+}
 export async function assertRecoverableIntegrationHistory(
 	checkpointCommit: string,
 	targetCommit: string,
@@ -320,6 +388,9 @@ export interface LocalCommandDiagnosticRecord {
 	readonly timedOut: boolean;
 	readonly exitCode?: number;
 	readonly durationMs?: number;
+	readonly operationCount?: number;
+	readonly failureCount?: number;
+	readonly nested?: boolean;
 }
 
 export interface LocalCommandOutputRecord {
@@ -332,6 +403,8 @@ export interface LocalCommandOutputRecord {
 export interface LocalCommandRecorder {
 	record(record: LocalCommandDiagnosticRecord): Promise<void>;
 	recordOutput?(record: LocalCommandOutputRecord): Promise<void>;
+	measure?<T>(commandKind: LocalCommandKind, nested: boolean, operation: () => Promise<T>): Promise<T>;
+	flushMeasurements?(): Promise<void>;
 }
 
 interface LocalCommandOutputJournal {
@@ -351,12 +424,18 @@ interface ManagedWorktree {
 	readonly initialized: boolean;
 }
 
+interface TrustedProducer {
+	readonly root: string;
+	readonly commit: string;
+}
+
 interface RemoteSnapshot {
 	readonly refs: ReadonlyMap<string, string>;
 }
 
 interface OmpControllerContext {
 	readonly config: LocalAutomationConfig;
+	readonly producer: TrustedProducer;
 	readonly worktree: string;
 	readonly localRef: string;
 	readonly canonicalRepository: string;
@@ -367,6 +446,7 @@ interface OmpControllerContext {
 	readonly expectedUpstreamRef: string;
 	readonly expectedUpstreamVersion: string;
 	readonly expectedIntegrationCommit: string | undefined;
+	readonly setPhase?: (phase: LocalPhase) => Promise<void>;
 	readonly commandRecorder: LocalCommandRecorder;
 }
 
@@ -575,16 +655,34 @@ function localIntegrationBranch(integrationBranch: string): string {
 	return `autobot-local/${integrationBranch}`;
 }
 
-async function trustedProducer(): Promise<{ readonly root: string; readonly commit: string }> {
+async function assertTrustedProducerUnchanged(producer: TrustedProducer): Promise<void> {
+	const actualRoot = await fs.realpath(await gitOutput(producer.root, ["rev-parse", "--show-toplevel"]));
+	const currentCommit = requireCommit(
+		await gitOutput(producer.root, ["rev-parse", "--verify", "HEAD^{commit}"]),
+		"Trusted producer HEAD",
+	);
+	const trackedStatus = await gitOutput(producer.root, [
+		"status",
+		"--porcelain=v1",
+		"--untracked-files=no",
+	]);
+	if (!samePath(producer.root, actualRoot) || currentCommit !== producer.commit || trackedStatus !== "") {
+		throw new AutoBotReleaseError("Trusted producer checkout changed or has uncommitted tracked changes");
+	}
+}
+
+async function trustedProducer(): Promise<TrustedProducer> {
 	const root = await fs.realpath(path.resolve(import.meta.dir, ".."));
 	const actual = await fs.realpath(await gitOutput(root, ["rev-parse", "--show-toplevel"]));
 	if (!samePath(root, actual)) {
 		throw new AutoBotReleaseError("Local controller must run from its trusted producer repository root");
 	}
-	return {
+	const producer = {
 		root,
 		commit: requireCommit(await gitOutput(root, ["rev-parse", "--verify", "HEAD^{commit}"]), "Trusted producer HEAD"),
 	};
+	await assertTrustedProducerUnchanged(producer);
+	return producer;
 }
 
 async function loadLocalAutomationConfig(configPath: string, producerRoot: string): Promise<LocalAutomationConfig> {
@@ -866,8 +964,20 @@ function parseLocalCommandDiagnosticRecord(value: unknown): LocalCommandDiagnost
 	const stage = requireLocalCommandEnum(value.stage, LOCAL_COMMAND_STAGES, "stage");
 	const commandKind = requireLocalCommandEnum(value.commandKind, LOCAL_COMMAND_KINDS, "kind");
 	const outcome = requireLocalCommandEnum(value.outcome, LOCAL_COMMAND_OUTCOMES, "outcome");
-	const keys =
-		outcome === "started"
+	const aggregated = AGGREGATED_OPERATION_KINDS[commandKind] === true;
+	const keys = aggregated
+		? [
+				"stage",
+				"commandKind",
+				"outcome",
+				"timedOut",
+				"exitCode",
+				"durationMs",
+				"operationCount",
+				"failureCount",
+				"nested",
+			]
+		: outcome === "started"
 			? ["stage", "commandKind", "outcome", "timedOut"]
 			: outcome === "exited"
 				? ["stage", "commandKind", "outcome", "timedOut", "exitCode", "durationMs"]
@@ -877,6 +987,30 @@ function parseLocalCommandDiagnosticRecord(value: unknown): LocalCommandDiagnost
 		throw new AutoBotReleaseError("Local command diagnostic timeout state is invalid");
 	}
 	const common = { stage, commandKind, outcome, timedOut: value.timedOut };
+	if (aggregated) {
+		if (
+			outcome !== "exited" ||
+			value.exitCode !== 0 ||
+			typeof value.operationCount !== "number" ||
+			!Number.isSafeInteger(value.operationCount) ||
+			value.operationCount < 1 ||
+			typeof value.failureCount !== "number" ||
+			!Number.isSafeInteger(value.failureCount) ||
+			value.failureCount < 0 ||
+			value.failureCount > value.operationCount ||
+			typeof value.nested !== "boolean"
+		) {
+			throw new AutoBotReleaseError("Aggregated local operation diagnostic is invalid");
+		}
+		return {
+			...common,
+			exitCode: 0,
+			durationMs: parseLocalCommandDuration(value.durationMs),
+			operationCount: value.operationCount,
+			failureCount: value.failureCount,
+			nested: value.nested,
+		};
+	}
 	if (outcome === "started") return common;
 	const durationMs = parseLocalCommandDuration(value.durationMs);
 	if (outcome === "exited") {
@@ -1112,7 +1246,24 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 	let journal = await readLocalCommandJournal(workRoot);
 	let outputJournal = await readLocalCommandOutputJournal(workRoot);
 	const redactionPolicy = createCommandOutputRedactionPolicy(process.env);
+	const measurements: Partial<
+		Record<LocalCommandKind, { count: number; failureCount: number; durationMs: number; nested: boolean }>
+	> = {};
+	let persistenceCount = 0;
+	let persistenceDurationMs = 0;
 	let writes = Promise.resolve();
+	const boundedDuration = (startedAt: number): number =>
+		Math.min(
+			MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
+			Math.max(0, Math.floor(performance.now() - startedAt)),
+		);
+	const includePersistence = (startedAt: number): void => {
+		persistenceCount++;
+		persistenceDurationMs = Math.min(
+			MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
+			persistenceDurationMs + boundedDuration(startedAt),
+		);
+	};
 	return {
 		record(record: LocalCommandDiagnosticRecord): Promise<void> {
 			const parsed = parseLocalCommandDiagnosticRecord(record);
@@ -1121,7 +1272,9 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 					schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION,
 					records: [...journal.records, parsed].slice(-MAX_COMMAND_DIAGNOSTIC_RECORDS),
 				};
+				const startedAt = performance.now();
 				await writeLocalCommandJournal(workRoot, next);
+				includePersistence(startedAt);
 				journal = next;
 			});
 			writes = operation.catch(() => undefined);
@@ -1142,7 +1295,80 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 					schemaVersion: COMMAND_OUTPUT_SCHEMA_VERSION,
 					records: [...outputJournal.records, safe].slice(-MAX_COMMAND_OUTPUT_RECORDS),
 				};
+				const startedAt = performance.now();
 				outputJournal = await writeLocalCommandOutputJournal(workRoot, next);
+				includePersistence(startedAt);
+			});
+			writes = operation.catch(() => undefined);
+			return operation;
+		},
+		async measure<T>(
+			commandKind: LocalCommandKind,
+			nested: boolean,
+			operation: () => Promise<T>,
+		): Promise<T> {
+			if (AGGREGATED_OPERATION_KINDS[commandKind] !== true || commandKind === "diagnostic-persistence") {
+				throw new AutoBotReleaseError("Local operation timing kind is invalid");
+			}
+			const startedAt = performance.now();
+			let failed = true;
+			try {
+				const result = await operation();
+				failed = false;
+				return result;
+			} finally {
+				const previous = measurements[commandKind];
+				measurements[commandKind] = {
+					count: (previous?.count ?? 0) + 1,
+					failureCount: (previous?.failureCount ?? 0) + (failed ? 1 : 0),
+					durationMs: Math.min(
+						MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
+						(previous?.durationMs ?? 0) + boundedDuration(startedAt),
+					),
+					nested: previous?.nested === true || nested,
+				};
+			}
+		},
+		flushMeasurements(): Promise<void> {
+			const operation = writes.then(async () => {
+				const summaries: LocalCommandDiagnosticRecord[] = Object.entries(measurements).map(
+					([commandKind, measurement]) => ({
+						stage: "release",
+						commandKind: commandKind as LocalCommandKind,
+						outcome: "exited",
+						timedOut: false,
+						exitCode: 0,
+						durationMs: measurement.durationMs,
+						operationCount: measurement.count,
+						failureCount: measurement.failureCount,
+						nested: measurement.nested,
+					}),
+				);
+				if (persistenceCount > 0) {
+					summaries.push({
+						stage: "release",
+						commandKind: "diagnostic-persistence",
+						outcome: "exited",
+						timedOut: false,
+						exitCode: 0,
+						durationMs: persistenceDurationMs,
+						operationCount: persistenceCount,
+						failureCount: 0,
+						nested: false,
+					});
+				}
+				if (summaries.length === 0) return;
+				const next: LocalCommandJournal = {
+					schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION,
+					records: [...journal.records, ...summaries.map(parseLocalCommandDiagnosticRecord)].slice(
+						-MAX_COMMAND_DIAGNOSTIC_RECORDS,
+					),
+				};
+				await writeLocalCommandJournal(workRoot, next);
+				journal = next;
+				for (const key of Object.keys(measurements)) delete measurements[key as LocalCommandKind];
+				persistenceCount = 0;
+				persistenceDurationMs = 0;
 			});
 			writes = operation.catch(() => undefined);
 			return operation;
@@ -1611,7 +1837,9 @@ async function invokeOmpGuarded(
 	reason: "conflicts" | "compatibility" | "build-failure",
 	sensitivePaths: readonly string[],
 	diagnostics: string | undefined,
+	failedStepContext?: FailedStepContext,
 ): Promise<RepairIntent> {
+	await assertTrustedProducerUnchanged(context.producer);
 	const beforeHead = await currentCommit(context.worktree, "Pre-OMP integration HEAD");
 	const localRefs = await snapshotLocalRefs(context.worktree);
 	const remoteRefs = await snapshotRemoteRefs(context.canonicalRepository);
@@ -1625,20 +1853,28 @@ async function invokeOmpGuarded(
 	let repairIntent: RepairIntent | undefined;
 	let ompError: unknown;
 	try {
-		repairIntent = (
-			await runLocalOmp(
-				context.config,
-				{
-					cwd: context.worktree,
-					reason,
-					forkCommit: beforeHead,
-					upstreamCommit: context.expectedUpstreamCommit,
-					sensitivePaths,
-					diagnostics,
-				},
-				context.commandRecorder,
-			)
-		).repairIntent;
+		const result = await runLocalOmp(
+			context.config,
+			{
+				cwd: context.worktree,
+				reason,
+				forkCommit: beforeHead,
+				upstreamCommit: context.expectedUpstreamCommit,
+				sensitivePaths,
+				diagnostics,
+				failedStepContext,
+			},
+			context.commandRecorder,
+		);
+		repairIntent = result.repairIntent;
+		if (reason === "build-failure") {
+			if (failedStepContext === undefined) {
+				throw new AutoBotReleaseError("Local build repair is missing its failed-step source scope");
+			}
+			assertBuildRepairScope(repairIntent, failedStepContext);
+		} else if (failedStepContext !== undefined) {
+			throw new AutoBotReleaseError("Non-build OMP invocation cannot carry failed-step source scope");
+		}
 	} catch (error) {
 		ompError = error;
 	}
@@ -1651,6 +1887,7 @@ async function invokeOmpGuarded(
 		await assertLocalRefsUnchanged(context.worktree, localRefs, context.localRef, beforeHead);
 		assertRemoteSnapshotsEqual(remoteRefs, await snapshotRemoteRefs(context.canonicalRepository));
 		if (reason !== "conflicts") await assertNoForbiddenWorktreeResidue(context.worktree);
+		await assertTrustedProducerUnchanged(context.producer);
 	} catch (error) {
 		postconditionError = error;
 	}
@@ -1679,7 +1916,9 @@ async function mergePinnedInput(
 			throw new AutoBotReleaseError("Configured OMP attempt limit reached while resolving an integration conflict");
 		}
 		ompAttempts.value++;
+		await context.setPhase?.("resolving-conflict");
 		repairIntent = await invokeOmpGuarded(context, "conflicts", [], undefined);
+		await context.setPhase?.("synchronizing");
 	}
 	return finalizeMerge(context.worktree, context.localRef, base, target, subject, candidate, repairIntent);
 }
@@ -1824,8 +2063,18 @@ function candidateFromIdentity(
 	};
 }
 
+async function measureLocalOperation<T>(
+	recorder: LocalCommandRecorder,
+	commandKind: LocalCommandKind,
+	nested: boolean,
+	operation: () => Promise<T>,
+): Promise<T> {
+	return recorder.measure ? recorder.measure(commandKind, nested, operation) : operation();
+}
+
 async function prepareCandidate(
 	config: LocalAutomationConfig,
+	producer: TrustedProducer,
 	managed: ManagedWorktree,
 	canonicalRepository: string,
 	canonicalRef: string,
@@ -1845,6 +2094,7 @@ async function prepareCandidate(
 	let currentHead = await currentCommit(managed.worktree, "Initial local integration HEAD");
 	const initialHead = currentHead;
 	const context = (): OmpControllerContext => ({
+		producer,
 		config,
 		worktree: managed.worktree,
 		localRef: managed.localRef,
@@ -1856,6 +2106,7 @@ async function prepareCandidate(
 		expectedUpstreamRef: upstreamRef,
 		expectedUpstreamVersion: upstreamVersion,
 		expectedIntegrationCommit: integrationRemoteCommit,
+		setPhase,
 		commandRecorder,
 	});
 	let sourceChanged = initialSourceChanged;
@@ -1936,7 +2187,22 @@ async function prepareCandidate(
 	);
 	currentHead = metadataSynchronization.commit;
 	sourceChanged = sourceChanged || metadataSynchronization.changed;
-	await validateConfiguredNativeReuseInputs(config, managed.worktree);
+	await measureLocalOperation(commandRecorder, "candidate-admission", true, async () => {
+		const dependencyEnvironmentRoot = await ensureAutoBotPrivateDirectory(
+			await fs.mkdtemp(path.join(config.workRoot, "autobot-candidate-dependencies-")),
+		);
+		try {
+			await admitCandidateNativeInputs(
+				config,
+				managed.worktree,
+				dependencyEnvironmentRoot,
+				process.env,
+				commandRecorder,
+			);
+		} finally {
+			await fs.rm(dependencyEnvironmentRoot, { recursive: true, force: true });
+		}
+	});
 
 	let identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, currentHead);
 	let candidate = candidateFromIdentity(
@@ -2008,8 +2274,11 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 	await claimWorkRoot(config.workRoot, config.repository, producer.root);
 	const commandRecorder = await createLocalCommandRecorder(config.workRoot);
 	let state = await readLocalState(config.workRoot);
+	let automationError: unknown;
 	try {
-		const managed = await ensureManagedWorktree(config, producer.root, producer.commit);
+		const managed = await measureLocalOperation(commandRecorder, "git-synchronization", false, () =>
+			ensureManagedWorktree(config, producer.root, producer.commit),
+		);
 		await assertCleanWorktree(managed.worktree, managed.localRef);
 		const canonicalRepository = requireHttpsRepository(
 			`https://github.com/${config.repository}.git`,
@@ -2257,6 +2526,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			});
 			const expectedIntegrationCommit = await pushIntegrationBranch(
 				{
+					producer,
 					config,
 					worktree: managed.worktree,
 					localRef: managed.localRef,
@@ -2326,6 +2596,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 		if (!(await isAncestor(managed.worktree, producer.commit, currentHead))) {
 			await setPhase("synchronizing");
 			const producerContext: OmpControllerContext = {
+				producer,
 				config,
 				worktree: managed.worktree,
 				localRef: managed.localRef,
@@ -2336,6 +2607,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 				expectedUpstreamRef: pinnedUpstream.ref,
 				expectedUpstreamVersion: upstreamVersion,
+				setPhase,
 				expectedIntegrationCommit: integrationRemoteCommit,
 				commandRecorder,
 			};
@@ -2352,22 +2624,25 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			throw new AutoBotReleaseError("Persistent integration does not retain the committed trusted producer HEAD");
 		}
 
-		const prepared = await prepareCandidate(
-			config,
-			managed,
-			canonicalRepository,
-			canonicalRef,
-			canonicalCommit,
-			pinnedUpstream.ref,
-			pinnedUpstream.commit,
-			upstreamCommit,
-			upstreamVersion,
-			integrationRemoteCommit,
-			state,
-			producerMerged,
-			ompAttempts,
-			setPhase,
-			commandRecorder,
+		const prepared = await measureLocalOperation(commandRecorder, "source-synchronization", true, () =>
+			prepareCandidate(
+				config,
+				producer,
+				managed,
+				canonicalRepository,
+				canonicalRef,
+				canonicalCommit,
+				pinnedUpstream.ref,
+				pinnedUpstream.commit,
+				upstreamCommit,
+				upstreamVersion,
+				integrationRemoteCommit,
+				state,
+				producerMerged,
+				ompAttempts,
+				setPhase,
+				commandRecorder,
+			),
 		);
 		state = { ...state, compatibilityReviewFingerprint: prepared.state.compatibilityReviewFingerprint };
 		const candidate = prepared.candidate;
@@ -2430,6 +2705,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 		});
 		let expectedIntegrationCommit = await pushIntegrationBranch(
 			{
+				producer,
 				config,
 				worktree: managed.worktree,
 				localRef: managed.localRef,
@@ -2492,6 +2768,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				return;
 			} catch (error) {
 				if (!(error instanceof LocalBuildFailure)) throw error;
+				const failedStepContext = deriveFailedStepContext(error.stepId);
 				const fingerprint = buildFailureFingerprint(publishCandidate);
 				const previousAttempts = state.buildFailure?.fingerprint === fingerprint ? state.buildFailure.attempts : 0;
 				if (previousAttempts >= config.maxOmpAttempts || ompAttempts.value >= config.maxOmpAttempts) {
@@ -2506,6 +2783,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				const repairBase = publishCandidate.forkCommit;
 				const repairIntent = await invokeOmpGuarded(
 					{
+						producer,
 						config,
 						worktree: managed.worktree,
 						localRef: managed.localRef,
@@ -2522,6 +2800,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					"build-failure",
 					publishCandidate.sensitivePaths,
 					error.diagnostics,
+					failedStepContext,
 				);
 				const repairedHead = await commitPendingChanges(
 					managed.worktree,
@@ -2569,6 +2848,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					const beforeReview = publishCandidate.forkCommit;
 					const repairIntent = await invokeOmpGuarded(
 						{
+							producer,
 							config,
 							worktree: managed.worktree,
 							localRef: managed.localRef,
@@ -2627,6 +2907,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				});
 				expectedIntegrationCommit = await pushIntegrationBranch(
 					{
+						producer,
 						config,
 						worktree: managed.worktree,
 						localRef: managed.localRef,
@@ -2651,12 +2932,19 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			}
 		}
 	} catch (error) {
+		automationError = error;
 		await writeLocalState(config.workRoot, {
 			...state,
 			phase: "blocked",
 			nativeInputFailure: error instanceof NativeInputError ? nativeInputFailureState(error) : undefined,
 		}).catch(() => {});
 		throw error;
+	} finally {
+		try {
+			await commandRecorder.flushMeasurements?.();
+		} catch (flushError) {
+			if (automationError === undefined) throw flushError;
+		}
 	}
 }
 
