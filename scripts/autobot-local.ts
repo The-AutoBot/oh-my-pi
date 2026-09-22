@@ -7,6 +7,7 @@ import {
 	assertAutoBotImportableFile,
 	assertAutoBotPrivateDirectory,
 	assertAutoBotPrivateFile,
+	ensureAutoBotPrivateDirectory,
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { synchronizeNativeReleaseMetadata } from "../packages/natives/scripts/native-compatibility.ts";
 import { NativeInputError } from "../packages/natives/scripts/native-build-provenance.ts";
@@ -52,12 +53,12 @@ import {
 import type { RepairIntent } from "./autobot-publication-boundary.ts";
 import { runLocalOmp } from "./autobot-local-omp.ts";
 import {
+	admitCandidateNativeInputs,
 	admitPreparedLocalRelease,
 	authenticateCompletedLocalRelease,
 	buildAndPublishLocalRelease,
 	createCommandOutputRedactionPolicy,
 	LocalBuildFailure,
-	validateConfiguredNativeReuseInputs,
 	publishPreparedLocalRelease,
 	redactSensitiveCommandOutput,
 } from "./autobot-local-release.ts";
@@ -98,6 +99,10 @@ const LOCAL_COMMAND_KINDS = [
 	"github-release-download",
 	"downloaded-release-verification",
 	"candidate-dependency-installation",
+	"git-synchronization",
+	"source-synchronization",
+	"candidate-admission",
+	"diagnostic-persistence",
 	"browser-relay-build",
 	"collab-web-build",
 	"runtime-compilation",
@@ -122,6 +127,12 @@ const LOCAL_COMMAND_KINDS = [
 	"omp-invocation",
 ] as const;
 const LOCAL_COMMAND_OUTCOMES = ["started", "exited", "timed-out", "start-failed"] as const;
+const AGGREGATED_OPERATION_KINDS: Record<string, true> = {
+	"git-synchronization": true,
+	"source-synchronization": true,
+	"candidate-admission": true,
+	"diagnostic-persistence": true,
+};
 const MAX_OMP_ATTEMPTS = 3;
 const BUN_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const DURATION = /^([1-9]\d*(?:\.\d+)?)([smh])$/;
@@ -320,6 +331,9 @@ export interface LocalCommandDiagnosticRecord {
 	readonly timedOut: boolean;
 	readonly exitCode?: number;
 	readonly durationMs?: number;
+	readonly operationCount?: number;
+	readonly failureCount?: number;
+	readonly nested?: boolean;
 }
 
 export interface LocalCommandOutputRecord {
@@ -332,6 +346,8 @@ export interface LocalCommandOutputRecord {
 export interface LocalCommandRecorder {
 	record(record: LocalCommandDiagnosticRecord): Promise<void>;
 	recordOutput?(record: LocalCommandOutputRecord): Promise<void>;
+	measure?<T>(commandKind: LocalCommandKind, nested: boolean, operation: () => Promise<T>): Promise<T>;
+	flushMeasurements?(): Promise<void>;
 }
 
 interface LocalCommandOutputJournal {
@@ -367,6 +383,7 @@ interface OmpControllerContext {
 	readonly expectedUpstreamRef: string;
 	readonly expectedUpstreamVersion: string;
 	readonly expectedIntegrationCommit: string | undefined;
+	readonly setPhase?: (phase: LocalPhase) => Promise<void>;
 	readonly commandRecorder: LocalCommandRecorder;
 }
 
@@ -866,8 +883,20 @@ function parseLocalCommandDiagnosticRecord(value: unknown): LocalCommandDiagnost
 	const stage = requireLocalCommandEnum(value.stage, LOCAL_COMMAND_STAGES, "stage");
 	const commandKind = requireLocalCommandEnum(value.commandKind, LOCAL_COMMAND_KINDS, "kind");
 	const outcome = requireLocalCommandEnum(value.outcome, LOCAL_COMMAND_OUTCOMES, "outcome");
-	const keys =
-		outcome === "started"
+	const aggregated = AGGREGATED_OPERATION_KINDS[commandKind] === true;
+	const keys = aggregated
+		? [
+				"stage",
+				"commandKind",
+				"outcome",
+				"timedOut",
+				"exitCode",
+				"durationMs",
+				"operationCount",
+				"failureCount",
+				"nested",
+			]
+		: outcome === "started"
 			? ["stage", "commandKind", "outcome", "timedOut"]
 			: outcome === "exited"
 				? ["stage", "commandKind", "outcome", "timedOut", "exitCode", "durationMs"]
@@ -877,6 +906,30 @@ function parseLocalCommandDiagnosticRecord(value: unknown): LocalCommandDiagnost
 		throw new AutoBotReleaseError("Local command diagnostic timeout state is invalid");
 	}
 	const common = { stage, commandKind, outcome, timedOut: value.timedOut };
+	if (aggregated) {
+		if (
+			outcome !== "exited" ||
+			value.exitCode !== 0 ||
+			typeof value.operationCount !== "number" ||
+			!Number.isSafeInteger(value.operationCount) ||
+			value.operationCount < 1 ||
+			typeof value.failureCount !== "number" ||
+			!Number.isSafeInteger(value.failureCount) ||
+			value.failureCount < 0 ||
+			value.failureCount > value.operationCount ||
+			typeof value.nested !== "boolean"
+		) {
+			throw new AutoBotReleaseError("Aggregated local operation diagnostic is invalid");
+		}
+		return {
+			...common,
+			exitCode: 0,
+			durationMs: parseLocalCommandDuration(value.durationMs),
+			operationCount: value.operationCount,
+			failureCount: value.failureCount,
+			nested: value.nested,
+		};
+	}
 	if (outcome === "started") return common;
 	const durationMs = parseLocalCommandDuration(value.durationMs);
 	if (outcome === "exited") {
@@ -1112,7 +1165,24 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 	let journal = await readLocalCommandJournal(workRoot);
 	let outputJournal = await readLocalCommandOutputJournal(workRoot);
 	const redactionPolicy = createCommandOutputRedactionPolicy(process.env);
+	const measurements: Partial<
+		Record<LocalCommandKind, { count: number; failureCount: number; durationMs: number; nested: boolean }>
+	> = {};
+	let persistenceCount = 0;
+	let persistenceDurationMs = 0;
 	let writes = Promise.resolve();
+	const boundedDuration = (startedAt: number): number =>
+		Math.min(
+			MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
+			Math.max(0, Math.floor(performance.now() - startedAt)),
+		);
+	const includePersistence = (startedAt: number): void => {
+		persistenceCount++;
+		persistenceDurationMs = Math.min(
+			MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
+			persistenceDurationMs + boundedDuration(startedAt),
+		);
+	};
 	return {
 		record(record: LocalCommandDiagnosticRecord): Promise<void> {
 			const parsed = parseLocalCommandDiagnosticRecord(record);
@@ -1121,7 +1191,9 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 					schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION,
 					records: [...journal.records, parsed].slice(-MAX_COMMAND_DIAGNOSTIC_RECORDS),
 				};
+				const startedAt = performance.now();
 				await writeLocalCommandJournal(workRoot, next);
+				includePersistence(startedAt);
 				journal = next;
 			});
 			writes = operation.catch(() => undefined);
@@ -1142,7 +1214,80 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 					schemaVersion: COMMAND_OUTPUT_SCHEMA_VERSION,
 					records: [...outputJournal.records, safe].slice(-MAX_COMMAND_OUTPUT_RECORDS),
 				};
+				const startedAt = performance.now();
 				outputJournal = await writeLocalCommandOutputJournal(workRoot, next);
+				includePersistence(startedAt);
+			});
+			writes = operation.catch(() => undefined);
+			return operation;
+		},
+		async measure<T>(
+			commandKind: LocalCommandKind,
+			nested: boolean,
+			operation: () => Promise<T>,
+		): Promise<T> {
+			if (AGGREGATED_OPERATION_KINDS[commandKind] !== true || commandKind === "diagnostic-persistence") {
+				throw new AutoBotReleaseError("Local operation timing kind is invalid");
+			}
+			const startedAt = performance.now();
+			let failed = true;
+			try {
+				const result = await operation();
+				failed = false;
+				return result;
+			} finally {
+				const previous = measurements[commandKind];
+				measurements[commandKind] = {
+					count: (previous?.count ?? 0) + 1,
+					failureCount: (previous?.failureCount ?? 0) + (failed ? 1 : 0),
+					durationMs: Math.min(
+						MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
+						(previous?.durationMs ?? 0) + boundedDuration(startedAt),
+					),
+					nested: previous?.nested === true || nested,
+				};
+			}
+		},
+		flushMeasurements(): Promise<void> {
+			const operation = writes.then(async () => {
+				const summaries: LocalCommandDiagnosticRecord[] = Object.entries(measurements).map(
+					([commandKind, measurement]) => ({
+						stage: "release",
+						commandKind: commandKind as LocalCommandKind,
+						outcome: "exited",
+						timedOut: false,
+						exitCode: 0,
+						durationMs: measurement.durationMs,
+						operationCount: measurement.count,
+						failureCount: measurement.failureCount,
+						nested: measurement.nested,
+					}),
+				);
+				if (persistenceCount > 0) {
+					summaries.push({
+						stage: "release",
+						commandKind: "diagnostic-persistence",
+						outcome: "exited",
+						timedOut: false,
+						exitCode: 0,
+						durationMs: persistenceDurationMs,
+						operationCount: persistenceCount,
+						failureCount: 0,
+						nested: false,
+					});
+				}
+				if (summaries.length === 0) return;
+				const next: LocalCommandJournal = {
+					schemaVersion: COMMAND_DIAGNOSTIC_SCHEMA_VERSION,
+					records: [...journal.records, ...summaries.map(parseLocalCommandDiagnosticRecord)].slice(
+						-MAX_COMMAND_DIAGNOSTIC_RECORDS,
+					),
+				};
+				await writeLocalCommandJournal(workRoot, next);
+				journal = next;
+				for (const key of Object.keys(measurements)) delete measurements[key as LocalCommandKind];
+				persistenceCount = 0;
+				persistenceDurationMs = 0;
 			});
 			writes = operation.catch(() => undefined);
 			return operation;
@@ -1679,7 +1824,9 @@ async function mergePinnedInput(
 			throw new AutoBotReleaseError("Configured OMP attempt limit reached while resolving an integration conflict");
 		}
 		ompAttempts.value++;
+		await context.setPhase?.("resolving-conflict");
 		repairIntent = await invokeOmpGuarded(context, "conflicts", [], undefined);
+		await context.setPhase?.("synchronizing");
 	}
 	return finalizeMerge(context.worktree, context.localRef, base, target, subject, candidate, repairIntent);
 }
@@ -1824,6 +1971,15 @@ function candidateFromIdentity(
 	};
 }
 
+async function measureLocalOperation<T>(
+	recorder: LocalCommandRecorder,
+	commandKind: LocalCommandKind,
+	nested: boolean,
+	operation: () => Promise<T>,
+): Promise<T> {
+	return recorder.measure ? recorder.measure(commandKind, nested, operation) : operation();
+}
+
 async function prepareCandidate(
 	config: LocalAutomationConfig,
 	managed: ManagedWorktree,
@@ -1856,6 +2012,7 @@ async function prepareCandidate(
 		expectedUpstreamRef: upstreamRef,
 		expectedUpstreamVersion: upstreamVersion,
 		expectedIntegrationCommit: integrationRemoteCommit,
+		setPhase,
 		commandRecorder,
 	});
 	let sourceChanged = initialSourceChanged;
@@ -1936,7 +2093,22 @@ async function prepareCandidate(
 	);
 	currentHead = metadataSynchronization.commit;
 	sourceChanged = sourceChanged || metadataSynchronization.changed;
-	await validateConfiguredNativeReuseInputs(config, managed.worktree);
+	await measureLocalOperation(commandRecorder, "candidate-admission", true, async () => {
+		const dependencyEnvironmentRoot = await ensureAutoBotPrivateDirectory(
+			await fs.mkdtemp(path.join(config.workRoot, "autobot-candidate-dependencies-")),
+		);
+		try {
+			await admitCandidateNativeInputs(
+				config,
+				managed.worktree,
+				dependencyEnvironmentRoot,
+				process.env,
+				commandRecorder,
+			);
+		} finally {
+			await fs.rm(dependencyEnvironmentRoot, { recursive: true, force: true });
+		}
+	});
 
 	let identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, currentHead);
 	let candidate = candidateFromIdentity(
@@ -2008,8 +2180,11 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 	await claimWorkRoot(config.workRoot, config.repository, producer.root);
 	const commandRecorder = await createLocalCommandRecorder(config.workRoot);
 	let state = await readLocalState(config.workRoot);
+	let automationError: unknown;
 	try {
-		const managed = await ensureManagedWorktree(config, producer.root, producer.commit);
+		const managed = await measureLocalOperation(commandRecorder, "git-synchronization", false, () =>
+			ensureManagedWorktree(config, producer.root, producer.commit),
+		);
 		await assertCleanWorktree(managed.worktree, managed.localRef);
 		const canonicalRepository = requireHttpsRepository(
 			`https://github.com/${config.repository}.git`,
@@ -2336,6 +2511,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				expectedOfficialUpstreamCommit: pinnedUpstream.commit,
 				expectedUpstreamRef: pinnedUpstream.ref,
 				expectedUpstreamVersion: upstreamVersion,
+				setPhase,
 				expectedIntegrationCommit: integrationRemoteCommit,
 				commandRecorder,
 			};
@@ -2352,22 +2528,24 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			throw new AutoBotReleaseError("Persistent integration does not retain the committed trusted producer HEAD");
 		}
 
-		const prepared = await prepareCandidate(
-			config,
-			managed,
-			canonicalRepository,
-			canonicalRef,
-			canonicalCommit,
-			pinnedUpstream.ref,
-			pinnedUpstream.commit,
-			upstreamCommit,
-			upstreamVersion,
-			integrationRemoteCommit,
-			state,
-			producerMerged,
-			ompAttempts,
-			setPhase,
-			commandRecorder,
+		const prepared = await measureLocalOperation(commandRecorder, "source-synchronization", true, () =>
+			prepareCandidate(
+				config,
+				managed,
+				canonicalRepository,
+				canonicalRef,
+				canonicalCommit,
+				pinnedUpstream.ref,
+				pinnedUpstream.commit,
+				upstreamCommit,
+				upstreamVersion,
+				integrationRemoteCommit,
+				state,
+				producerMerged,
+				ompAttempts,
+				setPhase,
+				commandRecorder,
+			),
 		);
 		state = { ...state, compatibilityReviewFingerprint: prepared.state.compatibilityReviewFingerprint };
 		const candidate = prepared.candidate;
@@ -2651,12 +2829,19 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			}
 		}
 	} catch (error) {
+		automationError = error;
 		await writeLocalState(config.workRoot, {
 			...state,
 			phase: "blocked",
 			nativeInputFailure: error instanceof NativeInputError ? nativeInputFailureState(error) : undefined,
 		}).catch(() => {});
 		throw error;
+	} finally {
+		try {
+			await commandRecorder.flushMeasurements?.();
+		} catch (flushError) {
+			if (automationError === undefined) throw flushError;
+		}
 	}
 }
 

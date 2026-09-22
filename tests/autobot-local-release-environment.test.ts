@@ -2,12 +2,16 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { NativeInputError } from "../packages/natives/scripts/native-build-provenance.ts";
 import {
 	assertDeclaredToolingBunSupport,
+	admitCandidateNativeInputs,
 	createCandidateBuildEnvironment,
 	createPinnedBunCommandEnvironment,
 	runQuiet,
 } from "../scripts/autobot-local-release.ts";
+import type { LocalAutomationConfig } from "../scripts/autobot-local-types.ts";
+import type { LocalCommandDiagnosticRecord, LocalCommandRecorder } from "../scripts/autobot-local.ts";
 
 const environmentNames = [
 	"HOME",
@@ -49,6 +53,75 @@ async function runText(
 	if (exitCode !== 0) throw new Error(`${command.join(" ")} failed: ${stderr}`);
 	return stdout;
 }
+
+test("blocks cold candidate admission on frozen install failure before native provenance validation", async () => {
+	const root = await fs.mkdtemp(path.join(os.homedir(), "omp-autobot-cold-admission-"));
+	try {
+		const sourceRoot = path.join(root, "candidate");
+		const environmentRoot = path.join(root, "environment");
+		await fs.mkdir(sourceRoot);
+		await fs.writeFile(path.join(sourceRoot, "package.json"), "{ invalid json");
+		const config: LocalAutomationConfig = {
+			schemaVersion: 1,
+			repository: "The-AutoBot/oh-my-pi",
+			canonicalBranch: "main",
+			integrationBranch: "autobot-local",
+			upstreamRepository: "https://github.com/example/upstream.git",
+			upstreamRef: "refs/tags/v1.0.0",
+			workRoot: root,
+			runnerBun: process.execPath,
+			runnerBunVersion: Bun.version,
+			compilerBun: process.execPath,
+			compilerBunVersion: Bun.version,
+			nativeAddonDirectory: sourceRoot,
+			nativeAddonProvenanceSha256: "a".repeat(64),
+			ompExecutable: process.execPath,
+			coordinatorRoot: root,
+			keyId: "fixture",
+			privateKeyPath: process.execPath,
+			publicKeyPath: process.execPath,
+			channelRepository: "The-AutoBot/channel",
+			channelBranch: "main",
+			channelPath: "signed-envelope.json",
+			allowInitial: false,
+			maxOmpAttempts: 0,
+			ompMaxTime: "1s",
+		};
+		const records: LocalCommandDiagnosticRecord[] = [];
+		const recorder: LocalCommandRecorder = {
+			async record(record): Promise<void> {
+				records.push(record);
+			},
+		};
+		let failure: unknown;
+		try {
+			await admitCandidateNativeInputs(config, sourceRoot, environmentRoot, process.env, recorder);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeDefined();
+		expect(failure).not.toBeInstanceOf(NativeInputError);
+		expect(records).toEqual([
+			{
+				stage: "release",
+				commandKind: "candidate-dependency-installation",
+				outcome: "started",
+				timedOut: false,
+			},
+			{
+				stage: "release",
+				commandKind: "candidate-dependency-installation",
+				outcome: "exited",
+				timedOut: false,
+				exitCode: expect.any(Number),
+				durationMs: expect.any(Number),
+			},
+		]);
+		expect(records[1]?.exitCode).not.toBe(0);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 60_000);
 
 test("keeps candidate home and Bun cache inside the release stage without changing publisher identity lookup", async () => {
 	const root = await fs.mkdtemp(path.join(os.homedir(), "omp-autobot-release-environment-"));

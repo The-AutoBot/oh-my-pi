@@ -153,11 +153,11 @@ interface ReleaseBuildIdentity {
 	readonly collabProtocolVersion: number;
 	readonly compatibilityEpoch: number;
 }
-interface NativeAddonReuseArtifactEvidence extends NativeBuildArtifact {
+export interface NativeAddonReuseArtifactEvidence extends NativeBuildArtifact {
 	readonly origin: "local-reuse";
 	readonly producerSourceCommit: null;
 }
-interface NativeAddonReuseEvidence {
+export interface NativeAddonReuseEvidence {
 	readonly nativeCompatibilityVersion: string;
 	readonly inputsSha256: string;
 	readonly provenanceSha256: string;
@@ -1651,10 +1651,10 @@ export async function validateConfiguredNativeReuseInputs(
 }
 
 async function stageNativeAddons(
-	candidate: LocalCandidate,
+	sourceRoot: string,
 	validated: ValidatedNativeArtifactInputs,
 ): Promise<NativeAddonReuseEvidence> {
-	const nativeDirectory = path.join(candidate.sourceRoot, "packages", "natives", "native");
+	const nativeDirectory = path.join(sourceRoot, "packages", "natives", "native");
 	const canonicalNativeDirectory = await requireDirectory(nativeDirectory, "Candidate native staging directory");
 	if (!sameCanonicalPath(nativeDirectory, canonicalNativeDirectory)) {
 		throw new AutoBotReleaseError("Candidate native staging directory must be a real canonical directory");
@@ -1764,33 +1764,31 @@ if (typeof native.LiveWebRtcPeer?.prototype?.setOutputMuted !== "function") thro
 	}
 }
 
-async function buildCandidateAssets(
+export interface CandidateCommandEnvironments {
+	readonly runner: NodeJS.ProcessEnv;
+	readonly compiler: NodeJS.ProcessEnv;
+}
+
+export async function materializeCandidateDependencies(
 	config: LocalAutomationConfig,
-	candidate: LocalCandidate,
-	identity: ReleaseBuildIdentity,
-	validatedNativeInputs: ValidatedNativeArtifactInputs,
-	stageRoot: string,
+	sourceRoot: string,
+	environmentRoot: string,
 	environment: NodeJS.ProcessEnv,
 	recorder: LocalCommandRecorder,
-): Promise<CandidateAssets> {
-	const sourceRoot = candidate.sourceRoot;
-	const baseCandidateEnvironment = await createCandidateBuildEnvironment(stageRoot, environment);
-	const candidateEnvironment = await createPinnedBunCommandEnvironment(
-		path.join(stageRoot, "br"),
+): Promise<CandidateCommandEnvironments> {
+	const baseCandidateEnvironment = await createCandidateBuildEnvironment(environmentRoot, environment);
+	const runner = await createPinnedBunCommandEnvironment(
+		path.join(environmentRoot, "br"),
 		config.runnerBun,
 		config.runnerBunVersion,
 		baseCandidateEnvironment,
 	);
-	const compilerCommandEnvironment = await createPinnedBunCommandEnvironment(
-		path.join(stageRoot, "bc"),
+	const compiler = await createPinnedBunCommandEnvironment(
+		path.join(environmentRoot, "bc"),
 		config.compilerBun,
 		config.compilerBunVersion,
 		baseCandidateEnvironment,
 	);
-	const inputs = path.join(stageRoot, "i");
-	await fs.mkdir(inputs);
-	await stageNativeAddons(candidate, validatedNativeInputs);
-	await qualifyNativeLoader(config, sourceRoot, stageRoot, compilerCommandEnvironment, recorder);
 	await runQuiet(
 		recorder,
 		"candidate-dependency-installation",
@@ -1798,11 +1796,53 @@ async function buildCandidateAssets(
 		bunCommand(config.compilerBun, "install", "--frozen-lockfile"),
 		{
 			cwd: sourceRoot,
-			env: compilerCommandEnvironment,
+			env: compiler,
 			captureOutput: true,
 		},
 	);
-	const nativeReuse = await stageNativeAddons(candidate, validatedNativeInputs);
+	return { runner, compiler };
+}
+export interface CandidateNativeAdmission {
+	readonly commandEnvironments: CandidateCommandEnvironments;
+	readonly nativeInputs: ValidatedNativeArtifactInputs;
+	readonly nativeReuse: NativeAddonReuseEvidence;
+}
+
+export async function admitCandidateNativeInputs(
+	config: LocalAutomationConfig,
+	sourceRoot: string,
+	environmentRoot: string,
+	environment: NodeJS.ProcessEnv,
+	recorder: LocalCommandRecorder,
+): Promise<CandidateNativeAdmission> {
+	const commandEnvironments = await materializeCandidateDependencies(
+		config,
+		sourceRoot,
+		environmentRoot,
+		environment,
+		recorder,
+	);
+	const nativeInputs = await validateConfiguredNativeReuseInputs(config, sourceRoot);
+	const nativeReuse = await stageNativeAddons(sourceRoot, nativeInputs);
+	return { commandEnvironments, nativeInputs, nativeReuse };
+}
+
+
+async function buildCandidateAssets(
+	config: LocalAutomationConfig,
+	candidate: LocalCandidate,
+	identity: ReleaseBuildIdentity,
+	nativeReuse: NativeAddonReuseEvidence,
+	stageRoot: string,
+	commandEnvironments: CandidateCommandEnvironments,
+	recorder: LocalCommandRecorder,
+): Promise<CandidateAssets> {
+	const sourceRoot = candidate.sourceRoot;
+	const candidateEnvironment = commandEnvironments.runner;
+	const compilerCommandEnvironment = commandEnvironments.compiler;
+	const inputs = path.join(stageRoot, "i");
+	await fs.mkdir(inputs);
+	await qualifyNativeLoader(config, sourceRoot, stageRoot, compilerCommandEnvironment, recorder);
 	await candidateBuildStage("Browser relay build failed", () =>
 		runQuiet(
 			recorder,
@@ -2606,7 +2646,11 @@ export async function buildAndPublishLocalRelease(
 				return { kind: "unchanged", forkCommit: candidate.forkCommit };
 			}
 		}
-		const validatedNativeInputs = await validateConfiguredNativeReuseInputs(config, sourceRoot);
+		const admission = recorder.measure
+			? await recorder.measure("candidate-admission", true, () =>
+					admitCandidateNativeInputs(config, sourceRoot, path.join(stageRoot, "ce"), environment, recorder),
+				)
+			: await admitCandidateNativeInputs(config, sourceRoot, path.join(stageRoot, "ce"), environment, recorder);
 		if (options.mode === "publish") await assertIntegrationRef(config, candidate, sourceRoot, recorder);
 		const identity: ReleaseBuildIdentity = {
 			schemaVersion: AUTO_BOT_RELEASE_SCHEMA_VERSION,
@@ -2622,9 +2666,9 @@ export async function buildAndPublishLocalRelease(
 			config,
 			candidate,
 			identity,
-			validatedNativeInputs,
+			admission.nativeReuse,
 			stageRoot,
-			environment,
+			admission.commandEnvironments,
 			recorder,
 		);
 		const coordinator = await buildCoordinatorAsset(config, candidate, stageRoot, environment, recorder);
