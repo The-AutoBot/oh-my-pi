@@ -28,6 +28,19 @@ async function createRunner(root: string, name: string, marker: string): Promise
 	return runner;
 }
 
+async function waitForFile(filePath: string, signal?: AbortSignal): Promise<void> {
+	const changes = fs.watch(path.dirname(filePath), { signal });
+	try {
+		if (await Bun.file(filePath).exists()) return;
+		for await (const change of changes) {
+			if (change.filename === path.basename(filePath) && (await Bun.file(filePath).exists())) return;
+		}
+		throw new Error(`Stopped watching before ${filePath} was created`);
+	} finally {
+		await changes.return?.();
+	}
+}
+
 interface ProcessResult {
 	readonly exitCode: number;
 	readonly stdout: string;
@@ -61,9 +74,23 @@ interface CapturedAction {
 
 interface CapturedScheduleOperation {
 	readonly operation: "register" | "set";
+	readonly weekly: boolean;
+	readonly weeksInterval: number;
 	readonly dayOfWeek: string;
 	readonly hour: number;
 	readonly minute: number;
+	readonly settings?: {
+		readonly allowStartIfOnBatteries: boolean;
+		readonly dontStopIfGoingOnBatteries: boolean;
+		readonly startWhenAvailable: boolean;
+		readonly multipleInstances: string;
+		readonly restartCount: number;
+		readonly executionTimeLimitHours: number;
+	};
+	readonly principal?: {
+		readonly logonType: string;
+		readonly runLevel: string;
+	};
 }
 
 async function runScheduledAction(action: CapturedAction): Promise<ProcessResult> {
@@ -121,6 +148,147 @@ windowsTest("rejects an explicit Bun mismatch before starting either runtime", a
 	expect(`${result.stdout}\n${result.stderr}`).not.toContain(secret);
 });
 
+windowsTest(
+	"overlapping launches run the isolated pipeline only once",
+	async () => {
+		const root = await createRoot();
+		const runner = path.join(root, "blocking-runner.cmd");
+		const configPath = path.join(root, "config.json");
+		const readyPath = path.join(root, "runner.ready");
+		const releasePath = path.join(root, "runner.release");
+		const startsPath = path.join(root, "runner-starts.txt");
+		await fs.writeFile(
+			runner,
+			`@echo off\r\n>> "${startsPath}" echo start\r\n> "${readyPath}" echo ready\r\n:wait\r\nif not exist "${releasePath}" (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto wait\r\n)\r\nexit /b 0\r\n`,
+		);
+		await writeConfig(configPath, runner);
+
+		const readinessAbort = new AbortController();
+		// This is a real subprocess integration boundary. Bound the file-system
+		// signal so a broken launcher cannot leave its child and watcher alive.
+		const readinessSignal = AbortSignal.any([readinessAbort.signal, AbortSignal.timeout(15_000)]);
+		const ready = waitForFile(readyPath, readinessSignal);
+		const first = Bun.spawn(
+			[
+				powershellPath,
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				launcherPath,
+				"-ConfigPath",
+				configPath,
+			],
+			{ cwd: repositoryRoot, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+		);
+		let firstExitCode: number;
+		try {
+			const readiness = await Promise.race([
+				ready.then(() => ({ kind: "ready" as const })),
+				first.exited.then(exitCode => ({ kind: "exited" as const, exitCode })),
+			]);
+			if (readiness.kind === "exited") {
+				throw new Error(`Launcher exited with ${readiness.exitCode} before its runner became ready`);
+			}
+			const overlapAbort = new AbortController();
+			const overlapDeadline = AbortSignal.any([overlapAbort.signal, AbortSignal.timeout(15_000)]);
+			const overlapping = Bun.spawn(
+				[
+					powershellPath,
+					"-NoProfile",
+					"-NonInteractive",
+					"-ExecutionPolicy",
+					"Bypass",
+					"-File",
+					launcherPath,
+					"-ConfigPath",
+					configPath,
+				],
+				{ cwd: repositoryRoot, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			try {
+				const overlapResult = await Promise.race([
+					overlapping.exited.then(exitCode => ({ kind: "exited" as const, exitCode })),
+					new Promise<{ kind: "deadline" }>(resolve => {
+						overlapDeadline.addEventListener("abort", () => resolve({ kind: "deadline" }), { once: true });
+					}),
+				]);
+				if (overlapResult.kind === "deadline") {
+					throw new Error("Overlapping launcher did not finish before the integration deadline");
+				}
+				expect(overlapResult.exitCode).toBe(0);
+				expect((await fs.readFile(startsPath, "utf8")).trim().split(/\r?\n/)).toEqual(["start"]);
+			} finally {
+				await fs.writeFile(releasePath, "release");
+				overlapAbort.abort();
+				const cleanupDeadline = AbortSignal.timeout(5_000);
+				const cleanupResult = await Promise.race([
+					overlapping.exited.then(() => "exited" as const),
+					new Promise<"deadline">(resolve => {
+						cleanupDeadline.addEventListener("abort", () => resolve("deadline"), { once: true });
+					}),
+				]);
+				if (cleanupResult === "deadline" && overlapping.exitCode === null) {
+					const treeKill = Bun.spawn(["taskkill.exe", "/PID", String(overlapping.pid), "/T", "/F"], {
+						stdin: "ignore",
+						stdout: "ignore",
+						stderr: "ignore",
+					});
+					await treeKill.exited;
+				}
+				await Promise.all([
+					overlapping.exited,
+					new Response(overlapping.stdout).text(),
+					new Response(overlapping.stderr).text(),
+				]);
+			}
+		} finally {
+			await fs.writeFile(releasePath, "release");
+			readinessAbort.abort();
+			const cleanupDeadline = AbortSignal.timeout(5_000);
+			const cleanupResult = await Promise.race([
+				first.exited.then(() => "exited" as const),
+				new Promise<"deadline">(resolve => {
+					cleanupDeadline.addEventListener("abort", () => resolve("deadline"), { once: true });
+				}),
+			]);
+			if (cleanupResult === "deadline" && first.exitCode === null) {
+				const treeKill = Bun.spawn(["taskkill.exe", "/PID", String(first.pid), "/T", "/F"], {
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				await treeKill.exited;
+			}
+			[firstExitCode] = await Promise.all([
+				first.exited,
+				new Response(first.stdout).text(),
+				new Response(first.stderr).text(),
+			]);
+		}
+		expect(firstExitCode).toBe(0);
+	},
+	45_000,
+);
+
+windowsTest("a failed pipeline releases the invocation mutex for the next run", async () => {
+	const root = await createRoot();
+	const runner = path.join(root, "recovering-runner.cmd");
+	const configPath = path.join(root, "config.json");
+	const marker = path.join(root, "runs.txt");
+	await fs.writeFile(runner, `@echo off\r\n>> "${marker}" echo failed\r\nexit /b 23\r\n`);
+	await writeConfig(configPath, runner);
+
+	const failed = await runPowerShell(["-File", launcherPath, "-ConfigPath", configPath]);
+	expect(failed.exitCode).toBe(23);
+
+	await fs.writeFile(runner, `@echo off\r\n>> "${marker}" echo recovered\r\nexit /b 0\r\n`);
+	const recovered = await runPowerShell(["-File", launcherPath, "-ConfigPath", configPath]);
+	expect(recovered.exitCode).toBe(0);
+	expect((await fs.readFile(marker, "utf8")).trim().split(/\r?\n/)).toEqual(["failed", "recovered"]);
+});
+
 windowsTest("a config-only scheduled action follows runner updates without re-registration", async () => {
 	const root = await createRoot();
 	const firstMarker = path.join(root, "first.marker");
@@ -143,8 +311,21 @@ function New-ScheduledTaskTrigger {
     param([switch]$Weekly, $At, $WeeksInterval, $DaysOfWeek)
     [pscustomobject]@{ Weekly = [bool]$Weekly; At = $At; WeeksInterval = $WeeksInterval; DaysOfWeek = [string]$DaysOfWeek }
 }
-function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) [pscustomobject]@{} }
-function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $MultipleInstances, $RestartCount, $ExecutionTimeLimit) [pscustomobject]@{} }
+function New-ScheduledTaskPrincipal {
+    param($UserId, $LogonType, $RunLevel)
+    [pscustomobject]@{ UserId = $UserId; LogonType = [string]$LogonType; RunLevel = [string]$RunLevel }
+}
+function New-ScheduledTaskSettingsSet {
+    param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $MultipleInstances, $RestartCount, $ExecutionTimeLimit)
+    [pscustomobject]@{
+        AllowStartIfOnBatteries = [bool]$AllowStartIfOnBatteries
+        DontStopIfGoingOnBatteries = [bool]$DontStopIfGoingOnBatteries
+        StartWhenAvailable = [bool]$StartWhenAvailable
+        MultipleInstances = [string]$MultipleInstances
+        RestartCount = [int]$RestartCount
+        ExecutionTimeLimitHours = $ExecutionTimeLimit.TotalHours
+    }
+}
 function Get-ScheduledTask {
     param($TaskName, $TaskPath, $ErrorAction)
     if ($env:AUTOBOT_EXISTING_MODE -eq "owned") {
@@ -156,15 +337,34 @@ function Get-ScheduledTask {
     return $null
 }
 function Write-ScheduleCapture {
-    param($Operation, $Trigger)
-    [pscustomobject]@{ operation = $Operation; dayOfWeek = [string]$Trigger.DaysOfWeek; hour = $Trigger.At.Hour; minute = $Trigger.At.Minute } |
-        ConvertTo-Json -Compress |
-        Set-Content -LiteralPath $env:AUTOBOT_SCHEDULE_CAPTURE -Encoding UTF8
+    param($Operation, $Trigger, $Settings, $Principal)
+    $capture = [ordered]@{
+        weekly = $Trigger.Weekly
+        weeksInterval = $Trigger.WeeksInterval
+        operation = $Operation
+        dayOfWeek = [string]$Trigger.DaysOfWeek
+        hour = $Trigger.At.Hour
+        minute = $Trigger.At.Minute
+    }
+    if ($null -ne $Settings) {
+        $capture.settings = [ordered]@{
+            allowStartIfOnBatteries = $Settings.AllowStartIfOnBatteries
+            dontStopIfGoingOnBatteries = $Settings.DontStopIfGoingOnBatteries
+            startWhenAvailable = $Settings.StartWhenAvailable
+            multipleInstances = $Settings.MultipleInstances
+            restartCount = $Settings.RestartCount
+            executionTimeLimitHours = $Settings.ExecutionTimeLimitHours
+        }
+    }
+    if ($null -ne $Principal) {
+        $capture.principal = [ordered]@{ logonType = $Principal.LogonType; runLevel = $Principal.RunLevel }
+    }
+    $capture | ConvertTo-Json -Compress -Depth 4 | Set-Content -LiteralPath $env:AUTOBOT_SCHEDULE_CAPTURE -Encoding UTF8
 }
 function Register-ScheduledTask {
     param($TaskName, $TaskPath, $Description, $Action, $Trigger, $Principal, $Settings, [switch]$Force, $ErrorAction)
     $Action | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:AUTOBOT_ACTION_CAPTURE -Encoding UTF8
-    Write-ScheduleCapture -Operation "register" -Trigger $Trigger
+    Write-ScheduleCapture -Operation "register" -Trigger $Trigger -Settings $Settings -Principal $Principal
     return [pscustomobject]@{}
 }
 function Set-ScheduledTask {
@@ -189,9 +389,23 @@ function Set-ScheduledTask {
 	) as CapturedScheduleOperation;
 	expect(initialSchedule).toEqual({
 		operation: "register",
+		weekly: true,
+		weeksInterval: 1,
 		dayOfWeek: "Friday",
 		hour: 21,
 		minute: 17,
+		settings: {
+			allowStartIfOnBatteries: true,
+			dontStopIfGoingOnBatteries: true,
+			startWhenAvailable: true,
+			multipleInstances: "IgnoreNew",
+			restartCount: 0,
+			executionTimeLimitHours: 72,
+		},
+		principal: {
+			logonType: "Interactive",
+			runLevel: "Limited",
+		},
 	});
 
 	await fs.rm(scheduleCapture);
@@ -208,6 +422,8 @@ function Set-ScheduledTask {
 	) as CapturedScheduleOperation;
 	expect(updatedSchedule).toEqual({
 		operation: "set",
+		weekly: true,
+		weeksInterval: 1,
 		dayOfWeek: "Friday",
 		hour: 21,
 		minute: 17,

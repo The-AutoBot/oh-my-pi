@@ -110,6 +110,7 @@ interface CommandOptions {
 	readonly cwd?: string;
 	readonly env?: NodeJS.ProcessEnv;
 	readonly captureOutput?: boolean;
+	readonly forwardSdkTimings?: boolean;
 }
 
 interface CandidateReleasePlan {
@@ -137,12 +138,14 @@ interface ReleaseChain {
 	readonly previousRelease?: GitHubRelease;
 	readonly matchingDraft?: GitHubRelease;
 	readonly matchingPublished?: GitHubRelease;
+	readonly channelComplete?: ChannelEnvelope;
 }
 
 interface ExpectedDraft {
 	readonly sequence: number;
 	readonly tag: string;
 	readonly targetCommit: string;
+	readonly envelopePath: string;
 }
 
 interface ReleaseBuildIdentity {
@@ -348,6 +351,42 @@ async function captureBounded(
 		truncated: true,
 	};
 }
+function forwardValidatedSdkTimings(stderr: string): void {
+	const prefix = "OMP_AUTOBOT_SDK_TIMING ";
+	for (const line of stderr.split(/\r?\n/)) {
+		if (!line.startsWith(prefix)) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(line.slice(prefix.length));
+		} catch {
+			continue;
+		}
+		if (!isRecord(value)) continue;
+		const keys = Object.keys(value);
+		if (
+			keys.some(key => key !== "schemaVersion" && key !== "phase" && key !== "durationMs" && key !== "outcome") ||
+			value.schemaVersion !== 1 ||
+			typeof value.phase !== "string" ||
+			!/^[a-z][a-z0-9-]{0,63}$/.test(value.phase) ||
+			typeof value.durationMs !== "number" ||
+			!Number.isFinite(value.durationMs) ||
+			value.durationMs < 0 ||
+			value.durationMs > 7 * 24 * 60 * 60 * 1000 ||
+			(value.outcome !== undefined && value.outcome !== "reused" && value.outcome !== "published")
+		) {
+			continue;
+		}
+		process.stderr.write(
+			`${prefix}${JSON.stringify({
+				schemaVersion: 1,
+				phase: value.phase,
+				durationMs: value.durationMs,
+				...(value.outcome === undefined ? {} : { outcome: value.outcome }),
+			})}\n`,
+		);
+	}
+}
+
 function isInside(parent: string, child: string): boolean {
 	const relative = path.relative(parent, child);
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -435,13 +474,14 @@ export async function runQuiet(
 	const startedAt = performance.now();
 	let child: Bun.Subprocess<"ignore", "ignore" | "pipe", "ignore" | "pipe">;
 	const captureOutput = options.captureOutput === true && recorder.recordOutput !== undefined;
+	const captureStreams = captureOutput || options.forwardSdkTimings === true;
 	try {
 		child = Bun.spawn([...argv], {
 			cwd: options.cwd,
 			env: options.env ?? process.env,
 			stdin: "ignore",
-			stdout: captureOutput ? "pipe" : "ignore",
-			stderr: captureOutput ? "pipe" : "ignore",
+			stdout: captureStreams ? "pipe" : "ignore",
+			stderr: captureStreams ? "pipe" : "ignore",
 		});
 	} catch (error) {
 		const durationMs = Math.min(7 * 24 * 60 * 60 * 1000, Math.max(0, Math.floor(performance.now() - startedAt)));
@@ -454,7 +494,7 @@ export async function runQuiet(
 	}
 	const redactionPolicy = createCommandOutputRedactionPolicy(process.env, options.env ?? process.env);
 	const captured =
-		captureOutput &&
+		captureStreams &&
 		child.stdout !== undefined &&
 		child.stderr !== undefined &&
 		typeof child.stdout !== "number" &&
@@ -479,7 +519,8 @@ export async function runQuiet(
 	} catch {
 		if (exitCode === 0) throw new AutoBotReleaseError("Local command diagnostics could not be recorded");
 	}
-	if (captured && recorder.recordOutput) {
+	if (captured && options.forwardSdkTimings === true) forwardValidatedSdkTimings(captured[1].text);
+	if (captured && captureOutput && recorder.recordOutput) {
 		try {
 			await recorder.recordOutput({
 				commandKind,
@@ -1097,6 +1138,27 @@ async function establishReleaseChain(
 		}
 	}
 	const channel = await readChannelEnvelope(config, trusted, path.join(stageRoot, "previous-channel-envelope.json"));
+	if (expectedDraft && channel?.verified.manifest.releaseSequence === expectedDraft.sequence) {
+		if (
+			drafts.length !== 0 ||
+			!matchingPublished ||
+			published.length !== expectedDraft.sequence ||
+			published.some((release, index) => release.draft || release.sequence !== index + 1) ||
+			published.at(-1)?.tag !== expectedDraft.tag ||
+			published.at(-1)?.targetCommit !== expectedDraft.targetCommit
+		) {
+			throw new AutoBotReleaseError(
+				"Prepared signed channel does not match the exact completed immutable AutoBot release chain",
+			);
+		}
+		await compareExactBytes(expectedDraft.envelopePath, channel.path, "Completed signed channel envelope");
+		return {
+			sequence: expectedDraft.sequence,
+			tag: expectedDraft.tag,
+			matchingPublished,
+			channelComplete: channel,
+		};
+	}
 	if (!channel) {
 		if (!config.allowInitial) {
 			throw new AutoBotReleaseError(
@@ -1833,7 +1895,6 @@ export async function admitCandidateNativeInputs(
 	return { commandEnvironments, nativeInputs, nativeReuse };
 }
 
-
 async function buildCandidateAssets(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
@@ -1862,28 +1923,32 @@ async function buildCandidateAssets(
 			},
 		),
 	);
-	await candidateBuildStage("browser-relay-output", "Browser relay build did not produce its required embedded assets", async () => {
-		await Promise.all([
-			requireRegularFile(
-				path.join(sourceRoot, "packages", "browser-relay", "dist", "omp-browser-relay-extension.zip"),
-				"Browser relay extension archive",
-			),
-			requireRegularFile(
-				path.join(
-					sourceRoot,
-					"packages",
-					"coding-agent",
-					"src",
-					"tools",
-					"browser",
-					"relay",
-					"extension-assets",
-					"background.js.txt",
+	await candidateBuildStage(
+		"browser-relay-output",
+		"Browser relay build did not produce its required embedded assets",
+		async () => {
+			await Promise.all([
+				requireRegularFile(
+					path.join(sourceRoot, "packages", "browser-relay", "dist", "omp-browser-relay-extension.zip"),
+					"Browser relay extension archive",
 				),
-				"Browser relay embedded background asset",
-			),
-		]);
-	});
+				requireRegularFile(
+					path.join(
+						sourceRoot,
+						"packages",
+						"coding-agent",
+						"src",
+						"tools",
+						"browser",
+						"relay",
+						"extension-assets",
+						"background.js.txt",
+					),
+					"Browser relay embedded background asset",
+				),
+			]);
+		},
+	);
 	await candidateBuildStage("collab-web-build", "Collab web build failed", () =>
 		runQuiet(
 			recorder,
@@ -1922,8 +1987,10 @@ async function buildCandidateAssets(
 			...(await createPrivateCommandEnvironment(smokeRoot, candidateEnvironment)),
 			PI_NATIVE_VARIANT: "baseline",
 		};
-		const reportedVersion = await candidateBuildStage("runtime-version-check", "Windows x64 runtime --version check failed", () =>
-			runText("Windows x64 runtime version check", [runtime, "--version"], { env: smokeEnvironment }),
+		const reportedVersion = await candidateBuildStage(
+			"runtime-version-check",
+			"Windows x64 runtime --version check failed",
+			() => runText("Windows x64 runtime version check", [runtime, "--version"], { env: smokeEnvironment }),
 		);
 		if (reportedVersion.trim() !== `omp/${candidate.upstreamVersion}`) {
 			throw new LocalBuildFailure(
@@ -1946,10 +2013,13 @@ async function buildCandidateAssets(
 				captureOutput: true,
 			}),
 		);
-		const reportedIdentity = await candidateBuildStage("runtime-identity-check", "Windows x64 runtime identity check failed", () =>
-			runText("Windows x64 runtime identity check", [runtime, "--autobot-build-identity"], {
-				env: smokeEnvironment,
-			}),
+		const reportedIdentity = await candidateBuildStage(
+			"runtime-identity-check",
+			"Windows x64 runtime identity check failed",
+			() =>
+				runText("Windows x64 runtime identity check", [runtime, "--autobot-build-identity"], {
+					env: smokeEnvironment,
+				}),
 		);
 		let parsedIdentity: unknown;
 		try {
@@ -1998,11 +2068,14 @@ async function buildCandidateAssets(
 	await candidateBuildStage("bootstrap-output", "Windows x64 bootstrap output was not produced", () =>
 		requireRegularFile(bootstrap, "Windows x64 bootstrap"),
 	);
-	const webBundleId = await candidateBuildStage("collab-web-bundle-identity", "Collab web bundle identity derivation failed", () =>
-		deriveManagedBundleId(
-			path.join(sourceRoot, "packages", "collab-web", "dist"),
-			path.join(sourceRoot, "packages", "collab-web", "public"),
-		),
+	const webBundleId = await candidateBuildStage(
+		"collab-web-bundle-identity",
+		"Collab web bundle identity derivation failed",
+		() =>
+			deriveManagedBundleId(
+				path.join(sourceRoot, "packages", "collab-web", "dist"),
+				path.join(sourceRoot, "packages", "collab-web", "public"),
+			),
 	);
 	const webArchive = path.join(inputs, `omp-collab-web-${webBundleId}.tar.gz`);
 	await candidateBuildStage("collab-web-packaging", "Collab web release packaging failed", () =>
@@ -2073,6 +2146,7 @@ async function buildCoordinatorAsset(
 		{
 			cwd: coordinatorRoot,
 			env: coordinatorEnvironment,
+			forwardSdkTimings: environmentValue(coordinatorEnvironment, "OMP_AUTOBOT_SDK_TIMINGS") === "1",
 		},
 	);
 	await runQuiet(
@@ -2320,6 +2394,132 @@ async function signAndVerifyLocalBundle(
 	);
 }
 
+async function uploadVerifiedDraftAssets(
+	config: LocalAutomationConfig,
+	tag: string,
+	bundle: AssembledBundle,
+	recorder: LocalCommandRecorder,
+	selectedFiles?: readonly string[],
+): Promise<void> {
+	const assetIndex = parseAssetIndex(await readJson(path.join(bundle.root, "asset-index.json"), "local asset index"));
+	const payloads = assetIndex.assets.map(asset => path.join(bundle.root, asset.file));
+	if (payloads.length !== 4)
+		throw new AutoBotReleaseError("Local bundle does not contain exactly four payload assets");
+	const allFiles = [...payloads, ...RELEASE_METADATA_FILES.map(file => path.join(bundle.root, file))];
+	const files = selectedFiles ?? allFiles;
+	if (files.length === 0 || files.some(file => !allFiles.includes(file))) {
+		throw new AutoBotReleaseError("GitHub release upload selection is not an exact local bundle subset");
+	}
+	await runQuiet(recorder, "github-release-upload", "GitHub release upload", [
+		"gh",
+		"release",
+		"upload",
+		tag,
+		"--repo",
+		config.repository,
+		...files,
+	]);
+}
+
+async function listGitHubReleaseAssetNames(repository: string, tag: string): Promise<readonly string[]> {
+	const output = await runText("GitHub release asset listing", [
+		"gh",
+		"release",
+		"view",
+		tag,
+		"--repo",
+		repository,
+		"--json",
+		"assets",
+	]);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(output);
+	} catch (error) {
+		throw new AutoBotReleaseError("GitHub release asset listing is not valid JSON", { cause: error });
+	}
+	if (!isRecord(parsed) || !Array.isArray(parsed.assets)) {
+		throw new AutoBotReleaseError("GitHub release asset listing is malformed");
+	}
+	const names = parsed.assets.map((asset, index) => {
+		if (!isRecord(asset)) throw new AutoBotReleaseError(`GitHub release asset ${index} is malformed`);
+		const name = requireString(asset.name, `GitHub release asset ${index} name`);
+		if (!name || path.basename(name) !== name) {
+			throw new AutoBotReleaseError(`GitHub release asset ${index} has an unsafe name`);
+		}
+		return name;
+	});
+	if (new Set(names).size !== names.length) {
+		throw new AutoBotReleaseError("GitHub release asset listing contains duplicate names");
+	}
+	return names;
+}
+
+async function missingMatchingDraftAssets(
+	config: LocalAutomationConfig,
+	tag: string,
+	bundle: AssembledBundle,
+	stageRoot: string,
+	recorder: LocalCommandRecorder,
+): Promise<readonly string[]> {
+	const index = parseAssetIndex(await readJson(path.join(bundle.root, "asset-index.json"), "local asset index"));
+	const allFiles = [
+		...index.assets.map(asset => path.join(bundle.root, asset.file)),
+		...RELEASE_METADATA_FILES.map(file => path.join(bundle.root, file)),
+	];
+	const expected = new Map(allFiles.map(file => [path.basename(file), file]));
+	if (expected.size !== allFiles.length) {
+		throw new AutoBotReleaseError("Matching GitHub draft expected asset names are not unique");
+	}
+	const listedNames = await listGitHubReleaseAssetNames(config.repository, tag);
+	if (listedNames.some(name => !expected.has(name))) {
+		throw new AutoBotReleaseError("Matching GitHub draft contains foreign release assets");
+	}
+	if (listedNames.length === 0) return allFiles;
+	const downloaded = await fs.mkdtemp(path.join(stageRoot, "downloaded-draft-"));
+	try {
+		await runQuiet(recorder, "github-release-download", "GitHub draft release download", [
+			"gh",
+			"release",
+			"download",
+			tag,
+			"--repo",
+			config.repository,
+			"--dir",
+			downloaded,
+			"--pattern",
+			"*",
+		]);
+		const entries = await fs.readdir(downloaded, { withFileTypes: true });
+		if (
+			entries.some(entry => !entry.isFile() || entry.isSymbolicLink()) ||
+			entries.some(entry => !expected.has(entry.name))
+		) {
+			throw new AutoBotReleaseError("Matching GitHub draft contains foreign release assets");
+		}
+		for (const entry of entries) {
+			const local = expected.get(entry.name);
+			if (!local) throw new AutoBotReleaseError("Matching GitHub draft contains a foreign release asset");
+			const [localHash, remoteHash] = await Promise.all([
+				hashFile(local),
+				hashFile(path.join(downloaded, entry.name)),
+			]);
+			if (localHash.size !== remoteHash.size || localHash.sha256 !== remoteHash.sha256) {
+				throw new AutoBotReleaseError(
+					"Matching GitHub draft contains an asset that differs from the retained release",
+				);
+			}
+		}
+		const present = new Set(entries.map(entry => entry.name));
+		if (listedNames.some(name => !present.has(name))) {
+			throw new AutoBotReleaseError("GitHub draft asset state changed while it was inspected");
+		}
+		return allFiles.filter(file => !present.has(path.basename(file)));
+	} finally {
+		await fs.rm(downloaded, { recursive: true, force: true });
+	}
+}
+
 async function publishVerifiedDraft(
 	config: LocalAutomationConfig,
 	candidate: LocalCandidate,
@@ -2342,20 +2542,7 @@ async function publishVerifiedDraft(
 		"--notes",
 		"Signed AutoBot Windows x64 runtime release. Channel promotion is the final separate step.",
 	]);
-	const assetIndex = parseAssetIndex(await readJson(path.join(bundle.root, "asset-index.json"), "local asset index"));
-	const payloads = assetIndex.assets.map(asset => path.join(bundle.root, asset.file));
-	if (payloads.length !== 4)
-		throw new AutoBotReleaseError("Local bundle does not contain exactly four payload assets");
-	await runQuiet(recorder, "github-release-upload", "GitHub release upload", [
-		"gh",
-		"release",
-		"upload",
-		chain.tag,
-		"--repo",
-		config.repository,
-		...payloads,
-		...RELEASE_METADATA_FILES.map(file => path.join(bundle.root, file)),
-	]);
+	await uploadVerifiedDraftAssets(config, chain.tag, bundle, recorder);
 }
 
 async function advanceChannelLast(
@@ -2529,7 +2716,17 @@ async function finalizeVerifiedRelease(
 	await assertOperatorGitCommitIdentity(stageRoot);
 	if (!alreadyPublished) {
 		await createAndAssertReleaseTag(config, candidate, chain.tag, recorder);
-		if (!draftExists) await publishVerifiedDraft(config, candidate, chain, bundle, recorder);
+		if (!draftExists) {
+			await publishVerifiedDraft(config, candidate, chain, bundle, recorder);
+		} else {
+			await assertSingleMatchingDraft(config, candidate, chain);
+			const missing = await missingMatchingDraftAssets(config, chain.tag, bundle, stageRoot, recorder);
+			if (missing.length > 0) {
+				await assertSingleMatchingDraft(config, candidate, chain);
+				await uploadVerifiedDraftAssets(config, chain.tag, bundle, recorder, missing);
+				await assertSingleMatchingDraft(config, candidate, chain);
+			}
+		}
 	}
 	const publishedIntegrationRef = await assertIntegrationRef(config, candidate, candidate.sourceRoot, recorder);
 	await verifyPublishedRelease(
@@ -2969,6 +3166,7 @@ export async function publishPreparedLocalRelease(
 		sequence: expectedSequence,
 		tag: expectedTag,
 		targetCommit: candidate.forkCommit,
+		envelopePath: bundle.signedEnvelope,
 	};
 	const coordinatorSourceSha256 = await assertPreparedCoordinatorIdentity(config, bundleRoot);
 	let completed = false;
@@ -3009,6 +3207,44 @@ export async function publishPreparedLocalRelease(
 		);
 		await assertCleanCommittedCheckout(sourceRoot, "Candidate source", candidate.forkCommit);
 		await assertPreparedCoordinatorIdentity(config, bundleRoot);
+		if (chain.channelComplete) {
+			await verifyPublishedRelease(
+				config,
+				candidate,
+				chain.tag,
+				recoveryRoot,
+				environment,
+				{
+					localBundle: bundle.root,
+					expectedEnvelope: bundle.signedEnvelope,
+					canonicalRef: integrationRef,
+				},
+				recorder,
+			);
+			const recheckedChannel = await readChannelEnvelope(
+				config,
+				trusted,
+				path.join(recoveryRoot, "rechecked-completed-channel-envelope.json"),
+			);
+			if (!recheckedChannel) {
+				throw new AutoBotReleaseError("Completed signed channel disappeared during prepared publication recovery");
+			}
+			await compareExactBytes(
+				bundle.signedEnvelope,
+				recheckedChannel.path,
+				"Rechecked completed signed channel envelope",
+			);
+			await assertCompletedReleaseChain(config, chain.sequence, chain.tag, candidate.forkCommit);
+			await fetchAndAssertReleaseTag(config, sourceRoot, chain.tag, candidate.forkCommit, recorder);
+			await assertIntegrationRef(config, candidate, sourceRoot, recorder);
+			completed = true;
+			return {
+				kind: "published",
+				forkCommit: candidate.forkCommit,
+				releaseSequence: chain.sequence,
+				tag: chain.tag,
+			};
+		}
 		await finalizeVerifiedRelease(
 			config,
 			candidate,

@@ -286,7 +286,6 @@ export function hasRetainedPublishedCheckpoint(
 	return publishedForkCommit !== undefined && publishedForkCommit === observedCommit;
 }
 
-
 /** Derive the immutable application-source boundary for one repairable failed step. */
 export function deriveFailedStepContext(stepId: RepairableStepId): FailedStepContext {
 	if (!Object.prototype.hasOwnProperty.call(REPAIRABLE_STEP_SOURCE_PATHS, stepId)) {
@@ -661,11 +660,7 @@ async function assertTrustedProducerUnchanged(producer: TrustedProducer): Promis
 		await gitOutput(producer.root, ["rev-parse", "--verify", "HEAD^{commit}"]),
 		"Trusted producer HEAD",
 	);
-	const trackedStatus = await gitOutput(producer.root, [
-		"status",
-		"--porcelain=v1",
-		"--untracked-files=no",
-	]);
+	const trackedStatus = await gitOutput(producer.root, ["status", "--porcelain=v1", "--untracked-files=no"]);
 	if (!samePath(producer.root, actualRoot) || currentCommit !== producer.commit || trackedStatus !== "") {
 		throw new AutoBotReleaseError("Trusted producer checkout changed or has uncommitted tracked changes");
 	}
@@ -1253,10 +1248,7 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 	let persistenceDurationMs = 0;
 	let writes = Promise.resolve();
 	const boundedDuration = (startedAt: number): number =>
-		Math.min(
-			MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS,
-			Math.max(0, Math.floor(performance.now() - startedAt)),
-		);
+		Math.min(MAX_COMMAND_DIAGNOSTIC_DURATION_MILLISECONDS, Math.max(0, Math.floor(performance.now() - startedAt)));
 	const includePersistence = (startedAt: number): void => {
 		persistenceCount++;
 		persistenceDurationMs = Math.min(
@@ -1302,11 +1294,7 @@ export async function createLocalCommandRecorder(workRoot: string): Promise<Loca
 			writes = operation.catch(() => undefined);
 			return operation;
 		},
-		async measure<T>(
-			commandKind: LocalCommandKind,
-			nested: boolean,
-			operation: () => Promise<T>,
-		): Promise<T> {
+		async measure<T>(commandKind: LocalCommandKind, nested: boolean, operation: () => Promise<T>): Promise<T> {
 			if (AGGREGATED_OPERATION_KINDS[commandKind] !== true || commandKind === "diagnostic-persistence") {
 				throw new AutoBotReleaseError("Local operation timing kind is invalid");
 			}
@@ -2001,10 +1989,17 @@ async function pushIntegrationBranch(context: OmpControllerContext, candidateCom
 }
 
 async function compatibilityFingerprint(candidate: LocalCandidate, canonicalCommit: string): Promise<string> {
-	// Bind review coverage to exact compatibility-relevant changes, not whole
-	// candidate roots: non-sensitive integrations and repairs retain coverage,
-	// while a changed sensitive blob or compatibility epoch must re-run review.
-	const basis = [String(candidate.compatibilityEpoch), ...candidate.sensitivePaths];
+	// Bind review coverage to the exact pinned compatibility inputs and their
+	// compatibility-relevant changes, not the whole candidate root. Unrelated
+	// repairs retain coverage, while a changed source pin, sensitive blob, path
+	// inventory, or compatibility epoch must re-run review.
+	const canonical = requireCommit(canonicalCommit, "Canonical compatibility base");
+	const basis = [
+		canonical,
+		requireCommit(candidate.upstreamCommit, "Candidate upstream commit"),
+		String(candidate.compatibilityEpoch),
+		...candidate.sensitivePaths,
+	];
 	if (candidate.sensitivePaths.length === 0) return sha256(basis.join("\u0000"));
 	const compatibilityDiff = await runCommand(
 		[
@@ -2016,7 +2011,7 @@ async function compatibilityFingerprint(candidate: LocalCandidate, canonicalComm
 			"-z",
 			"--no-abbrev",
 			"--no-renames",
-			requireCommit(canonicalCommit, "Canonical compatibility base"),
+			canonical,
 			candidate.forkCommit,
 		],
 		{ cwd: candidate.sourceRoot, capture: true },

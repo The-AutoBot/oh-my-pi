@@ -15,7 +15,7 @@ import { daemonClientForProject } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
 import { daemonRuntimeDir } from "../launch/paths";
 import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
-import type { BlobBackend } from "./broker";
+import { type BlobBackend, LocalBlobBackend } from "./broker";
 import {
 	BLOB_BROKER_CONFIG_ENV,
 	BLOB_BROKER_DAEMON_NAME,
@@ -31,6 +31,7 @@ import {
 	type BlobBrokerPurgeResponse,
 	type BlobBrokerStatus,
 	type BlobBrokerWorkerConfig,
+	type BlobStoreStatus,
 	blobBrokerEndpoint,
 	type EnsureBlobResponse,
 } from "./protocol";
@@ -288,15 +289,50 @@ export async function connectDaemonBlobBackend(
 	}
 }
 
-/** Exercise worker-host blob daemon startup and the /info probe for distribution smoke tests. */
+async function assertBlobBackendSmoke(
+	ensureBlob: () => Promise<BlobPublication | null>,
+	getStatus: () => Promise<BlobStoreStatus>,
+): Promise<void> {
+	const publication = await ensureBlob();
+	if (!publication) throw new Error("blob broker smoke failed: ensure returned no publication");
+	if (publication.destination !== "direct" || publication.bytes !== 10) {
+		throw new Error("blob broker smoke failed: ensure returned incomplete publication metadata");
+	}
+	const served = await fetch(publication.url);
+	if (!served.ok || (await served.text()) !== "smoke-test") {
+		throw new Error(`blob broker smoke failed: blob roundtrip returned ${served.status}`);
+	}
+	const status = await getStatus();
+	if (status.metrics.activeBlobs !== 1 || status.metrics.hits !== 1 || status.metrics.bytesServed !== 10) {
+		throw new Error("blob broker smoke failed: status metrics did not roundtrip");
+	}
+}
+
+/**
+ * Exercise the supported blob backend for this platform: the in-process direct
+ * backend on Windows, and worker-host daemon startup plus /info elsewhere.
+ */
 export async function smokeTestBlobBroker(): Promise<void> {
-	const socket = path.join(os.tmpdir(), `omp-blob-smoke-${process.pid.toString(36)}.sock`);
 	const config: BlobBrokerWorkerConfig = {
 		kind: "direct",
 		options: {},
 		credentials: {},
 		bindHost: "127.0.0.1",
 	};
+	if (process.platform === "win32") {
+		const backend = new LocalBlobBackend(config);
+		try {
+			await assertBlobBackendSmoke(
+				() => backend.ensureBlob("smoke", "image/png", () => Buffer.from("smoke-test")),
+				async () => backend.storeStatus(),
+			);
+		} finally {
+			backend.stop();
+		}
+		return;
+	}
+
+	const socket = path.join(os.tmpdir(), `omp-blob-smoke-${process.pid.toString(36)}.sock`);
 	const spawn = resolveWorkerSpawnCmd(BLOB_BROKER_WORKER_ARG);
 	const proc = ptree.spawn(spawn.cmd, {
 		cwd: spawn.cwd,
@@ -319,26 +355,20 @@ export async function smokeTestBlobBroker(): Promise<void> {
 				`blob broker smoke failed: no /info response (${proc.peekStderr().slice(-500) || "no stderr"})`,
 			);
 		}
-		const { publication } = await fetchUnix<EnsureBlobResponse>(socket, "/blob", {
-			method: "POST",
-			body: JSON.stringify({
-				key: "smoke",
-				mimeType: "image/png",
-				data: Buffer.from("smoke-test").toString("base64"),
-			}),
-		});
-		if (!publication) throw new Error("blob broker smoke failed: ensure returned no publication");
-		if (publication.destination !== "direct" || publication.bytes !== 10) {
-			throw new Error("blob broker smoke failed: ensure returned incomplete publication metadata");
-		}
-		const served = await fetch(publication.url);
-		if (!served.ok || (await served.text()) !== "smoke-test") {
-			throw new Error(`blob broker smoke failed: blob roundtrip returned ${served.status}`);
-		}
-		const status = await fetchUnix<BlobBrokerStatus>(socket, "/status");
-		if (status.metrics.activeBlobs !== 1 || status.metrics.hits !== 1 || status.metrics.bytesServed !== 10) {
-			throw new Error("blob broker smoke failed: status metrics did not roundtrip");
-		}
+		await assertBlobBackendSmoke(
+			async () => {
+				const { publication } = await fetchUnix<EnsureBlobResponse>(socket, "/blob", {
+					method: "POST",
+					body: JSON.stringify({
+						key: "smoke",
+						mimeType: "image/png",
+						data: Buffer.from("smoke-test").toString("base64"),
+					}),
+				});
+				return publication ?? null;
+			},
+			() => fetchUnix<BlobBrokerStatus>(socket, "/status"),
+		);
 	} finally {
 		proc.kill();
 		await proc.exited.catch(() => {});

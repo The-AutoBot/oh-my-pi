@@ -220,9 +220,30 @@ if (process.platform === "win32" && process.arch === "x64") {
 			testTimeoutMilliseconds,
 		);
 		test(
+			"adds only missing exact assets to an interrupted partial draft before verification and publication",
+			async () => {
+				await runScenario("partial-upload-resume", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+		test(
+			"recovers a retained draft interrupted before its first asset upload",
+			async () => {
+				await runScenario("empty-upload-resume", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+		test(
 			"advances the channel for an exact already-published retained release without replacing its assets",
 			async () => {
 				await runScenario("published-promotion", requireGhExecutable());
+			},
+			testTimeoutMilliseconds,
+		);
+		test(
+			"accepts an exact channel-complete retained release after promotion confirmation is interrupted",
+			async () => {
+				await runScenario("channel-confirmation-resume", requireGhExecutable());
 			},
 			testTimeoutMilliseconds,
 		);
@@ -255,7 +276,6 @@ if (process.platform === "win32" && process.arch === "x64") {
 			testTimeoutMilliseconds,
 		);
 
-
 		test.each([
 			"conflicting-tag",
 			"foreign-draft",
@@ -264,6 +284,8 @@ if (process.platform === "win32" && process.arch === "x64") {
 			"unsafe-stage",
 			"foreign-modify-acl",
 			"contradictory-manifest",
+			"draft-published-during-inspection",
+			"unsafe-remote-asset-listing",
 			"invalid-provenance",
 			"recovery-tampered",
 			"recovery-invalid-provenance",

@@ -219,7 +219,10 @@ try {
 		previousBundle = priorBundle;
 	}
 	if (previousBundle) {
-		await fs.copyFile(path.join(previousBundle, "signed-envelope.json"), path.join(channelSeed, "signed-envelope.json"));
+		await fs.copyFile(
+			path.join(previousBundle, "signed-envelope.json"),
+			path.join(channelSeed, "signed-envelope.json"),
+		);
 		commit(channelSeed, "publish predecessor channel");
 		git(channelSeed, "push", "origin", "HEAD:refs/heads/main");
 	}
@@ -307,7 +310,9 @@ try {
 	const recovery = scenario.startsWith("recovery-");
 	const draft = {
 		tag_name: tag,
-		draft: recovery ? scenario === "recovery-draft" : scenario !== "published-promotion",
+		draft: recovery
+			? scenario === "recovery-draft"
+			: scenario !== "published-promotion" && scenario !== "channel-confirmation-resume",
 		target_commitish: forkCommit,
 		assets,
 	};
@@ -346,9 +351,19 @@ try {
 		channelBranch: "main",
 		channelPath: "signed-envelope.json",
 		log: [] as string[],
+		...(scenario === "draft-published-during-inspection" ? { publishAfterAssetView: true } : {}),
+		...(scenario === "unsafe-remote-asset-listing" ? { listedExtraAsset: "../foreign" } : {}),
 	};
 	if (scenario === "foreign-draft") draft.target_commitish = upstreamCommit;
 	if (scenario === "tampered-asset") await fs.appendFile(path.join(assets, "manifest.json"), "tamper");
+	if (scenario === "partial-upload-resume" || scenario === "draft-published-during-inspection") {
+		await fs.rm(path.join(assets, "signed-envelope.json"));
+		await fs.rm(path.join(assets, path.basename(runtime)));
+	}
+	if (scenario === "empty-upload-resume") {
+		await fs.rm(assets, { recursive: true });
+		await fs.mkdir(assets);
+	}
 	if (scenario === "recovery-tampered") await fs.appendFile(path.join(assets, "manifest.json"), "tamper");
 	if (scenario === "recovery-invalid-provenance") await write(path.join(assets, "provenance.json"), "{}\n");
 	if (scenario === "recovery-wrong-target") draft.target_commitish = upstreamCommit;
@@ -371,7 +386,8 @@ try {
 			assets,
 		});
 	}
-	if (recovery) {
+	const releaseExistedAtStart = releases.some(release => release.tag_name === tag);
+	if (recovery || scenario === "channel-confirmation-resume") {
 		await fs.copyFile(path.join(bundle, "signed-envelope.json"), path.join(channelSeed, "signed-envelope.json"));
 		commit(channelSeed, "publish completed channel");
 		git(channelSeed, "push", "origin", "HEAD:refs/heads/main");
@@ -546,14 +562,43 @@ try {
 		"recovery-draft",
 		"recovery-foreign-release",
 		"third-release-future",
+		"draft-published-during-inspection",
+		"unsafe-remote-asset-listing",
 	].includes(scenario);
 	if (rejecting) {
 		if (!failure) throw new Error(`${scenario} unexpectedly published`);
-		if (!recovery && !finalState.releases.find(release => release.tag_name === tag)?.draft)
+		const resultingDraft = finalState.releases.find(release => release.tag_name === tag)?.draft;
+		if (!recovery && scenario !== "draft-published-during-inspection" && !resultingDraft)
 			throw new Error(`${scenario} changed draft state`);
+		if (scenario === "draft-published-during-inspection" && resultingDraft !== false)
+			throw new Error(`${scenario} did not exercise the injected draft publication transition`);
 		if (git(channelGit, "rev-parse", "refs/heads/main") !== beforeChannel)
 			throw new Error(`${scenario} changed channel`);
 		if (finalState.log.some(value => value.startsWith("publish:"))) throw new Error(`${scenario} published draft`);
+		if (
+			(scenario === "draft-published-during-inspection" || scenario === "unsafe-remote-asset-listing") &&
+			finalState.log.some(value => value.startsWith("upload:") || value.startsWith("resume-upload:"))
+		) {
+			throw new Error(`${scenario} uploaded release assets after its boundary changed`);
+		}
+		if (
+			(scenario === "draft-published-during-inspection" || scenario === "unsafe-remote-asset-listing") &&
+			records.some(record => record.commandKind === "github-release-upload")
+		) {
+			throw new Error(`${scenario} attempted release asset upload after its boundary changed`);
+		}
+		if (
+			scenario === "unsafe-remote-asset-listing" &&
+			finalState.log.some(value => value.startsWith(`download:${tag}`))
+		) {
+			throw new Error(`${scenario} downloaded assets after the unsafe listing was observed`);
+		}
+		if (
+			scenario === "unsafe-remote-asset-listing" &&
+			records.some(record => record.commandKind === "github-release-download")
+		) {
+			throw new Error(`${scenario} attempted asset download after the unsafe listing was observed`);
+		}
 		if (readTag() !== beforeTag) throw new Error(`${scenario} changed release tag`);
 	} else {
 		if (failure) throw failure;
@@ -586,6 +631,7 @@ try {
 		const recoveryMutations = finalState.log.filter(
 			value =>
 				value.startsWith("upload:") ||
+				value.startsWith("resume-upload:") ||
 				value.startsWith("create:") ||
 				value.startsWith("publish:") ||
 				value.startsWith("delete:"),
@@ -593,13 +639,52 @@ try {
 		if (scenario === "matching" && (recoveryMutations.length !== 1 || recoveryMutations[0] !== `publish:${tag}`)) {
 			throw new Error("exact retained-draft recovery did not perform exactly the required publication");
 		}
-		if ((scenario === "published-promotion" || scenario === "recovery-complete") && recoveryMutations.length !== 0) {
+		const expectedResumeUpload =
+			scenario === "partial-upload-resume"
+				? [path.basename(runtime), "signed-envelope.json"]
+				: [
+						path.basename(runtime),
+						path.basename(bootstrap),
+						path.basename(coordinatorAsset),
+						path.basename(web),
+						"manifest.json",
+						"asset-index.json",
+						"provenance.json",
+						"coordinator-source.json",
+						"signed-envelope.json",
+					];
+		if (
+			(scenario === "partial-upload-resume" || scenario === "empty-upload-resume") &&
+			(recoveryMutations.length !== 2 ||
+				recoveryMutations[0] !== `resume-upload:${tag}:${expectedResumeUpload.join(",")}` ||
+				recoveryMutations[1] !== `publish:${tag}`)
+		) {
+			throw new Error("partial draft recovery did not add only its missing exact assets before publication");
+		}
+		if (
+			scenario === "channel-confirmation-resume" &&
+			git(channelGit, "rev-parse", "refs/heads/main") !== beforeChannel
+		) {
+			throw new Error("channel-complete recovery created a redundant channel commit");
+		}
+		if (
+			scenario === "channel-confirmation-resume" &&
+			records.some(
+				record => record.commandKind === "signed-channel-commit" || record.commandKind === "signed-channel-push",
+			)
+		) {
+			throw new Error("channel-complete recovery attempted channel mutation");
+		}
+		if (
+			(scenario === "published-promotion" ||
+				scenario === "recovery-complete" ||
+				scenario === "channel-confirmation-resume") &&
+			recoveryMutations.length !== 0
+		) {
 			throw new Error("exact completed recovery replaced assets or republished the release");
 		}
 		if (
-			scenario !== "matching" &&
-			scenario !== "published-promotion" &&
-			scenario !== "recovery-complete" &&
+			!releaseExistedAtStart &&
 			(!finalState.log.includes(`tag-exact-at-create:${tag}`) || !finalState.log.includes(`create:${tag}`))
 		) {
 			throw new Error("draft creation did not observe the exact release tag target");
@@ -628,6 +713,8 @@ try {
 				forbidden[record.commandKind] &&
 				!(
 					(scenario === "fresh" ||
+						scenario === "partial-upload-resume" ||
+						scenario === "empty-upload-resume" ||
 						scenario === "subsequent-autocrlf" ||
 						scenario === "third-release-history") &&
 					record.commandKind === "github-release-upload"

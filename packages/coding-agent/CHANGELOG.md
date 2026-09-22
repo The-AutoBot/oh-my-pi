@@ -26,6 +26,8 @@
 - Prevented standby AutoBot candidates from attempting session journal repairs before activation.
 - Restored maintained launch and update integration typing against the current upstream SDK.
 - Fixed Windows session enumeration in indexed and in-memory storage when journal paths use native backslash separators.
+- Corrected the Windows blob-broker smoke to exercise the supported in-process backend's publication, fetch, status, and cleanup path while retaining the worker IPC smoke on other platforms.
+
 ## [18.2.7] - 2026-09-21
 
 ### Breaking Changes

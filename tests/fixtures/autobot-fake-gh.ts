@@ -14,6 +14,8 @@ interface State {
 	channelBranch: string;
 	channelPath: string;
 	log: string[];
+	publishAfterAssetView?: boolean;
+	listedExtraAsset?: string;
 }
 
 const statePath = process.env.AUTOBOT_FAKE_GH_STATE;
@@ -88,11 +90,31 @@ if (exactArgs(["api", "--paginate", "--slurp", `repos/${releaseRepository}/relea
 	state.releases.push({ tag_name: tag, draft: true, target_commitish: target, assets });
 	state.log.push(`tag-exact-at-create:${tag}`);
 	await log(`create:${tag}`);
+} else if (
+	args[0] === "release" &&
+	args[1] === "view" &&
+	exactArgs(["release", "view", args[2]!, "--repo", releaseRepository, "--json", "assets"])
+) {
+	const tag = args[2]!;
+	const release = state.releases.find(value => value.tag_name === tag);
+	if (!release) throw new Error("release missing");
+	const names = await fs.readdir(release.assets);
+	if (state.listedExtraAsset) names.push(state.listedExtraAsset);
+	if (state.publishAfterAssetView) {
+		release.draft = false;
+		await log(`transition-published:${tag}`);
+	}
+	process.stdout.write(JSON.stringify({ assets: names.map(name => ({ name })) }));
 } else if (args[0] === "release" && args[1] === "upload") {
-	if (args[3] !== "--repo" || args[4] !== releaseRepository || args.length !== 14) {
+	const tag = args[2]!;
+	const fresh = state.log.includes(`create:${tag}`);
+	if (
+		args[3] !== "--repo" ||
+		args[4] !== releaseRepository ||
+		(fresh ? args.length !== 14 : args.length < 6 || args.length > 14)
+	) {
 		throw new Error("unsupported fake gh release upload invocation");
 	}
-	const tag = args[2]!;
 	const sources = args.slice(5);
 	if (
 		sources.some(source => !path.isAbsolute(source) || !isInsideFixture(path.resolve(source))) ||
@@ -102,8 +124,12 @@ if (exactArgs(["api", "--paginate", "--slurp", `repos/${releaseRepository}/relea
 	}
 	const release = state.releases.find(value => value.tag_name === tag && value.draft);
 	if (!release) throw new Error("draft missing");
-	for (const source of sources) await fs.copyFile(source, path.join(release.assets, path.basename(source)));
-	await log(`upload:${tag}`);
+	for (const source of sources) {
+		const destination = path.join(release.assets, path.basename(source));
+		if (await fs.stat(destination).catch(() => undefined)) throw new Error("asset exists");
+		await fs.copyFile(source, destination);
+	}
+	await log(`${fresh ? "upload" : "resume-upload"}:${tag}:${sources.map(source => path.basename(source)).join(",")}`);
 } else if (args[0] === "release" && args[1] === "download") {
 	if (
 		args.length !== 9 ||

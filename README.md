@@ -798,8 +798,10 @@ fields are rejected):
 - Channel and bounds: set `channelRepository`, `channelBranch`, and relative
   `channelPath`; the channel branch cannot be the protected canonical or
   integration branch. `allowInitial` is `false` unless deliberately authorizing
-  the first channel publication. Set `maxOmpAttempts` from `0` through `3` and
-  `ompMaxTime` as a positive `s`, `m`, or `h` duration no longer than two
+  the first channel publication. Set `maxOmpAttempts` from `0` through `3`; it
+  is one shared within-run budget across conflict resolution, compatibility
+  review, and eligible build repair, rather than a fresh allowance per phase.
+  Set `ompMaxTime` as a positive `s`, `m`, or `h` duration no longer than two
   hours.
 
 From the committed trusted producer checkout, run the launcher once with
@@ -870,8 +872,9 @@ To register, but not start, the dedicated weekly task:
 The installer registers **AutoBot Local Build** for the current Windows user
 at limited, interactive privilege. By default it runs every Friday at 21:17
 local time; `-DayOfWeek`, `-Hour`, and `-Minute` can select a different weekly
-schedule. Task Scheduler ignores a new instance while one is active, allows a
-run to continue on battery power, and limits it to 72 hours. Re-running the
+schedule. Task Scheduler starts a missed run when the task next becomes
+available, ignores a new instance while one is active, allows a run to continue
+on battery power, and limits it to 72 hours. Re-running the
 installer updates only the trigger of an owned task, preserving its action,
 principal, settings, security descriptor, and enabled state. It refuses to
 overwrite a task with a different action.
@@ -886,9 +889,13 @@ the native compatibility generation stable across application-only releases
 without normalizing unrelated Rust or third-party metadata. The deterministic
 controller retains the exact release plan, commands, step order, and admission
 gates; OMP never chooses commands or gains permission to skip or resume pipeline
-steps. OMP is invoked only to resolve an integration conflict, perform the
-mandatory review of a sensitive compatibility change, or repair an eligible
-application build or smoke failure.
+steps. Compatibility review is limited to the compatibility-relevant path
+inventory and blob identities, while its coverage remains bound to the exact
+canonical and effective-upstream pins and compatibility epoch; the candidate
+must also retain the committed producer, canonical, and upstream ancestry.
+OMP is invoked only to resolve an integration conflict, perform the mandatory
+review of a sensitive compatibility change, or repair an eligible application
+build or smoke failure.
 
 As a caller/controller integrity guard, the trusted producer checkout must keep
 the same pinned `HEAD` and have no staged or unstaged tracked changes at startup
@@ -905,20 +912,23 @@ on its own. Out-of-scope changes and control-plane, native, security,
 provenance, signing, or other non-eligible failures stop the run; missing,
 unpinned, or incompatible reused native inputs are never treated as a
 source-repair loop. Because an accepted source repair invalidates prior
-outputs, the controller reruns the existing full deterministic pipeline from
-the start for fresh outputs and reapplies every mandatory gate; it never uses
-receipts to resume or skip past the failed command.
+outputs, the controller calls the full builder entrypoint again from its first
+admission step for fresh outputs and reapplies every build, assembly, signing,
+download, and publication gate; it never replays only the failed command or
+uses receipts to resume past it.
 
 After an interrupted or separately completed publication, a stale integration
 checkpoint can recover automatically only when the current signed channel,
-exact immutable published release, tag, downloaded assets and provenance, and
-integration branch all authenticate the same completed release. Recovery
-requires forward checkpoint ancestry and consistent owned local history,
-rechecks remote publication state after downloading, and never republishes
-assets or rewrites Git history. Pending-push markers still admit only their
-exact recorded outcomes; unrelated branch movement remains an error. Published
-source identity is retained separately from an in-progress next candidate so
-an interrupted preparation cannot invalidate the previous published checkpoint.
+exact immutable published release, tag, independently downloaded assets and
+provenance, and integration branch all authenticate the same completed release.
+That completed-channel resume is remote-write-free: it performs no release,
+asset, tag, channel, or integration writes. Recovery requires forward
+checkpoint ancestry and consistent owned local history, rechecks remote state
+after downloading, and never republishes assets or rewrites Git history.
+Pending-push markers still admit only their exact recorded outcomes; unrelated
+branch movement remains an error. Published source identity is retained
+separately from an in-progress next candidate so an interrupted preparation
+cannot invalidate the previous published checkpoint.
 
 The publisher validates the clean committed candidate, exact pinned tools,
 pinned native provenance record, current native source-input fingerprint,
@@ -926,17 +936,24 @@ artifact bytes, and the signed predecessor before compiling the Windows x64
 application only. It does not run Cargo or rebuild native add-ons. It also
 builds the immutable bootstrap, relay/collab web bundle, and matching
 coordinator SDK/client JavaScript required by the existing four-asset signed
-topology. Broad lint, type, and test suites belong to normal CI, not every
+topology. Coordinator SDK stage reuse validates the full source and staged
+content bytes plus the exact first-party closure on every resolution; it does
+not trust mtimes. File reads and copies run in bounded batches and each batch is
+fully drained before an error is reported. This is not a dependency or
+`node_modules` cache: the frozen candidate install and native-input admission
+still run. Broad lint, type, and test suites belong to normal CI, not every
 local publication build. The publisher retains focused application-version,
 managed `--autobot-build-identity`, help, fresh-profile, loader, and
-baseline-native smokes, then signs and
-verifies the local quartet and creates or confirms the exact candidate tag
-without force before creating a draft. It independently downloads and verifies
-uploaded bytes, publishes only that verified draft, and advances the signed
-channel last. Authentication, admission, signature, integrity, provenance,
-asset-topology, predecessor, immutable-prepared-publication, independent
-download, safe-idle, and recovery checks remain mandatory. Channel predecessor
-checks compare raw committed Git
+baseline-native smokes. The blob-broker smoke uses the supported in-process
+`LocalBlobBackend` on Windows and verifies publication, fetch, status metrics,
+and cleanup; non-Windows retains the worker-host IPC round trip. The publisher
+then signs and verifies the local quartet and creates or confirms the exact
+candidate tag without force before creating a draft. It independently
+downloads and verifies uploaded bytes, publishes only that verified draft, and
+advances the signed channel last. Authentication, admission, signature,
+integrity, provenance, asset-topology, predecessor,
+immutable-prepared-publication, independent download, safe-idle, and recovery
+checks remain mandatory. Channel predecessor checks compare raw committed Git
 blobs, not checkout bytes affected by line-ending conversion. Publication
 does not install a runtime, change PATH, schedule a task, or deploy the
 coordinator.
@@ -946,13 +963,18 @@ To recover a preserved signed stage, a reviewed operator can call
 from `scripts/autobot-local-release.ts`. The caller must select the exact stage;
 the API never searches for the newest stage, rebuilds, or re-signs. It validates
 the retained inputs and copies them into a private verification snapshot,
-preserving the supplied stage. It creates a draft only when none exists, or
-reuses one exact matching next-sequence draft without replacing its assets.
-An exact already-published next release can complete channel-only promotion
-after independent verification; it is not republished. Conflicting tags,
-foreign or ambiguous drafts, altered assets, and stale predecessor state fail
-closed. A release already named by the current signed channel uses the
-read-only completed-publication recovery above, not next-release promotion.
+preserving the supplied stage. It creates a draft only when none exists. For
+one exact matching next-sequence draft, every retained asset already present is
+downloaded and hash-compared, foreign, duplicate, changed, or ambiguous state
+fails closed, and only the exact missing retained signed assets are uploaded.
+The complete remote release is then independently downloaded and subjected to
+the full hash, signature, provenance, predecessor, and four-asset topology
+validation before publication; the signed channel advances last. An exact
+already-published next release follows the same independent verification and
+can complete channel-only promotion without republication. A release already
+named by the current signed channel takes the read-only completed-publication
+resume path above. Conflicting tags, foreign or ambiguous drafts, altered
+assets, and stale predecessor state fail closed.
 
 Publisher subprocesses inherit the caller's current environment unless an
 explicit environment is supplied. Operators can therefore isolate Git settings
