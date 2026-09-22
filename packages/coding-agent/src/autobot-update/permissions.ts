@@ -275,17 +275,15 @@ async function assertWindowsOwnerPrivate(directory: string): Promise<void> {
 	assertWindowsOwnerPrivateSnapshot(cohortSnapshot(cohort, directory), cohort.sid);
 }
 
-async function assertWindowsPrivateFile(filePath: string): Promise<void> {
-	const cohort = await readWindowsAcls([filePath]);
-	const snapshot = cohortSnapshot(cohort, filePath);
-	if (!snapshot.daclPresent || snapshot.owner !== cohort.sid) {
+function assertWindowsPrivateFileSnapshot(snapshot: WindowsAclSnapshot, sid: string): void {
+	if (!snapshot.daclPresent || snapshot.owner !== sid) {
 		throw new Error("AutoBot managed executable lacks a current-user-owned Windows DACL");
 	}
 	for (const rule of snapshot.rules) {
 		if (
 			!rule.allow ||
 			rule.inheritOnly ||
-			rule.sid === cohort.sid ||
+			rule.sid === sid ||
 			rule.sid === SYSTEM_SID ||
 			rule.sid === CREATOR_OWNER_SID ||
 			rule.sid === OWNER_RIGHTS_SID
@@ -296,6 +294,11 @@ async function assertWindowsPrivateFile(filePath: string): Promise<void> {
 			throw new Error("AutoBot managed executable grants another Windows identity mutation access");
 		}
 	}
+}
+
+async function assertWindowsPrivateFile(filePath: string): Promise<void> {
+	const cohort = await readWindowsAcls([filePath]);
+	assertWindowsPrivateFileSnapshot(cohortSnapshot(cohort, filePath), cohort.sid);
 }
 
 /**
@@ -572,6 +575,79 @@ export async function assertAutoBotPrivateDirectory(directory: string): Promise<
 	// Revalidate after canonicalization so a concurrent replacement cannot turn
 	// a checked lexical path into a different trusted root.
 	await verify(canonical);
+	return canonical;
+}
+
+function resolveImmediateChildPaths(directory: string, filePaths: readonly string[]): string[] {
+	const children = new Set<string>();
+	for (const filePath of filePaths) {
+		const child = path.resolve(filePath);
+		const relative = path.relative(directory, child);
+		if (!relative || relative === ".." || path.isAbsolute(relative) || relative.split(path.sep).length !== 1) {
+			throw new Error("AutoBot managed files must be immediate children of their managed directory");
+		}
+		children.add(child);
+	}
+	return [...children];
+}
+
+async function existingRegularFiles(filePaths: readonly string[]): Promise<string[]> {
+	const existing: string[] = [];
+	for (const filePath of filePaths) {
+		try {
+			await assertNoLinkRegularFile(filePath);
+			existing.push(filePath);
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+			throw error;
+		}
+	}
+	return existing;
+}
+
+/**
+ * Prove an existing owner-private directory and any present immediate-child
+ * files in two fresh cohorts. Missing optional files are ignored, but every
+ * file that exists in either pass must be a protected regular file.
+ */
+export async function assertAutoBotPrivateDirectoryAndOptionalFiles(
+	directory: string,
+	filePaths: readonly string[],
+): Promise<string> {
+	const lexical = path.resolve(directory);
+	const lexicalFiles = resolveImmediateChildPaths(lexical, filePaths);
+	const verify = async (candidateDirectory: string, candidateFiles: readonly string[]): Promise<string[]> => {
+		await assertNoLexicalLinks(candidateDirectory);
+		const presentFiles = await existingRegularFiles(candidateFiles);
+		if (process.platform === "win32") {
+			const ancestors = windowsAncestorDirectories(candidateDirectory);
+			const cohort = await readWindowsAcls([candidateDirectory, ...ancestors, ...presentFiles]);
+			assertWindowsOwnerPrivateSnapshot(cohortSnapshot(cohort, candidateDirectory), cohort.sid);
+			assertSafeWindowsAncestorSnapshots(ancestors, cohort);
+			for (const filePath of presentFiles) {
+				assertWindowsPrivateFileSnapshot(cohortSnapshot(cohort, filePath), cohort.sid);
+			}
+			return presentFiles;
+		}
+		await assertPosixPrivateDirectory(candidateDirectory);
+		await assertSafePosixAncestors(candidateDirectory);
+		for (const filePath of presentFiles) {
+			await assertDarwinDenyOnlyAcl(filePath);
+			await assertPosixPrivateFile(filePath);
+		}
+		return presentFiles;
+	};
+	const presentLexicalFiles = new Set(await verify(lexical, lexicalFiles));
+	const canonical = await fs.realpath(lexical);
+	const canonicalFiles = resolveImmediateChildPaths(
+		canonical,
+		await Promise.all(
+			lexicalFiles.map(filePath =>
+				presentLexicalFiles.has(filePath) ? fs.realpath(filePath) : path.join(canonical, path.basename(filePath)),
+			),
+		),
+	);
+	await verify(canonical, canonicalFiles);
 	return canonical;
 }
 

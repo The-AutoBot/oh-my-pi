@@ -20,6 +20,7 @@
 - Local publishers now recover stale integration checkpoints only from fully verified completed signed releases, retain published source identity across interrupted preparations, and preserve an already-shipped upstream base until an official stable descendant is available.
 - Scheduled local publishers now use the configured Bun runtime directly; explicit mismatched runtime paths are rejected before execution or registration.
 - Fixed snapshot-tag edit recovery with canonical Windows paths while preserving rejection of outside-workspace and ambiguous matches.
+- Reduced Windows managed-launcher startup delays by batching lock-storage permission checks while preserving fresh ownership, ACL, and reparse-point validation across transaction boundaries.
 - Automatic collaboration recovery now replaces the host after a same-session CLI restart and directs browser guests to fully reload and reconnect; stalled browser discovery recovers after its 10-second fetch/body deadline without logging room secrets or guest content.
 - AutoBot handoffs now preserve authenticated lifetime ownership and exact owner/claim journals: normal child exits do not disturb foreign state, and a pre-activation failure can restore only its recorded predecessor before work resumes.
 - Prevented standby AutoBot candidates from exposing session title changes before acquiring activation ownership.

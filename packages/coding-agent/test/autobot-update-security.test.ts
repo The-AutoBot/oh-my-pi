@@ -18,7 +18,11 @@ import {
 	type AutoBotRestartTarget,
 } from "@oh-my-pi/pi-coding-agent/autobot-update/contract";
 import { fetchVerifiedAutoBotRelease } from "@oh-my-pi/pi-coding-agent/autobot-update/channel";
-import { assertAutoBotDenyOnlyDarwinAclListing } from "@oh-my-pi/pi-coding-agent/autobot-update/permissions";
+import {
+	assertAutoBotDenyOnlyDarwinAclListing,
+	assertAutoBotPrivateDirectoryAndOptionalFiles,
+	ensureAutoBotPrivateDirectory,
+} from "@oh-my-pi/pi-coding-agent/autobot-update/permissions";
 import { __projectAutoBotHandoffProfileEnvironmentForTests } from "@oh-my-pi/pi-coding-agent/autobot-update/bootstrap";
 import {
 	hasAutoBotMinimumRemainingHandoffTime,
@@ -121,6 +125,12 @@ async function createTemporaryDirectory(): Promise<string> {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-autobot-replay-security-"));
 	temporaryDirectories.push(directory);
 	return directory;
+}
+
+async function createPrivateTemporaryDirectory(): Promise<string> {
+	const directory = await fs.mkdtemp(path.join(os.homedir(), ".omp-autobot-permissions-"));
+	temporaryDirectories.push(directory);
+	return ensureAutoBotPrivateDirectory(directory);
 }
 
 async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
@@ -373,8 +383,7 @@ describe("AutoBot installation-wide active pointer", () => {
 			expect(await advanceAutoBotActivePointer(paths, competingR43)).toEqual(r43);
 			expect(await readAutoBotActivePointer(paths)).toEqual(r43);
 		},
-		// Four pointer advances require repeated real Windows ACL subprocesses.
-		process.platform === "win32" ? 300_000 : undefined,
+		windowsFilesystemSecurityTestTimeoutMs,
 	);
 });
 
@@ -603,6 +612,71 @@ describe("Managed AutoBot session environment", () => {
 
 		expect(environment).toEqual(launchEnvironment);
 	});
+});
+
+describe("AutoBot managed directory cohorts", () => {
+	test(
+		"accepts absent optional files and rejects paths outside the managed directory",
+		async () => {
+			const directory = await createPrivateTemporaryDirectory();
+			const present = path.join(directory, "state.db");
+			await fs.writeFile(present, "state");
+			await fs.chmod(present, 0o600);
+
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [present, path.join(directory, "state.db-wal")]),
+			).resolves.toBe(await fs.realpath(directory));
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [path.join(directory, "nested", "state.db")]),
+			).rejects.toThrow("immediate children");
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [path.join(path.dirname(directory), "state.db")]),
+			).rejects.toThrow("immediate children");
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [path.dirname(directory)]),
+			).rejects.toThrow("immediate children");
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
+
+	test(
+		"rejects a present optional reparse point instead of following it",
+		async () => {
+			const directory = await createPrivateTemporaryDirectory();
+			const target = await createPrivateTemporaryDirectory();
+			const linkedFile = path.join(directory, "state.db");
+			await fs.symlink(target, linkedFile, process.platform === "win32" ? "junction" : "dir");
+
+			await expect(assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [linkedFile])).rejects.toThrow(
+				"real regular file",
+			);
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
+
+	test(
+		"rejects a regular optional file writable by another identity",
+		async () => {
+			const directory = await createPrivateTemporaryDirectory();
+			const unsafe = path.join(directory, "state.db");
+			await fs.writeFile(unsafe, "state");
+			if (process.platform === "win32") {
+				const icacls = path.join(process.env.SystemRoot ?? "", "System32", "icacls.exe");
+				const child = Bun.spawn([icacls, unsafe, "/grant", "*S-1-1-0:W"], {
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+				});
+				const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				if (exitCode !== 0) throw new Error(`Cannot prepare unsafe ACL fixture: ${stderr}`);
+			} else {
+				await fs.chmod(unsafe, 0o666);
+			}
+
+			await expect(assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [unsafe])).rejects.toThrow();
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot macOS ACL listings", () => {

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { assertAutoBotPrivateDirectory, assertAutoBotPrivateFile } from "./permissions";
+import { assertAutoBotPrivateDirectory, assertAutoBotPrivateDirectoryAndOptionalFiles } from "./permissions";
 
 export interface AutoBotFileLockOptions {
 	/** Maximum acquisition attempts, including the initial attempt. */
@@ -42,19 +42,7 @@ function databasePathFor(filePath: string): string {
 	return `${path.resolve(filePath)}.lock.sqlite`;
 }
 
-async function assertPrivateRegularFileIfPresent(filePath: string): Promise<void> {
-	let stat: Awaited<ReturnType<typeof fs.lstat>>;
-	try {
-		stat = await fs.lstat(filePath);
-	} catch (error) {
-		if (isEnoent(error)) return;
-		throw error;
-	}
-	if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("AutoBot control lock is not a regular file");
-	await assertAutoBotPrivateFile(filePath);
-}
-
-async function ensurePrivateLockDatabase(databasePath: string): Promise<void> {
+async function ensureLockDatabaseExists(databasePath: string): Promise<void> {
 	try {
 		const handle = await fs.open(databasePath, "wx", 0o600);
 		await handle.close();
@@ -62,7 +50,6 @@ async function ensurePrivateLockDatabase(databasePath: string): Promise<void> {
 		if (errorCode(error) !== "EEXIST")
 			throw new Error("Cannot create the AutoBot control lock database", { cause: error });
 	}
-	await assertPrivateRegularFileIfPresent(databasePath);
 }
 
 async function assertLockStorage(lockPath: string, requireExisting = false): Promise<string> {
@@ -78,12 +65,12 @@ async function assertLockStorage(lockPath: string, requireExisting = false): Pro
 			if (isEnoent(error)) throw new Error("AutoBot required control lock database is missing");
 			throw new Error("Cannot inspect the required AutoBot control lock database", { cause: error });
 		}
-		await assertPrivateRegularFileIfPresent(databasePath);
 	} else {
-		await ensurePrivateLockDatabase(databasePath);
+		await ensureLockDatabaseExists(databasePath);
 	}
-	for (const filePath of [`${databasePath}-journal`, `${databasePath}-wal`, `${databasePath}-shm`]) {
-		await assertPrivateRegularFileIfPresent(filePath);
+	const lockStoragePaths = [databasePath, `${databasePath}-journal`, `${databasePath}-wal`, `${databasePath}-shm`];
+	if ((await assertAutoBotPrivateDirectoryAndOptionalFiles(lockDirectory, lockStoragePaths)) !== lockDirectory) {
+		throw new Error("AutoBot control lock directory is not canonical");
 	}
 	return databasePath;
 }
