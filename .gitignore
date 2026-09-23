@@ -18,6 +18,7 @@ target/
 
 # Environment
 .env
+.venv
 
 # Local Semgrep Guardian state
 /.semgrep/guardian.yml

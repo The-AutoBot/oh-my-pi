@@ -471,6 +471,8 @@ export interface InteractiveModeContext {
 	pushRemoteLiveInput(samples: Float32Array): boolean;
 	/** Stop the remote realtime session without affecting a local `/live` call. */
 	stopRemoteLiveInput(): Promise<boolean>;
+	/** Start a `/record` screen capture, or stop the running one. */
+	toggleRecording(): Promise<void>;
 	executeCompaction(
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto?: boolean,

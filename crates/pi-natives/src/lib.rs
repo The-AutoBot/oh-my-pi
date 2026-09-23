@@ -250,22 +250,18 @@ fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
 	})
 }
 
-/// Version sentinel — exists solely so the JS loader can prove at load time
-/// that the `.node` file on disk is from the same package release as the
-/// `index.js` ESM wrapper invoking it.
+/// Native compatibility sentinel — lets the JS loader prove at load time that
+/// the `.node` file belongs to the compatibility generation declared by the
+/// package wrapper.
 ///
-/// The `js_name` is bumped by `scripts/release.ts` to match the new
-/// `Cargo.toml` / `package.json` version on every release. The JS loader
-/// computes the expected name from `package.json#version` and refuses to use
-/// a `.node` that doesn't expose it, turning the silent
-/// `<sym> is not a function` crash from a locked-file update (the canonical
-/// Windows `bun install -g` failure mode) into a clear load-time error.
+/// The native metadata synchronizer keeps this `js_name`, the Cargo workspace
+/// versions, and `package.json#nativeCompatibilityVersion` aligned. Application
+/// package releases may advance independently while reusing the same validated
+/// native generation.
 ///
 /// Bump policy: `__piNativesV{major}_{minor}_{patch}` — non-alphanumerics in
-/// the version string are mapped to `_` to keep it a valid JS identifier.
-/// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
-/// `packages/natives/native/index.js` (which derives the name from
-/// `package.json#version`).
+/// the compatibility version are mapped to `_` to keep it a valid JS
+/// identifier.
 #[napi(js_name = "__piNativesV18_2_7")]
 pub const fn pi_natives_version_sentinel() {}
 

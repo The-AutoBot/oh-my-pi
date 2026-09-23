@@ -7,6 +7,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { getModelMatchPreferences, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
@@ -860,19 +861,22 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
-	test("skips a depleted coding-plan model before creating a noninteractive subagent session", async () => {
+	test.each([
+		["depleted", "runtime-model"],
+		["reserve", "runtime-provider/runtime-m*"],
+	] as const)("resolves the source selector when skipping a %s startup model", async (state, pattern) => {
 		const settings = Settings.isolated({
 			"retry.usageAwareFallback": true,
 			"retry.usageReservePolicy": "confirm",
 		});
-		settings.setModelRole("task", "runtime-provider/runtime-model,runtime-provider/runtime-fallback-model");
+		settings.setModelRole("task", `${pattern},runtime-provider/runtime-fallback-model`);
 		const options = buildSessionOptions("task");
 		vi.spyOn(options.authStorage, "getModelUsageHealth").mockImplementation(async (_provider, healthOptions) =>
 			healthOptions.modelId === "runtime-model"
-				? { state: "depleted", accounts: [{ credentialId: 1, credentialType: "oauth", state: "depleted" }] }
+				? { state, accounts: [{ credentialId: 1, credentialType: "oauth", state }] }
 				: { state: "healthy", accounts: [{ credentialId: 2, credentialType: "oauth", state: "healthy" }] },
 		);
-		const { session } = await createAgentSession({
+		const { session, modelFallbackMessage } = await createAgentSession({
 			...options,
 			modelPatternFallbackRole: "subagent:usage-aware",
 			settings,
@@ -881,6 +885,11 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		try {
 			expect(session.model?.provider).toBe("runtime-provider");
 			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(modelFallbackMessage).toContain(
+				"runtime-provider/runtime-model -> runtime-provider/runtime-fallback-model",
+			);
+			expect(modelFallbackMessage).toMatch(/preflight/i);
+			expect(modelFallbackMessage).toMatch(/no request.*source model/i);
 		} finally {
 			await session.dispose();
 		}
@@ -1385,9 +1394,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		// Regression: with an Anthropic key but no configured `default` role and no
 		// session/CLI model, the step-4 startup fallback used to pick the first
 		// anthropic model in models.json catalog order (claude-3-5-sonnet-20240620)
-		// instead of the provider's configured default from DEFAULT_MODEL_PER_PROVIDER
-		// (claude-opus-4-8).
-		const providerDefault = getBundledModel("anthropic", "claude-opus-4-8");
+		// instead of the provider's configured default from DEFAULT_MODEL_PER_PROVIDER.
+		const providerDefault = getBundledModel("anthropic", DEFAULT_MODEL_PER_PROVIDER.anthropic);
 		const catalogFirst = getBundledModel("anthropic", "claude-3-5-sonnet-20240620");
 		if (!providerDefault || !catalogFirst) {
 			throw new Error("Expected bundled anthropic models for fallback regression");
