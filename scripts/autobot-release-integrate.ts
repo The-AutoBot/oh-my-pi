@@ -313,12 +313,12 @@ async function candidateContractPolicy(sourceRoot: string): Promise<CandidateCon
 
 export async function candidateReleaseIdentity(
 	sourceRoot: string,
-	canonicalCommit: string,
+	upstreamCommit: string,
 	candidateCommit: string,
 ): Promise<CandidateReleaseIdentity> {
 	const [candidatePolicy, changed] = await Promise.all([
 		candidateContractPolicy(sourceRoot),
-		runCommand(["git", "diff", "--name-only", "--no-renames", "-z", canonicalCommit, candidateCommit], {
+		runCommand(["git", "diff", "--name-only", "--no-renames", "-z", upstreamCommit, candidateCommit], {
 			cwd: sourceRoot,
 			capture: true,
 		}),
@@ -556,7 +556,7 @@ async function main(): Promise<void> {
 		);
 		const candidateCommit = await gitOutput(clone, ["rev-parse", "HEAD"]);
 		const candidateTree = await gitOutput(clone, ["rev-parse", "HEAD^{tree}"]);
-		const identity = await candidateReleaseIdentity(clone, canonicalCommit, candidateCommit);
+		const identity = await candidateReleaseIdentity(clone, upstreamCommit, candidateCommit);
 		const built = await buildCandidate(
 			clone,
 			runnerBun,

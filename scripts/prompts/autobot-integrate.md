@@ -102,33 +102,33 @@ poll status.
 
 ### Compatibility
 
-- Treat supplied `affectedPaths` as an upper bound, not as separate audit tasks. The controller has
-  already identified the pinned integration merge and its pre-integration parent. Read both exact
-  bounded views in `compatibilityEvidence`: `incomingDiff` is the upstream side from the verified
-  merge base, while `maintainedDiff` contains maintained changes from that same base through the
-  pre-integration parent in affected sibling directories of actual incoming contracts. The
-  base/head and `paths` fields identify each comparison. `maintainedDiff.scope` states the
-  selection strategy and complete included/excluded affected-path inventory; exclusion means
-  outside this focused view, not that the fork has no delta there. An empty incoming patch does
-  not imply an empty maintained patch, and an empty synthetic-merge delta is not compatibility
-  approval.
-- Prioritize contracts actually changed by `incomingDiff`. Compare concrete neighboring
-  `maintainedDiff` hunks when they interact with those contracts, but do not turn every neighboring
-  maintained file into a mandatory audit task. Inspect only immediate consumers needed to assess
-  the interaction. Producer/canonical synchronization may have changed the maintained side before
-  the upstream merge. Classify concrete evidence as behavioral, nonbehavioral, or unchanged.
-  Inspect otherwise unchanged custom code only when a changed interface threatens it.
+- Treat supplied `affectedPaths` as the complete selected maintained fork-delta review set, not as
+  separate audit tasks. The controller has already identified the pinned integration merge and its
+  pre-integration parent. Read both exact bounded views in `compatibilityEvidence`:
+  `maintainedDiff` contains the maintained side of every selected affected path from the verified
+  merge base through the pre-integration parent, while `incomingDiff` supplies overlapping upstream
+  changes needed to assess merge interactions. The base/head and `paths` fields identify each
+  comparison. `maintainedDiff.scope` states the selection strategy and complete included/excluded
+  affected-path inventory. An empty incoming patch means there is no upstream overlap for that
+  selected fork delta; it does not make the maintained patch optional.
+- Assess every concrete contract changed by `maintainedDiff`. Compare the corresponding
+  `incomingDiff` hunk when upstream also changed that contract, then inspect only immediate
+  consumers needed to assess the maintained behavior and merge interaction. Producer/canonical
+  synchronization may have changed the maintained side before the upstream merge. Classify
+  concrete evidence as behavioral, nonbehavioral, or unchanged. Do not broaden a selected path
+  into a whole-subsystem audit.
 - If either supplied diff view, its pinned ancestry metadata, or a changed contract cannot be
   assessed, report the blocker, stop without writing repair intent, and do not reconstruct a
   substitute ancestry, compensate with a broad audit, or claim the code unchanged or safe.
   Discover focused tests by component basename and exact test paths first; at most, search symbols
   within a bounded named test directory. Never scan package-wide test wildcards. Read relevant
   symbols or ranges rather than large consumer/test files wholesale; a complete small, directly
-  relevant file is allowed. Run only existing tests that directly exercise changed contracts: no
-  full build, native build, dependency install, or general requalification. If a required focused
-  check fails or cannot run, report the blocker and stop without repair intent; never treat a
-  missing prerequisite as a pass. The controller owns downstream native and release qualification,
-  which this worker is not required to run.
+  relevant file is allowed. Run only existing focused tests that directly exercise maintained fork
+  or merge-contract changes: no full build, native build, dependency install, upstream
+  requalification, or general test sweep. If a required focused check fails or cannot run, report
+  the blocker and stop without repair intent; never treat a missing prerequisite as a pass. The
+  official pinned upstream release is trusted as already qualified; the controller owns subsequent
+  artifact, provenance, compatibility, compilation, and publication gates.
 
 For a supplied build failure, treat `failedStepContext.stepId` as the complete failed-step
 identity and `failedStepContext.permittedSourcePaths` as the complete edit boundary. Diagnose

@@ -2002,18 +2002,13 @@ async function pushIntegrationBranch(context: OmpControllerContext, candidateCom
 	return candidateCommit;
 }
 
-async function compatibilityFingerprint(candidate: LocalCandidate, canonicalCommit: string): Promise<string> {
-	// Bind review coverage to the exact pinned compatibility inputs and their
-	// compatibility-relevant changes, not the whole candidate root. Unrelated
-	// repairs retain coverage, while a changed source pin, sensitive blob, path
+async function compatibilityFingerprint(candidate: LocalCandidate): Promise<string> {
+	// Bind review coverage to the exact pinned upstream input and the selected
+	// maintained fork changes, not the whole candidate root. Unrelated repairs
+	// retain coverage, while a changed upstream pin, selected blob, path
 	// inventory, or compatibility epoch must re-run review.
-	const canonical = requireCommit(canonicalCommit, "Canonical compatibility base");
-	const basis = [
-		canonical,
-		requireCommit(candidate.upstreamCommit, "Candidate upstream commit"),
-		String(candidate.compatibilityEpoch),
-		...candidate.sensitivePaths,
-	];
+	const upstream = requireCommit(candidate.upstreamCommit, "Candidate upstream commit");
+	const basis = [upstream, String(candidate.compatibilityEpoch), ...candidate.sensitivePaths];
 	if (candidate.sensitivePaths.length === 0) return sha256(basis.join("\u0000"));
 	const compatibilityDiff = await runCommand(
 		[
@@ -2025,7 +2020,7 @@ async function compatibilityFingerprint(candidate: LocalCandidate, canonicalComm
 			"-z",
 			"--no-abbrev",
 			"--no-renames",
-			canonical,
+			upstream,
 			candidate.forkCommit,
 		],
 		{ cwd: candidate.sourceRoot, capture: true },
@@ -2214,7 +2209,7 @@ async function prepareCandidate(
 		}
 	});
 
-	let identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, currentHead);
+	let identity = await candidateReleaseIdentity(managed.worktree, upstreamCommit, currentHead);
 	let candidate = candidateFromIdentity(
 		managed.worktree,
 		currentHead,
@@ -2223,7 +2218,7 @@ async function prepareCandidate(
 		identity,
 		sourceChanged || currentState.publishedForkCommit !== currentHead,
 	);
-	const reviewKey = await compatibilityFingerprint(candidate, canonicalCommit);
+	const reviewKey = await compatibilityFingerprint(candidate);
 	if (candidate.sensitivePaths.length > 0 && currentState.compatibilityReviewFingerprint !== reviewKey) {
 		if (ompAttempts.value >= config.maxOmpAttempts) {
 			throw new AutoBotReleaseError("Configured OMP attempt limit reached for compatibility review");
@@ -2243,9 +2238,9 @@ async function prepareCandidate(
 		if (!(await isAncestor(managed.worktree, beforeReview, currentHead))) {
 			throw new AutoBotReleaseError("OMP compatibility work did not preserve the candidate ancestry");
 		}
-		identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, currentHead);
+		identity = await candidateReleaseIdentity(managed.worktree, upstreamCommit, currentHead);
 		candidate = candidateFromIdentity(managed.worktree, currentHead, upstreamCommit, upstreamVersion, identity, true);
-		const reviewedFingerprint = await compatibilityFingerprint(candidate, canonicalCommit);
+		const reviewedFingerprint = await compatibilityFingerprint(candidate);
 		currentState = {
 			...currentState,
 			compatibilityReviewFingerprint: reviewedFingerprint,
@@ -2265,7 +2260,7 @@ async function prepareCandidate(
 		finalHead,
 		upstreamCommit,
 		upstreamVersion,
-		await candidateReleaseIdentity(managed.worktree, canonicalCommit, finalHead),
+		await candidateReleaseIdentity(managed.worktree, upstreamCommit, finalHead),
 		sourceChanged || finalHead !== initialHead || currentState.publishedForkCommit !== finalHead,
 	);
 	return { candidate, candidateMergeCommit: candidateMerge.commit, state: currentState };
@@ -2832,7 +2827,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				if (!repairedMerge || repairedMerge.upstreamCommit !== upstreamCommit) {
 					throw new AutoBotReleaseError("OMP repair removed the required candidate merge ancestry");
 				}
-				let identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, repairedHead);
+				let identity = await candidateReleaseIdentity(managed.worktree, upstreamCommit, repairedHead);
 				publishCandidate = candidateFromIdentity(
 					managed.worktree,
 					repairedHead,
@@ -2842,7 +2837,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					true,
 				);
 				publishCandidateMerge = repairedMerge.commit;
-				const repairReviewKey = await compatibilityFingerprint(publishCandidate, canonicalCommit);
+				const repairReviewKey = await compatibilityFingerprint(publishCandidate);
 				if (
 					publishCandidate.sensitivePaths.length > 0 &&
 					state.compatibilityReviewFingerprint !== repairReviewKey
@@ -2896,7 +2891,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					if (!reviewedMerge || reviewedMerge.upstreamCommit !== upstreamCommit) {
 						throw new AutoBotReleaseError("OMP compatibility work removed the required candidate merge ancestry");
 					}
-					identity = await candidateReleaseIdentity(managed.worktree, canonicalCommit, reviewedHead);
+					identity = await candidateReleaseIdentity(managed.worktree, upstreamCommit, reviewedHead);
 					publishCandidate = candidateFromIdentity(
 						managed.worktree,
 						reviewedHead,
@@ -2906,7 +2901,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 						true,
 					);
 					publishCandidateMerge = reviewedMerge.commit;
-					const reviewedFingerprint = await compatibilityFingerprint(publishCandidate, canonicalCommit);
+					const reviewedFingerprint = await compatibilityFingerprint(publishCandidate);
 					state = await transition(config.workRoot, state, "building", {
 						candidateCommit: publishCandidate.forkCommit,
 						candidateMergeCommit: publishCandidateMerge,

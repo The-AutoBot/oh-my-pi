@@ -674,14 +674,15 @@ The standalone smoke checks the copied executable's exact `--version`,
 `--help`, and `--smoke-test` in a fresh isolated profile with
 `PI_NATIVE_VARIANT=baseline`. It does not claim or validate the managed
 `--autobot-build-identity` used by signed releases, and it does not install or
-activate the executable. Broad lint, type, and test suites remain normal CI
-responsibilities rather than per-build prerequisites.
+activate the executable. Broad lint, type, and upstream test suites are not
+repeated per build: the pinned official upstream release is already qualified.
+Focused checks cover the maintained fork delta and its merge interactions.
 
 When Rust/native implementation, native ABI, or the runtime/SDK/broker protocol
-contract actually changes, use a clean matching-source native rebuild and the
-project's normal CI qualification. Reusing native inputs is only the
-application-only path; it does not relax maintenance requirements for native or
-protocol changes.
+contract changes in the maintained fork, use a clean matching-source native
+rebuild and validate that fork delta and its affected consumers. Reusing native
+inputs remains only the application-only path; it does not relax strict native
+provenance, artifact-hash, compatibility, compiled-artifact, or protocol checks.
 
 #### Install an application-only build into a plain legacy runtime
 
@@ -954,10 +955,11 @@ content bytes plus the exact first-party closure on every resolution; it does
 not trust mtimes. File reads and copies run in bounded batches and each batch is
 fully drained before an error is reported. This is not a dependency or
 `node_modules` cache: the frozen candidate install and native-input admission
-still run. Broad lint, type, and test suites belong to normal CI, not every
-local publication build. The publisher retains focused application-version,
-managed `--autobot-build-identity`, help, fresh-profile, loader, and
-baseline-native smokes. The blob-broker smoke uses the supported in-process
+still run. The pinned official upstream release is not requalified locally;
+focused checks cover maintained fork changes and their merge-contract
+interactions. The publisher retains focused application-version, managed
+`--autobot-build-identity`, help, fresh-profile, loader, and baseline-native
+smokes. The blob-broker smoke uses the supported in-process
 `LocalBlobBackend` on Windows and verifies publication, fetch, status metrics,
 and cleanup; non-Windows retains the worker-host IPC round trip. The publisher
 then signs and verifies the local quartet and creates or confirms the exact

@@ -8,6 +8,7 @@ import {
 	LOCAL_COMMAND_DIAGNOSTICS_FILENAME,
 	LOCAL_COMMAND_OUTPUT_FILENAME,
 } from "../scripts/autobot-local.ts";
+import { candidateReleaseIdentity } from "../scripts/autobot-release-integrate.ts";
 import { runLocalOmp } from "../scripts/autobot-local-omp.ts";
 import { runQuiet } from "../scripts/autobot-local-release.ts";
 import type { LocalAutomationConfig } from "../scripts/autobot-local-types.ts";
@@ -44,6 +45,29 @@ async function runGit(cwd: string, ...args: string[]): Promise<string> {
 	]);
 	if (exitCode !== 0) throw new Error(`git ${args[0]} failed: ${stderr}`);
 	return stdout.trim();
+}
+
+async function createReleaseIdentityFixture(): Promise<string> {
+	const workRoot = await createPrivateRoot();
+	const worktree = path.join(workRoot, "worktree");
+	await fs.mkdir(worktree);
+	await runGit(worktree, "init", "-b", "main");
+	await runGit(worktree, "config", "user.name", "fixture");
+	await runGit(worktree, "config", "user.email", "fixture@invalid");
+	const contractPath = path.join(
+		worktree,
+		"packages",
+		"coding-agent",
+		"src",
+		"autobot-update",
+		"contract.ts",
+	);
+	await fs.mkdir(path.dirname(contractPath), { recursive: true });
+	await fs.copyFile(
+		path.join(import.meta.dir, "..", "packages", "coding-agent", "src", "autobot-update", "contract.ts"),
+		contractPath,
+	);
+	return worktree;
 }
 
 async function createLargeHistoricalMergeChain(cwd: string, mergeCount: number): Promise<void> {
@@ -553,6 +577,116 @@ if (process.platform === "win32" && process.arch === "x64") {
 		},
 		OMP_PROCESS_TIMEOUT_MS,
 	);
+	test("selects maintained compatibility changes relative to the pinned upstream release", async () => {
+		const worktree = await createReleaseIdentityFixture();
+		const maintainedPath = "packages/coding-agent/src/session/maintained.ts";
+		const upstreamOnlyPath = "packages/coding-agent/src/config/upstream-only.ts";
+		const policyExcludedPath = "packages/unrelated/maintained.ts";
+		const maintainedFile = path.join(worktree, ...maintainedPath.split("/"));
+		const upstreamOnlyFile = path.join(worktree, ...upstreamOnlyPath.split("/"));
+		const policyExcludedFile = path.join(worktree, ...policyExcludedPath.split("/"));
+		await fs.mkdir(path.dirname(maintainedFile), { recursive: true });
+		await fs.mkdir(path.dirname(upstreamOnlyFile), { recursive: true });
+		await fs.mkdir(path.dirname(policyExcludedFile), { recursive: true });
+		await fs.writeFile(maintainedFile, "export const maintained = 'base';\n");
+		await fs.writeFile(upstreamOnlyFile, "export const upstreamOnly = 'base';\n");
+		await fs.writeFile(policyExcludedFile, "export const unrelated = 'base';\n");
+		await runGit(worktree, "add", ".");
+		await runGit(worktree, "commit", "-m", "base");
+		await runGit(worktree, "branch", "upstream");
+
+		await fs.writeFile(maintainedFile, "export const maintained = 'fork';\n");
+		await fs.writeFile(policyExcludedFile, "export const unrelated = 'fork';\n");
+		await runGit(worktree, "commit", "-am", "maintained fork behavior");
+		const canonicalCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		await runGit(worktree, "checkout", "upstream");
+		await fs.writeFile(upstreamOnlyFile, "export const upstreamOnly = 'released';\n");
+		await runGit(worktree, "commit", "-am", "released upstream behavior");
+		const upstreamCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		await runGit(worktree, "checkout", "main");
+		await runGit(worktree, "merge", "--no-edit", "upstream");
+		const candidateCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		const identity = await candidateReleaseIdentity(worktree, upstreamCommit, candidateCommit);
+		expect(identity.compatibilityReviewPaths).toEqual([maintainedPath]);
+
+		const canonicalScopedIdentity = await candidateReleaseIdentity(worktree, canonicalCommit, candidateCommit);
+		expect(canonicalScopedIdentity.compatibilityReviewPaths).toEqual([upstreamOnlyPath]);
+
+		const candidateContract = path.join(
+			worktree,
+			"packages",
+			"coding-agent",
+			"src",
+			"autobot-update",
+			"contract.ts",
+		);
+		await fs.appendFile(candidateContract, "\n// Candidate policy intentionally differs from its producer.\n");
+		const conservativeIdentity = await candidateReleaseIdentity(worktree, upstreamCommit, candidateCommit);
+		expect(conservativeIdentity.compatibilityReviewPaths).toEqual([maintainedPath, policyExcludedPath]);
+	});
+
+	test("selects only merge resolutions whose bytes differ from pinned upstream", async () => {
+		const worktree = await createReleaseIdentityFixture();
+		const forkResolutionPath = "packages/coding-agent/src/session/resolved-for-fork.ts";
+		const upstreamResolutionPath = "packages/coding-agent/src/config/resolved-as-upstream.ts";
+		const forkResolutionFile = path.join(worktree, ...forkResolutionPath.split("/"));
+		const upstreamResolutionFile = path.join(worktree, ...upstreamResolutionPath.split("/"));
+		await fs.mkdir(path.dirname(forkResolutionFile), { recursive: true });
+		await fs.mkdir(path.dirname(upstreamResolutionFile), { recursive: true });
+		await fs.writeFile(forkResolutionFile, "export const resolution = 'base';\n");
+		await fs.writeFile(upstreamResolutionFile, "export const resolution = 'base';\n");
+		await runGit(worktree, "add", ".");
+		await runGit(worktree, "commit", "-m", "base");
+		await runGit(worktree, "branch", "upstream");
+
+		await fs.writeFile(forkResolutionFile, "export const resolution = 'canonical';\n");
+		await fs.writeFile(upstreamResolutionFile, "export const resolution = 'canonical';\n");
+		await runGit(worktree, "commit", "-am", "canonical conflict sides");
+
+		await runGit(worktree, "checkout", "upstream");
+		await fs.writeFile(forkResolutionFile, "export const resolution = 'upstream';\n");
+		await fs.writeFile(upstreamResolutionFile, "export const resolution = 'upstream';\n");
+		await runGit(worktree, "commit", "-am", "upstream conflict sides");
+		const upstreamCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		await runGit(worktree, "checkout", "main");
+		await expect(runGit(worktree, "merge", "--no-edit", "upstream")).rejects.toThrow();
+		await fs.writeFile(forkResolutionFile, "export const resolution = 'combined';\n");
+		await fs.writeFile(upstreamResolutionFile, "export const resolution = 'upstream';\n");
+		await runGit(worktree, "add", forkResolutionPath, upstreamResolutionPath);
+		await runGit(worktree, "commit", "-m", "resolve candidate compatibility");
+		const candidateCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		const identity = await candidateReleaseIdentity(worktree, upstreamCommit, candidateCommit);
+		expect(identity.compatibilityReviewPaths).toEqual([forkResolutionPath]);
+	});
+
+	test("returns an explicit empty compatibility path set for a pure upstream candidate", async () => {
+		const worktree = await createReleaseIdentityFixture();
+		const upstreamOnlyPath = "packages/coding-agent/src/session/upstream-only.ts";
+		const upstreamOnlyFile = path.join(worktree, ...upstreamOnlyPath.split("/"));
+		await fs.mkdir(path.dirname(upstreamOnlyFile), { recursive: true });
+		await fs.writeFile(upstreamOnlyFile, "export const upstreamOnly = 'base';\n");
+		await runGit(worktree, "add", ".");
+		await runGit(worktree, "commit", "-m", "base");
+		await runGit(worktree, "branch", "upstream");
+
+		await runGit(worktree, "checkout", "upstream");
+		await fs.writeFile(upstreamOnlyFile, "export const upstreamOnly = 'released';\n");
+		await runGit(worktree, "commit", "-am", "released upstream behavior");
+		const upstreamCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		await runGit(worktree, "checkout", "main");
+		await runGit(worktree, "merge", "--no-ff", "--no-edit", "upstream");
+		const candidateCommit = await runGit(worktree, "rev-parse", "HEAD");
+
+		const identity = await candidateReleaseIdentity(worktree, upstreamCommit, candidateCommit);
+		expect(identity.compatibilityReviewPaths).toEqual([]);
+	});
+
 	test(
 		"provides exact incoming and maintained compatibility diffs across intervening metadata commits",
 		async () => {
@@ -574,16 +708,16 @@ if (process.platform === "win32" && process.arch === "x64") {
 			expect(Buffer.byteLength(historicalMergeInventory, "utf8")).toBeGreaterThan(256 * 1024);
 			const incomingPath = "packages/model/schema.ts";
 			const maintainedPath = "packages/model/discovery.ts";
-			const excludedPath = "packages/unrelated/fork.ts";
+			const distantMaintainedPath = "packages/unrelated/fork.ts";
 			const incomingFile = path.join(worktree, ...incomingPath.split("/"));
 			const maintainedFile = path.join(worktree, ...maintainedPath.split("/"));
-			const excludedFile = path.join(worktree, ...excludedPath.split("/"));
+			const distantMaintainedFile = path.join(worktree, ...distantMaintainedPath.split("/"));
 			await fs.mkdir(path.dirname(incomingFile), { recursive: true });
-			await fs.mkdir(path.dirname(excludedFile), { recursive: true });
+			await fs.mkdir(path.dirname(distantMaintainedFile), { recursive: true });
 			await fs.writeFile(incomingFile, "export const contract = 'base';\n");
 			await fs.writeFile(maintainedFile, "export const discoverModels = 'base';\n");
-			await fs.writeFile(excludedFile, "export const unrelated = 'base';\n");
-			await runGit(worktree, "add", incomingPath, maintainedPath, excludedPath);
+			await fs.writeFile(distantMaintainedFile, "export const unrelated = 'base';\n");
+			await runGit(worktree, "add", incomingPath, maintainedPath, distantMaintainedPath);
 			await runGit(worktree, "commit", "-m", "base");
 			await runGit(worktree, "branch", "upstream");
 
@@ -601,7 +735,7 @@ if (process.platform === "win32" && process.arch === "x64") {
 
 			await runGit(worktree, "checkout", "main");
 			await fs.writeFile(maintainedFile, "export const discoverModels = 'maintained';\n");
-			await fs.writeFile(excludedFile, "export const unrelated = 'maintained elsewhere';\n");
+			await fs.writeFile(distantMaintainedFile, "export const unrelated = 'maintained elsewhere';\n");
 			await runGit(worktree, "commit", "-am", "maintained fork changes");
 			const preIntegrationCommit = await runGit(worktree, "rev-parse", "HEAD");
 			await runGit(worktree, "merge", "-s", "ours", "--no-edit", canonicalSideCommit);
@@ -666,7 +800,7 @@ if (process.platform === "win32" && process.arch === "x64") {
 					reason: "compatibility",
 					forkCommit,
 					upstreamCommit,
-					sensitivePaths: [incomingPath, maintainedPath, excludedPath],
+					sensitivePaths: [incomingPath, maintainedPath, distantMaintainedPath],
 				},
 				recorder,
 			);
@@ -678,12 +812,12 @@ if (process.platform === "win32" && process.arch === "x64") {
 				incomingDiff: { head: upstreamCommit, paths: [incomingPath] },
 				maintainedDiff: {
 					head: preIntegrationCommit,
-					paths: [maintainedPath],
+					paths: [maintainedPath, distantMaintainedPath],
 					scope: {
-						strategy: "incoming-parent-directories",
-						directories: ["packages/model"],
-						includedAffectedPaths: [maintainedPath, incomingPath],
-						excludedAffectedPaths: [excludedPath],
+						strategy: "all-affected-parent-directories",
+						directories: ["packages/model", "packages/unrelated"],
+						includedAffectedPaths: [maintainedPath, incomingPath, distantMaintainedPath],
+						excludedAffectedPaths: [],
 					},
 				},
 			});
@@ -691,7 +825,7 @@ if (process.platform === "win32" && process.arch === "x64") {
 			expect(evidence.incomingDiff.patch).not.toContain("discoverModels");
 			expect(evidence.maintainedDiff.patch).toContain("+export const discoverModels = 'maintained';");
 			expect(evidence.maintainedDiff.patch).not.toContain("upstreamContract");
-			expect(evidence.maintainedDiff.patch).not.toContain("maintained elsewhere");
+			expect(evidence.maintainedDiff.patch).toContain("+export const unrelated = 'maintained elsewhere';");
 		},
 		OMP_PROCESS_TIMEOUT_MS,
 	);

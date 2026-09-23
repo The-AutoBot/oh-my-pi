@@ -406,22 +406,12 @@ async function deriveCompatibilityEvidence(
 		affectedPaths,
 		"incoming compatibility path inventory",
 	);
-	const selectionStrategy =
-		incomingPaths.length === 0
-			? ("all-affected-parent-directories" as const)
-			: ("incoming-parent-directories" as const);
+	const selectionStrategy = "all-affected-parent-directories" as const;
 	const relevantDirectories = Array.from(
-		new Set(
-			(incomingPaths.length === 0 ? affectedPaths : incomingPaths).map(affectedPath =>
-				path.posix.dirname(affectedPath),
-			),
-		),
+		new Set(affectedPaths.map(affectedPath => path.posix.dirname(affectedPath))),
 	).sort();
-	const relevantDirectorySet = new Set(relevantDirectories);
-	const maintainedCandidates = affectedPaths.filter(affectedPath =>
-		relevantDirectorySet.has(path.posix.dirname(affectedPath)),
-	);
-	const excludedMaintainedCandidates = affectedPaths.filter(affectedPath => !maintainedCandidates.includes(affectedPath));
+	const maintainedCandidates = [...affectedPaths];
+	const excludedMaintainedCandidates: string[] = [];
 	const maintainedPaths = await changedAffectedPaths(
 		cwd,
 		mergeBase,
