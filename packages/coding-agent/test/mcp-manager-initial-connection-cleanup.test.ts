@@ -18,10 +18,22 @@ class FakeTransport implements MCPTransport {
 	closeCalls = 0;
 	onClose?: () => void;
 	#closeGate?: Promise<void>;
+	hasActiveRequests = false;
+	#restartQuiesced = false;
 
 	/** Make `close()` hang on the given gate to simulate a slow HTTP session DELETE. */
 	gateClose(gate: Promise<void>): void {
 		this.#closeGate = gate;
+	}
+
+	acquireRestartQuiescence(): { release(): void } | undefined {
+		if (this.hasActiveRequests || this.#restartQuiesced) return undefined;
+		this.#restartQuiesced = true;
+		return {
+			release: () => {
+				this.#restartQuiesced = false;
+			},
+		};
 	}
 
 	request<T>(): Promise<T> {
@@ -219,5 +231,36 @@ describe("MCPManager initial connection ownership", () => {
 		expect(connectSpy).toHaveBeenCalledTimes(2);
 
 		stuckClose.resolve();
+	});
+
+	it("fences new connections reversibly and defers while a connection is pending", async () => {
+		const manager = new MCPManager(process.cwd());
+		const pendingConnection = Promise.withResolvers<MCPServerConnection>();
+		const connectStarted = Promise.withResolvers<void>();
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => {
+			connectStarted.resolve();
+			return pendingConnection.promise;
+		});
+		vi.spyOn(mcpClient, "listTools").mockResolvedValue([]);
+
+		const loading = manager.connectServers({ first: CONFIG }, {});
+		await connectStarted.promise;
+		expect(manager.restartQuiescenceReason).toBe("mcp-connection-active");
+		expect(manager.acquireRestartQuiescence()).toBeUndefined();
+		pendingConnection.resolve(fakeConnection("first").connection);
+		await loading;
+
+		const guard = manager.acquireRestartQuiescence();
+		expect(guard).toBeDefined();
+		await expect(manager.connectServers({ second: CONFIG }, {})).rejects.toThrow(
+			"MCP manager is quiesced for runtime restart",
+		);
+
+		guard!.release();
+		connectSpy.mockResolvedValue(fakeConnection("second").connection);
+		await expect(manager.connectServers({ second: CONFIG }, {})).resolves.toMatchObject({
+			connectedServers: ["second"],
+		});
+		await manager.disconnectAll();
 	});
 });

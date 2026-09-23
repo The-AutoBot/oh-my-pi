@@ -91,6 +91,7 @@ export class HttpTransport implements MCPTransport {
 	readonly #activeFetches = new Set<Promise<Response>>();
 	readonly #backgroundDrains = new Set<Promise<void>>();
 	#closePromise: Promise<void> | null = null;
+	#restartQuiescence: symbol | undefined;
 	/**
 	 * Protocol version echoed in the `MCP-Protocol-Version` header. `null` until
 	 * the `initialize` response is negotiated (via {@link setProtocolVersion}):
@@ -180,9 +181,19 @@ export class HttpTransport implements MCPTransport {
 		return this.#connected;
 	}
 
-	/** A streamable-HTTP server session cannot be recreated losslessly mid-run. */
-	get hasStatefulSession(): boolean {
-		return this.#sessionId !== null;
+	get hasActiveRequests(): boolean {
+		return this.#activeRequests.size > 0;
+	}
+
+	acquireRestartQuiescence(): { release(): void } | undefined {
+		if (this.hasActiveRequests || this.#restartQuiescence !== undefined) return undefined;
+		const token = Symbol();
+		this.#restartQuiescence = token;
+		return {
+			release: () => {
+				if (this.#restartQuiescence === token) this.#restartQuiescence = undefined;
+			},
+		};
 	}
 
 	get url(): string {
@@ -387,13 +398,13 @@ export class HttpTransport implements MCPTransport {
 
 	/** Route an SSE message (or batch) to the appropriate handler. */
 	#dispatchSSEMessage(message: JsonRpcMessage | JsonRpcMessage[]): void {
+		if (this.#restartQuiescence !== undefined) return;
 		if (Array.isArray(message)) {
 			for (const m of message) this.#dispatchSSEMessage(m);
 			return;
 		}
-		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			void this.#trackRequest(this.#handleServerRequest(message as JsonRpcRequest));
 			return;
 		}
 		// Notification: has method but no id
@@ -403,6 +414,9 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	request<T = unknown>(method: string, params?: Record<string, unknown>, options?: MCPRequestOptions): Promise<T> {
+		if (this.#restartQuiescence !== undefined) {
+			return Promise.reject(new Error("MCP transport is quiesced for runtime restart"));
+		}
 		return this.#trackRequest(this.#requestWithAuthRetry<T>(method, params, options));
 	}
 
@@ -782,6 +796,9 @@ export class HttpTransport implements MCPTransport {
 	}
 
 	notify(method: string, params?: Record<string, unknown>): Promise<void> {
+		if (this.#restartQuiescence !== undefined) {
+			return Promise.reject(new Error("MCP transport is quiesced for runtime restart"));
+		}
 		return this.#trackRequest(this.#sendNotification(method, params));
 	}
 

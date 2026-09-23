@@ -9,10 +9,23 @@ import {
 	fetchVerifiedAutoBotRelease,
 	readAutoBotChannelConfig,
 	type AutoBotChannelConfig,
+	type AutoBotFetchDeps,
 } from "../packages/coding-agent/src/autobot-update/channel.ts";
 import { AUTO_BOT_COMPATIBILITY_EPOCH } from "../packages/coding-agent/src/autobot-update/contract.ts";
-import { ensureAutoBotInstallationIdentity, readAutoBotInstallationIdentity } from "../packages/coding-agent/src/autobot-update/identity.ts";
-import { autoBotBootstrapSlotPath, autoBotPaths, type AutoBotPaths } from "../packages/coding-agent/src/autobot-update/paths.ts";
+import {
+	ensureAutoBotInstallationIdentity,
+	readAutoBotInstallationIdentity,
+} from "../packages/coding-agent/src/autobot-update/identity.ts";
+import {
+	prepareAutoBotInstallationReleaseLocked,
+	recoverAutoBotInstallationLocked,
+	refreshAutoBotInstallationLocked,
+} from "../packages/coding-agent/src/autobot-update/installation.ts";
+import {
+	autoBotBootstrapSlotPath,
+	autoBotPaths,
+	type AutoBotPaths,
+} from "../packages/coding-agent/src/autobot-update/paths.ts";
 import {
 	assertAutoBotImportableFile,
 	assertAutoBotPrivateDirectory,
@@ -21,16 +34,17 @@ import {
 	normalizeAutoBotPrivateFile,
 } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { currentAutoBotRuntimeTarget } from "../packages/coding-agent/src/autobot-update/platform.ts";
-import { stageVerifiedAutoBotRelease, type StagedAutoBotRelease } from "../packages/coding-agent/src/autobot-update/stage.ts";
+import { type StagedAutoBotRelease } from "../packages/coding-agent/src/autobot-update/stage.ts";
 import { replaceFileAtomically } from "../packages/coding-agent/src/utils/atomic-file.ts";
 import {
 	advanceAutoBotSequenceHighWater,
 	assertAutoBotSequenceAllowed,
+	isAutoBotReleaseQuarantined,
 	readAutoBotActivePointer,
 	writeAutoBotActivePointer,
 	type AutoBotActivePointer,
 } from "../packages/coding-agent/src/autobot-update/state.ts";
-import { copyFileAtomically, sha256File, writeJsonAtomically } from "../packages/coding-agent/src/autobot-update/storage.ts";
+import { sha256File, writeJsonAtomically } from "../packages/coding-agent/src/autobot-update/storage.ts";
 import {
 	AutoBotReleaseError,
 	assertKnownOptions,
@@ -49,7 +63,9 @@ const CONTROL_FILES: Readonly<Record<string, true>> = {
 	"active.json": true,
 	"high-water.json": true,
 	"pending-restart.json": true,
+	"installation-root.json": true,
 	"committed-restart.json": true,
+	"installation-publication.json": true,
 	[LEGACY_MIGRATION_FILE]: true,
 };
 const CONTROL_DIRECTORIES: Readonly<Record<string, true>> = {
@@ -58,6 +74,7 @@ const CONTROL_DIRECTORIES: Readonly<Record<string, true>> = {
 	phases: true,
 	quarantine: true,
 	signals: true,
+	"update-diagnostics": true,
 };
 
 const helpText = `Usage: bun scripts/autobot-install.ts --root <absolute-directory> --channel-url <https-url> --trusted-key <keyId=Ed25519-SPKI-file> --portal-url <https-live-url>
@@ -87,8 +104,9 @@ Release transport options:
                            hostnames, credentials, query strings, or paths.
 
 Existing verified installations are maintained under both install and update
-locks. Their active runtime and stable launcher are never overwritten by this
-command; the newly verified release is staged for the managed handoff path. A
+locks. A verified newer release becomes the preferred runtime and its bootstrap
+is published at the stable launcher path without stopping processes already
+mapped to older bytes. Publication is journaled and recovered idempotently. A
 legacy migration stages and records all signed state before atomically replacing
 the legacy launcher as its final operation.`;
 
@@ -117,12 +135,11 @@ interface LegacyBinaryProof {
 	readonly legacyNlink: 1;
 }
 
-interface InstallArguments {
+export interface InstallArguments {
 	readonly root: string;
 	readonly channel: AutoBotChannelConfig;
 	readonly migrateLegacy: boolean;
 }
-
 
 function isEnoent(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "ENOENT";
@@ -136,6 +153,14 @@ function isRetainedAtomicBackup(entry: string): boolean {
 	const prefix = `${bootstrapExecutableName()}.`;
 	if (!entry.startsWith(prefix) || !entry.endsWith(".bak")) return false;
 	return /^\d+\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(entry.slice(prefix.length, -4));
+}
+
+function isPublicationArtifact(entry: string): boolean {
+	const escapedName = bootstrapExecutableName().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(
+		`^${escapedName}\\.publication-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\\.(?:tmp|bak)$`,
+		"u",
+	).test(entry);
 }
 
 function reportError(error: unknown): void {
@@ -152,12 +177,29 @@ async function lstatIfPresent(filePath: string): Promise<Stats | undefined> {
 	}
 }
 
-
 async function requirePlainFile(filePath: string, label: string): Promise<void> {
 	const stat = await lstatIfPresent(filePath);
 	if (!stat) throw new AutoBotReleaseError(`${label} does not exist: ${filePath}`);
 	if (!stat.isFile() || stat.isSymbolicLink()) {
 		throw new AutoBotReleaseError(`${label} must be a non-symlink regular file: ${filePath}`);
+	}
+}
+
+async function inspectDiagnosticsDirectory(directory: string): Promise<void> {
+	for (const entry of await fs.readdir(directory)) {
+		const isSnapshot = /^[A-Za-z0-9_-]{32,128}\.json$/u.test(entry);
+		const isAtomicTransient =
+			/^[A-Za-z0-9_-]{32,128}\.json\.\d+\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.(?:tmp|bak)$/u.test(entry);
+		if (!isSnapshot && !isAtomicTransient) {
+			throw new AutoBotReleaseError(
+				`AutoBot diagnostics snapshot has an invalid name: ${path.join(directory, entry)}`,
+			);
+		}
+		const snapshotPath = path.join(directory, entry);
+		const stat = await lstatIfPresent(snapshotPath);
+		if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+			throw new AutoBotReleaseError(`AutoBot diagnostics snapshot is unsafe: ${snapshotPath}`);
+		}
 	}
 }
 
@@ -176,7 +218,9 @@ async function inspectControlDirectory(paths: AutoBotPaths): Promise<boolean> {
 			continue;
 		}
 		if (CONTROL_DIRECTORIES[entry] === true) {
-			if (!stat.isDirectory()) throw new AutoBotReleaseError(`AutoBot control directory is not a directory: ${child}`);
+			if (!stat.isDirectory())
+				throw new AutoBotReleaseError(`AutoBot control directory is not a directory: ${child}`);
+			if (entry === "update-diagnostics") await inspectDiagnosticsDirectory(child);
 			continue;
 		}
 		throw new AutoBotReleaseError(`Refusing an AutoBot root with an unknown control entry: ${child}`);
@@ -207,12 +251,13 @@ async function inspectInstallRoot(paths: AutoBotPaths): Promise<RootInspection> 
 		const child = path.join(paths.root, entry);
 		const stat = await lstatIfPresent(child);
 		const isRetainedBackup = isRetainedAtomicBackup(entry);
-		if (!stat || stat.isSymbolicLink() || (knownEntries[entry] !== true && !isRetainedBackup)) {
+		const isPublicationFile = isPublicationArtifact(entry);
+		if (!stat || stat.isSymbolicLink() || (knownEntries[entry] !== true && !isRetainedBackup && !isPublicationFile)) {
 			throw new AutoBotReleaseError(
 				`Refusing unrelated nonempty root; never overwrite a possibly live legacy executable: ${paths.root}`,
 			);
 		}
-		if (entry === bootstrapExecutableName() || isRetainedBackup) {
+		if (entry === bootstrapExecutableName() || isRetainedBackup || isPublicationFile) {
 			if (!stat.isFile()) throw new AutoBotReleaseError(`AutoBot executable entry is not a regular file: ${child}`);
 		} else if (!stat.isDirectory()) {
 			throw new AutoBotReleaseError(`AutoBot root entry is not a directory: ${child}`);
@@ -230,6 +275,8 @@ async function inspectInstallRoot(paths: AutoBotPaths): Promise<RootInspection> 
 	const activePointerPresent = (await lstatIfPresent(paths.activePointerPath)) !== undefined;
 	const retainedBackups = entries.filter(isRetainedAtomicBackup);
 	const legacyMigrationRecordPresent = (await lstatIfPresent(legacyMigrationPath(paths))) !== undefined;
+	const publicationJournalPresent =
+		(await lstatIfPresent(path.join(paths.controlDir, "installation-publication.json"))) !== undefined;
 	if (
 		hasControl &&
 		hasRuntimeDirectory &&
@@ -245,7 +292,13 @@ async function inspectInstallRoot(paths: AutoBotPaths): Promise<RootInspection> 
 			retiredLegacyPath: path.join(paths.root, retainedBackups[0]!),
 		};
 	}
-	if (hasControl && hasRuntimeDirectory && hasBootstrapDirectory && hasStableBootstrap && activePointerPresent) {
+	if (
+		hasControl &&
+		hasRuntimeDirectory &&
+		hasBootstrapDirectory &&
+		activePointerPresent &&
+		(hasStableBootstrap || publicationJournalPresent)
+	) {
 		return { kind: "managed", stableBootstrapPath };
 	}
 	if (
@@ -331,7 +384,8 @@ async function establishPrivateInstallPaths(root: string, inspection: RootInspec
 		}
 	}
 	const reopenedRoot = await assertAutoBotPrivateDirectory(paths.root);
-	if (reopenedRoot !== paths.root) throw new AutoBotReleaseError("AutoBot root changed while preparing private storage");
+	if (reopenedRoot !== paths.root)
+		throw new AutoBotReleaseError("AutoBot root changed while preparing private storage");
 	return paths;
 }
 
@@ -363,12 +417,7 @@ async function assertNoLiveLegacyProcesses(legacyPaths: readonly string[]): Prom
 type LegacyFileVerifier = (filePath: string) => Promise<string>;
 
 function assertLegacyBinaryStat(stat: Stats): void {
-	if (
-		!Number.isSafeInteger(stat.size) ||
-		stat.size <= 0 ||
-		!Number.isSafeInteger(stat.nlink) ||
-		stat.nlink !== 1
-	) {
+	if (!Number.isSafeInteger(stat.size) || stat.size <= 0 || !Number.isSafeInteger(stat.nlink) || stat.nlink !== 1) {
 		throw new AutoBotReleaseError("Legacy omp executable must be a non-empty file with no hardlink aliases");
 	}
 }
@@ -546,7 +595,6 @@ async function recordLegacyRetirement(
 	return journal;
 }
 
-
 async function resolveLegacyMigration(
 	paths: AutoBotPaths,
 	initialInspection: RootInspection,
@@ -561,7 +609,9 @@ async function resolveLegacyMigration(
 		return await startLegacyMigration(paths, lockedInspection.stableBootstrapPath);
 	}
 	if (lockedInspection.kind !== "recoverable" && lockedInspection.kind !== "managed") {
-		throw new AutoBotReleaseError("--migrate-legacy requires a direct legacy omp root or an interrupted legacy migration");
+		throw new AutoBotReleaseError(
+			"--migrate-legacy requires a direct legacy omp root or an interrupted legacy migration",
+		);
 	}
 
 	return await resumeLegacyMigration(paths, lockedInspection.stableBootstrapPath);
@@ -574,7 +624,9 @@ async function restoreRetiredLegacyBootstrap(
 ): Promise<void> {
 	const replacement = await lstatIfPresent(stableBootstrapPath);
 	if (replacement) {
-		throw new AutoBotReleaseError("Cannot safely restore the legacy launcher because its original path has reappeared");
+		throw new AutoBotReleaseError(
+			"Cannot safely restore the legacy launcher because its original path has reappeared",
+		);
 	}
 	const retiredProof = await proveLegacyBinary(retiredLegacyPath);
 	assertLegacyMigrationContent(migration, retiredProof);
@@ -683,7 +735,8 @@ async function loadTrustedKeyMaterial(specifications: readonly string[]): Promis
 		if (keyId === "__proto__" || keyId === "constructor" || keyId === "prototype") {
 			throw new AutoBotReleaseError(`Trusted key ID ${keyId} is reserved`);
 		}
-		if (trustedKeys[keyId] !== undefined) throw new AutoBotReleaseError(`Trusted key ${keyId} was supplied more than once`);
+		if (trustedKeys[keyId] !== undefined)
+			throw new AutoBotReleaseError(`Trusted key ${keyId} was supplied more than once`);
 		const keyPath = path.resolve(specification.slice(equals + 1));
 		await requirePlainFile(keyPath, "Trusted public key");
 		const der = decodePemOrDer(new Uint8Array(await Bun.file(keyPath).arrayBuffer()));
@@ -702,7 +755,15 @@ async function loadTrustedKeyMaterial(specifications: readonly string[]): Promis
 
 async function parseInstallArguments(): Promise<InstallArguments | undefined> {
 	const args = parseCliArgs(process.argv.slice(2), ["help", "migrate-legacy"]);
-	assertKnownOptions(args, ["help", "migrate-legacy", "root", "channel-url", "trusted-key", "portal-url", "artifact-origin"]);
+	assertKnownOptions(args, [
+		"help",
+		"migrate-legacy",
+		"root",
+		"channel-url",
+		"trusted-key",
+		"portal-url",
+		"artifact-origin",
+	]);
 	if (hasOption(args, "help")) {
 		if (args.flags.size !== 1) throw new AutoBotReleaseError("--help cannot be combined with other options");
 		process.stdout.write(`${helpText}\n`);
@@ -710,7 +771,8 @@ async function parseInstallArguments(): Promise<InstallArguments | undefined> {
 	}
 
 	const requestedRoot = requiredOption(args, "root");
-	if (!path.isAbsolute(requestedRoot)) throw new AutoBotReleaseError("--root must be an absolute installation directory");
+	if (!path.isAbsolute(requestedRoot))
+		throw new AutoBotReleaseError("--root must be an absolute installation directory");
 	const root = path.resolve(requestedRoot);
 	const trustedKeys = await loadTrustedKeyMaterial(repeatedOption(args, "trusted-key"));
 	const channel = assertAutoBotChannelConfig({
@@ -723,30 +785,7 @@ async function parseInstallArguments(): Promise<InstallArguments | undefined> {
 	return { root, channel, migrateLegacy: hasOption(args, "migrate-legacy") };
 }
 
-async function installStableBootstrap(
-	paths: AutoBotPaths,
-	inspection: RootInspection,
-	staged: StagedAutoBotRelease,
-): Promise<void> {
-	const existing = await lstatIfPresent(inspection.stableBootstrapPath);
-	if (existing) {
-		if (!existing.isFile() || existing.isSymbolicLink()) {
-			throw new AutoBotReleaseError(`Stable AutoBot bootstrap is unsafe: ${inspection.stableBootstrapPath}`);
-		}
-		const [existingDigest, stagedDigest] = await Promise.all([
-			sha256File(inspection.stableBootstrapPath),
-			sha256File(staged.bootstrapPath),
-		]);
-		if (existingDigest !== stagedDigest) {
-			throw new AutoBotReleaseError(
-				"Refusing to replace an existing stable bootstrap during recovery; it may be mapped by a live process",
-			);
-		}
-		return;
-	}
-	await copyFileAtomically(staged.bootstrapPath, inspection.stableBootstrapPath);
-}
-async function runInstallation(arguments_: InstallArguments): Promise<void> {
+export async function runInstallation(arguments_: InstallArguments, deps: AutoBotFetchDeps = {}): Promise<void> {
 	const initialPaths = autoBotPaths(arguments_.root);
 	const initialInspection = await inspectInstallRoot(initialPaths);
 	if (initialInspection.kind === "legacy") {
@@ -765,7 +804,9 @@ async function runInstallation(arguments_: InstallArguments): Promise<void> {
 		await assertNoLiveLegacyProcesses([beforeTightening.legacyPath]);
 		await tightenProvenLegacyRoot(arguments_.root, beforeTightening);
 	} else if (initialInspection.kind === "migration-interrupted" && !arguments_.migrateLegacy) {
-		throw new AutoBotReleaseError("An interrupted legacy migration requires the explicit --migrate-legacy flag to recover");
+		throw new AutoBotReleaseError(
+			"An interrupted legacy migration requires the explicit --migrate-legacy flag to recover",
+		);
 	} else if (arguments_.migrateLegacy && initialInspection.kind === "fresh") {
 		throw new AutoBotReleaseError("--migrate-legacy requires an existing direct legacy omp installation");
 	}
@@ -787,6 +828,10 @@ async function runInstallation(arguments_: InstallArguments): Promise<void> {
 					await recoverInterruptedLegacyMigration(paths, inspection);
 					inspection = await inspectInstallRoot(paths);
 				}
+				if (await lstatIfPresent(path.join(paths.controlDir, "installation-publication.json"))) {
+					await recoverAutoBotInstallationLocked(paths);
+					inspection = await inspectInstallRoot(paths);
+				}
 				const migration = await resolveLegacyMigration(
 					paths,
 					initialInspection,
@@ -797,56 +842,62 @@ async function runInstallation(arguments_: InstallArguments): Promise<void> {
 					throw new AutoBotReleaseError("AutoBot root changed while acquiring the installation locks");
 				}
 				if (inspection.kind === "managed") {
-					if (migration) await validateManagedReleaseState(paths);
-					else await validateKnownManagedInstall(paths, inspection.stableBootstrapPath);
+					if (migration || (await lstatIfPresent(path.join(paths.controlDir, "installation-publication.json")))) {
+						await validateManagedReleaseState(paths);
+					} else {
+						await validateKnownManagedInstall(paths, inspection.stableBootstrapPath);
+					}
 				}
 
-				// Keep all network and executable verification after a locally pinned
-				// trust configuration, and reject replay before stage probes can run.
-				const release = await fetchVerifiedAutoBotRelease(arguments_.channel);
+				// Fetch with the proposed trust configuration, then prove policy
+				// eligibility and every signed executable before replacing the
+				// currently durable channel. Rejections retain the old channel.
+				const release = await fetchVerifiedAutoBotRelease(arguments_.channel, deps);
 				if (release.manifest.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH) {
 					throw new AutoBotReleaseError(
 						`Signed release compatibility epoch ${release.manifest.compatibilityEpoch} does not match this installer (${AUTO_BOT_COMPATIBILITY_EPOCH})`,
 					);
 				}
+				if (await isAutoBotReleaseQuarantined(paths, release.manifest)) {
+					throw new AutoBotReleaseError("Signed AutoBot release is quarantined after a failed activation");
+				}
 				await assertAutoBotSequenceAllowed(paths, release.manifest, release.payloadSha256);
-				const staged = await stageVerifiedAutoBotRelease(paths, release);
-				await advanceAutoBotSequenceHighWater(paths, staged.manifest, staged.payloadSha256);
-
 				await ensureAutoBotInstallationIdentity(paths);
+				const staged = await prepareAutoBotInstallationReleaseLocked(paths, release, deps);
+
+				// Publication recovery authenticates its retained envelope through
+				// this file, so the awaited atomic channel write precedes any
+				// high-water, active-pointer, or publication-journal mutation.
 				await writeJsonAtomically(paths.channelConfigPath, arguments_.channel);
-				const runtimeAsset = staged.manifest.assets.find(
-					asset => asset.kind === "runtime" && asset.target === currentAutoBotRuntimeTarget(),
-				);
-				if (!runtimeAsset) throw new AutoBotReleaseError("Staged signed release has no runtime asset for this installation target");
-				const activePointer = {
-					schemaVersion: 1 as const,
-					slotId: staged.slotId,
-					runtimePath: staged.runtimePath,
-					runtimeSha256: runtimeAsset.sha256,
-					manifest: staged.manifest,
-					activatedAt: new Date().toISOString(),
-				};
 				if (migration) {
-					// Every signed asset and all protected control state exist before
-					// exposing the new bootstrap at the legacy PATH location.
-					await writeAutoBotActivePointer(paths, activePointer);
+					await advanceAutoBotSequenceHighWater(paths, staged.manifest, staged.payloadSha256);
+					const runtimeAsset = staged.manifest.assets.find(
+						asset => asset.kind === "runtime" && asset.target === currentAutoBotRuntimeTarget(),
+					);
+					if (!runtimeAsset) {
+						throw new AutoBotReleaseError(
+							"Staged signed release has no runtime asset for this installation target",
+						);
+					}
+					await writeAutoBotActivePointer(paths, {
+						schemaVersion: 1,
+						slotId: staged.slotId,
+						runtimePath: staged.runtimePath,
+						runtimeSha256: runtimeAsset.sha256,
+						manifest: staged.manifest,
+						activatedAt: new Date().toISOString(),
+					});
 					await replaceLegacyBootstrap(paths, inspection.stableBootstrapPath, migration, staged);
 					process.stdout.write(
 						`Migrated the recorded legacy omp launcher to AutoBot release ${staged.manifest.releaseSequence} at ${paths.root}.\n`,
 					);
 					return;
 				}
-				if (inspection.kind === "managed") {
-					process.stdout.write(
-						`Maintained AutoBot root ${paths.root}; staged release ${staged.manifest.releaseSequence} without replacing its active runtime or stable bootstrap.\n`,
-					);
-					return;
-				}
-
-				await installStableBootstrap(paths, inspection, staged);
-				await writeAutoBotActivePointer(paths, activePointer);
-				process.stdout.write(`Installed AutoBot release ${staged.manifest.releaseSequence} at ${paths.root}.\n`);
+				const refreshed = await refreshAutoBotInstallationLocked(paths, release, deps, staged);
+				const action = inspection.kind === "managed" ? "Maintained" : "Installed";
+				process.stdout.write(
+					`${action} AutoBot release ${refreshed.active.manifest.releaseSequence} at ${paths.root}; the verified runtime and stable bootstrap are now preferred.\n`,
+				);
 			}),
 		{ retries: 1, retryDelayMs: 0 },
 	);

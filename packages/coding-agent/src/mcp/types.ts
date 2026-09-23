@@ -335,10 +335,17 @@ export interface MCPTransport {
 	readonly connected: boolean;
 
 	/**
-	 * True only when this otherwise-connected transport holds a server session
-	 * whose loss cannot be assumed harmless. Omitted for stateless transports.
+	 * True while an outbound operation or asynchronous server-request handler,
+	 * including its response delivery, is still in flight.
 	 */
-	readonly hasStatefulSession?: boolean;
+	readonly hasActiveRequests?: boolean;
+
+	/**
+	 * Atomically prevent new outbound operations and server-request handlers.
+	 * Returns no guard when work is already active. Transports that omit this
+	 * capability cannot safely participate in a runtime restart.
+	 */
+	acquireRestartQuiescence?(): { release(): void } | undefined;
 
 	/** Event handlers */
 	onClose?: () => void;

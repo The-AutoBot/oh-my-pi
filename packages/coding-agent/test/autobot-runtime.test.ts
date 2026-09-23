@@ -44,8 +44,13 @@ const request: AutoBotRestartRequest = {
 
 function runtimeForPreflight(
 	isCollabSafe: () => boolean,
-	canPrepare: () => Promise<{ readonly canPrepare: boolean }>,
+	canPrepare: () => Promise<{ readonly canPrepare: true } | { readonly canPrepare: false; readonly reason: string }>,
 	onReservation: () => void,
+	transport?: {
+		readonly hasActiveRequests?: boolean;
+		acquireRestartQuiescence?: () => { release(): void } | undefined;
+	},
+	interactiveReason?: string,
 ): AutoBotRuntime {
 	const session = {
 		sessionManager: {
@@ -66,7 +71,16 @@ function runtimeForPreflight(
 		},
 	};
 	const mode = {
-		getAutoBotUpdateDeferralReason: () => undefined,
+		mcpManager: transport
+			? {
+					get restartQuiescenceReason(): string | undefined {
+						if (transport.hasActiveRequests === true) return "mcp-request-active";
+						return transport.acquireRestartQuiescence ? undefined : "mcp-restart-quiescence-unsupported";
+					},
+					acquireRestartQuiescence: () => transport.acquireRestartQuiescence?.(),
+				}
+			: undefined,
+		getAutoBotUpdateDeferralReason: () => interactiveReason,
 		beginAutoBotUpdateAdmission: () => {
 			throw new Error("read-only preflight must not begin update admission");
 		},
@@ -75,16 +89,18 @@ function runtimeForPreflight(
 		},
 	};
 	return new AutoBotRuntime(
-		session as ConstructorParameters<typeof AutoBotRuntime>[0],
+		session as unknown as ConstructorParameters<typeof AutoBotRuntime>[0],
 		parseArgs([]),
-		mode as ConstructorParameters<typeof AutoBotRuntime>[2],
+		mode as unknown as ConstructorParameters<typeof AutoBotRuntime>[2],
 		undefined,
 	);
 }
 
 test("AutoBot preflight defers without reserving when browser safety changes during coordinator preflight", async () => {
 	const preflightStarted = Promise.withResolvers<void>();
-	const preflight = Promise.withResolvers<{ readonly canPrepare: boolean }>();
+	const preflight = Promise.withResolvers<
+		{ readonly canPrepare: true } | { readonly canPrepare: false; readonly reason: string }
+	>();
 	let collabSafe = true;
 	let reservations = 0;
 	const runtime = runtimeForPreflight(
@@ -103,8 +119,157 @@ test("AutoBot preflight defers without reserving when browser safety changes dur
 	collabSafe = false;
 	preflight.resolve({ canPrepare: true });
 
-	expect(await result).toBeFalse();
+	expect(await result).toEqual({ canPrepare: false, reason: "collab-guest-incompatible" });
 	expect(reservations).toBe(0);
+});
+
+test("AutoBot preflight admits an idle explicitly reconnectable MCP transport", async () => {
+	const runtime = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: true }),
+		() => {},
+		{ hasActiveRequests: false, acquireRestartQuiescence: () => ({ release: () => {} }) },
+	);
+
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: true,
+	});
+});
+
+test("AutoBot preflight reports active and unsupported MCP transports without disturbing them", async () => {
+	const active = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: true }),
+		() => {},
+		{ hasActiveRequests: true, acquireRestartQuiescence: () => ({ release: () => {} }) },
+	);
+	expect(await active.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "mcp-request-active",
+	});
+
+	const unsupported = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: true }),
+		() => {},
+		{ hasActiveRequests: false },
+	);
+	expect(await unsupported.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "mcp-restart-quiescence-unsupported",
+	});
+});
+
+test("AutoBot preflight preserves coordinator deferral reason as a stable code", async () => {
+	const runtime = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: false, reason: "reservation-contended" }),
+		() => {},
+	);
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "coordinator-reservation-contended",
+	});
+});
+
+test("AutoBot preflight reports a busy session without reserving shared handoff state", async () => {
+	let coordinatorChecks = 0;
+	const runtime = runtimeForPreflight(
+		() => true,
+		async () => {
+			coordinatorChecks++;
+			return { canPrepare: true };
+		},
+		() => {},
+		undefined,
+		"session work is still active",
+	);
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "session-work-active",
+	});
+	expect(coordinatorChecks).toBe(0);
+});
+
+test("AutoBot preparation materializes an idle empty session without changing its identity", async () => {
+	const sessionId = "empty-session";
+	const sessionFile = "/tmp/empty-session.jsonl";
+	const admission = {};
+	let onDisk = false;
+	let mcpQuiesced = false;
+	let ensureCalls = 0;
+	const preparation = {
+		reservationId: "reservation",
+		fallbackInstanceId: "fallback",
+		predecessorInstanceId: "predecessor",
+		successorInstanceId: "successor",
+		predecessorTarget: request.predecessorTarget,
+		expiresAt: "2030-01-01T00:00:00.000Z",
+		leaseDurationMs: 600_000,
+		target: request.target,
+		handoff: { manualRoom: "preserve" as const, collab: "preserve" as const },
+	};
+	const session = {
+		sessionManager: {
+			isSessionOnDisk: () => onDisk,
+			ensureOnDisk: async () => {
+				ensureCalls++;
+				onDisk = true;
+			},
+			flush: async () => {},
+			getSessionFile: () => sessionFile,
+			getSessionId: () => sessionId,
+			getCwd: () => process.cwd(),
+		},
+		getEvalKernelOwnerId: () => sessionId,
+		autoBotUpdateCoordinator: {
+			canPrepare: async () => ({ canPrepare: true as const }),
+			prepare: async () => preparation,
+			cancel: async () => {},
+			abandon: async () => {},
+		},
+	};
+	const mode = {
+		mcpManager: {
+			get restartQuiescenceReason(): string | undefined {
+				return mcpQuiesced ? "mcp-restart-quiescence-unavailable" : undefined;
+			},
+			acquireRestartQuiescence: () => {
+				if (mcpQuiesced) return undefined;
+				mcpQuiesced = true;
+				return {
+					release: () => {
+						mcpQuiesced = false;
+					},
+				};
+			},
+		},
+		getAutoBotUpdateDeferralReason: () => undefined,
+		beginAutoBotUpdateAdmission: () => admission,
+		isAutoBotUpdateAdmissionValid: (value: unknown) => value === admission,
+		isAutoBotUpdateExitRequested: () => false,
+		cancelAutoBotUpdateAdmission: () => {},
+		collabController: {
+			canPrepareUpdate: () => ({ safe: true as const }),
+			captureAutoBotFallbackState: () => ({ wasHosting: false as const }),
+		},
+	};
+	const runtime = new AutoBotRuntime(
+		session as unknown as ConstructorParameters<typeof AutoBotRuntime>[0],
+		parseArgs([]),
+		mode as unknown as ConstructorParameters<typeof AutoBotRuntime>[2],
+		undefined,
+	);
+
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: true,
+	});
+	const prepared = await runtime.hooks.prepareRestart!(request.target, request.predecessorTarget);
+	expect(ensureCalls).toBe(1);
+	expect(prepared).toMatchObject({ sessionId, sessionFile });
+	expect(mcpQuiesced).toBe(true);
+	await runtime.hooks.abortRestart!(request, "candidate-rejected");
+	expect(mcpQuiesced).toBe(false);
 });
 
 test("AutoBot restart capsule rejects nonpersistent credential and prompt overrides", () => {
@@ -116,7 +281,15 @@ test("AutoBot restart capsule rejects nonpersistent credential and prompt overri
 });
 
 test("AutoBot candidate args restore only safe effective launch state", () => {
-	const args = parseArgs(["--no-lsp", "--no-pty", "--approval-mode", "write", "--config", "/tmp/config.yml", "ignored prompt"]);
+	const args = parseArgs([
+		"--no-lsp",
+		"--no-pty",
+		"--approval-mode",
+		"write",
+		"--config",
+		"/tmp/config.yml",
+		"ignored prompt",
+	]);
 	const context = createAutoBotRestartLaunchContext(args);
 	expect(context).toBeDefined();
 	const parsed = parseAutoBotRestartLaunchContext(context!, request.target, {
@@ -153,10 +326,12 @@ test("AutoBot candidate rejects a coordinator reservation for another release", 
 	});
 	expect(context).toBeDefined();
 	const incompatible = { ...request.target, releaseSequence: request.target.releaseSequence + 1 };
-	expect(parseAutoBotRestartLaunchContext(context!, incompatible, {
-		target: incompatible,
-		predecessorTarget: request.predecessorTarget,
-	})).toBeUndefined();
+	expect(
+		parseAutoBotRestartLaunchContext(context!, incompatible, {
+			target: incompatible,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toBeUndefined();
 });
 
 test("AutoBot candidate treats coordinator expiry as diagnostic, not a cross-clock deadline", () => {
@@ -173,10 +348,12 @@ test("AutoBot candidate treats coordinator expiry as diagnostic, not a cross-clo
 		handoff: { manualRoom: "preserve", collab: "preserve" },
 	});
 	expect(context).toBeDefined();
-	expect(parseAutoBotRestartLaunchContext(context!, request.target, {
-		target: request.target,
-		predecessorTarget: request.predecessorTarget,
-	})).toEqual(context);
+	expect(
+		parseAutoBotRestartLaunchContext(context!, request.target, {
+			target: request.target,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toEqual(context);
 });
 
 test("AutoBot fallback capsule binds the failed target while restoring the recorded predecessor", () => {
@@ -196,17 +373,23 @@ test("AutoBot fallback capsule binds the failed target while restoring the recor
 		{ wasHosting: true, access: "view" },
 	);
 	expect(context).toBeDefined();
-	expect(parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
-		target: request.target,
-		predecessorTarget: request.predecessorTarget,
-	})).toEqual(context);
-	expect(parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
-		target: request.predecessorTarget,
-		predecessorTarget: request.predecessorTarget,
-	})).toBeUndefined();
-	expect(parseAutoBotRestartLaunchContext(
-		{ ...context!, collab: { wasHosting: true } } as unknown as JsonValue,
-		request.predecessorTarget,
-		{ target: request.target, predecessorTarget: request.predecessorTarget },
-	)).toBeUndefined();
+	expect(
+		parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
+			target: request.target,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toEqual(context);
+	expect(
+		parseAutoBotRestartLaunchContext(context!, request.predecessorTarget, {
+			target: request.predecessorTarget,
+			predecessorTarget: request.predecessorTarget,
+		}),
+	).toBeUndefined();
+	expect(
+		parseAutoBotRestartLaunchContext(
+			{ ...context!, collab: { wasHosting: true } } as unknown as JsonValue,
+			request.predecessorTarget,
+			{ target: request.target, predecessorTarget: request.predecessorTarget },
+		),
+	).toBeUndefined();
 });

@@ -558,6 +558,8 @@ export class StdioTransport implements MCPTransport {
 	 */
 	#detached = false;
 	readonly #requestIds = new RequestIdAllocator();
+	readonly #activeServerRequests = new Set<Promise<void>>();
+	#restartQuiescence: symbol | undefined;
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -570,9 +572,19 @@ export class StdioTransport implements MCPTransport {
 		return this.#connected;
 	}
 
-	/** A live stdio process is stateful until it exits. */
-	get hasStatefulSession(): boolean {
-		return this.#connected;
+	get hasActiveRequests(): boolean {
+		return this.#pendingRequests.size > 0 || this.#activeServerRequests.size > 0;
+	}
+
+	acquireRestartQuiescence(): { release(): void } | undefined {
+		if (this.hasActiveRequests || this.#restartQuiescence !== undefined) return undefined;
+		const token = Symbol();
+		this.#restartQuiescence = token;
+		return {
+			release: () => {
+				if (this.#restartQuiescence === token) this.#restartQuiescence = undefined;
+			},
+		};
 	}
 
 	/**
@@ -692,9 +704,16 @@ export class StdioTransport implements MCPTransport {
 			for (const m of message) this.#handleMessage(m);
 			return;
 		}
-		// Server-to-client request: has both method and id
+		// Server-to-client request: has both method and id. The tracked lifetime
+		// includes writing the response, so restart admission cannot cut it off.
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			if (this.#restartQuiescence !== undefined) return;
+			const activity = this.#handleServerRequest(message as JsonRpcRequest);
+			this.#activeServerRequests.add(activity);
+			void activity.then(
+				() => this.#activeServerRequests.delete(activity),
+				() => this.#activeServerRequests.delete(activity),
+			);
 			return;
 		}
 
@@ -712,6 +731,7 @@ export class StdioTransport implements MCPTransport {
 			}
 			return;
 		}
+		if (this.#restartQuiescence !== undefined) return;
 
 		// Notification: has method but no id
 		if ("method" in message) {
@@ -769,6 +789,9 @@ export class StdioTransport implements MCPTransport {
 		params?: Record<string, unknown>,
 		options?: MCPRequestOptions,
 	): Promise<T> {
+		if (this.#restartQuiescence !== undefined) {
+			throw new Error("MCP transport is quiesced for runtime restart");
+		}
 		if (!this.#connected || !this.#process?.stdin) {
 			throw new MCPTransportError({
 				transport: "stdio",
@@ -877,6 +900,9 @@ export class StdioTransport implements MCPTransport {
 	}
 
 	async notify(method: string, params?: Record<string, unknown>): Promise<void> {
+		if (this.#restartQuiescence !== undefined) {
+			throw new Error("MCP transport is quiesced for runtime restart");
+		}
 		if (!this.#connected || !this.#process?.stdin) {
 			throw new MCPTransportError({
 				transport: "stdio",

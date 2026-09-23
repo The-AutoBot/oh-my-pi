@@ -44,6 +44,9 @@ export class LegacySseTransport implements MCPTransport {
 	#pending = new Map<string | number, PendingLegacySseRequest>();
 	#config: MCPSseServerConfig;
 	readonly #requestIds = new RequestIdAllocator();
+	readonly #activeOperations = new Set<Promise<unknown>>();
+	readonly #activeServerRequests = new Set<Promise<void>>();
+	#restartQuiescence: symbol | undefined;
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -80,9 +83,28 @@ export class LegacySseTransport implements MCPTransport {
 		return this.#connected;
 	}
 
-	/** Legacy SSE uses one server-side endpoint/session for the live event stream. */
-	get hasStatefulSession(): boolean {
-		return this.#endpointUrl !== null;
+	get hasActiveRequests(): boolean {
+		return this.#pending.size > 0 || this.#activeOperations.size > 0 || this.#activeServerRequests.size > 0;
+	}
+
+	acquireRestartQuiescence(): { release(): void } | undefined {
+		if (this.hasActiveRequests || this.#restartQuiescence !== undefined) return undefined;
+		const token = Symbol();
+		this.#restartQuiescence = token;
+		return {
+			release: () => {
+				if (this.#restartQuiescence === token) this.#restartQuiescence = undefined;
+			},
+		};
+	}
+
+	#trackOperation<T>(operation: Promise<T>): Promise<T> {
+		this.#activeOperations.add(operation);
+		void operation.then(
+			() => this.#activeOperations.delete(operation),
+			() => this.#activeOperations.delete(operation),
+		);
+		return operation;
 	}
 
 	get url(): string {
@@ -213,8 +235,14 @@ export class LegacySseTransport implements MCPTransport {
 				return;
 			}
 		}
+		if (this.#restartQuiescence !== undefined) return;
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			const activity = this.#handleServerRequest(message as JsonRpcRequest);
+			this.#activeServerRequests.add(activity);
+			void activity.then(
+				() => this.#activeServerRequests.delete(activity),
+				() => this.#activeServerRequests.delete(activity),
+			);
 			return;
 		}
 		if ("method" in message && !("id" in message)) {
@@ -222,7 +250,14 @@ export class LegacySseTransport implements MCPTransport {
 		}
 	}
 
-	async request<T = unknown>(
+	request<T = unknown>(method: string, params?: Record<string, unknown>, options?: MCPRequestOptions): Promise<T> {
+		if (this.#restartQuiescence !== undefined) {
+			return Promise.reject(new Error("MCP transport is quiesced for runtime restart"));
+		}
+		return this.#trackOperation(this.#request<T>(method, params, options));
+	}
+
+	async #request<T = unknown>(
 		method: string,
 		params?: Record<string, unknown>,
 		options?: MCPRequestOptions,
@@ -289,7 +324,14 @@ export class LegacySseTransport implements MCPTransport {
 		}
 	}
 
-	async notify(method: string, params?: Record<string, unknown>): Promise<void> {
+	notify(method: string, params?: Record<string, unknown>): Promise<void> {
+		if (this.#restartQuiescence !== undefined) {
+			return Promise.reject(new Error("MCP transport is quiesced for runtime restart"));
+		}
+		return this.#trackOperation(this.#notify(method, params));
+	}
+
+	async #notify(method: string, params?: Record<string, unknown>): Promise<void> {
 		if (!this.#connected || !this.#endpointUrl) {
 			throw new Error("Transport not connected");
 		}

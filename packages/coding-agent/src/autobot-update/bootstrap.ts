@@ -6,6 +6,7 @@ import {
 	AUTO_BOT_RESTART_EXIT_CODE,
 	parseAutoBotReleaseManifest,
 	sameAutoBotRestartTarget,
+	serializeAutoBotReleaseManifest,
 	type AutoBotReleaseManifest,
 	type AutoBotRestartRequest,
 	type AutoBotHandoffRecord,
@@ -31,13 +32,16 @@ import {
 	readAutoBotInstallationIdentitySync,
 	type AutoBotInstallationIdentity,
 } from "./identity";
-import { acquireAutoBotFileLock } from "./lock";
 import {
-	autoBotLaunchLeaseLockPath,
-	autoBotPaths,
-	resolveAutoBotBootstrapRoot,
-	type AutoBotPaths,
-} from "./paths";
+	AutoBotInstallationChannelUnavailableError,
+	AutoBotInstallationQuarantinedError,
+	recoverAutoBotInstallation,
+	refreshAutoBotInstallation,
+	type AutoBotInstallationRefreshResult,
+} from "./installation";
+import { writeAutoBotUpdateDiagnostic, type AutoBotUpdateDiagnosticInput } from "./diagnostics";
+import { acquireAutoBotFileLock } from "./lock";
+import { autoBotLaunchLeaseLockPath, autoBotPaths, resolveAutoBotBootstrapRoot, type AutoBotPaths } from "./paths";
 import {
 	advanceAutoBotActivePointer,
 	clearAutoBotCommittedRestart,
@@ -46,7 +50,7 @@ import {
 	commitAutoBotPendingRestart,
 	matchesAutoBotHandoffJournal,
 	quarantineAutoBotRelease,
-	readAutoBotActivePointerSync,
+	readAutoBotActivePointer,
 	readAutoBotCommittedRestart,
 	readAutoBotPendingRestart,
 	hasAutoBotPendingRestartOwnership,
@@ -131,7 +135,12 @@ async function readStagedRuntime(paths: AutoBotPaths, runtimePath: string): Prom
 	const resolvedRuntimePath = path.resolve(runtimePath);
 	const slotPath = path.dirname(resolvedRuntimePath);
 	const relative = path.relative(paths.runtimeDir, slotPath);
-	if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || path.basename(resolvedRuntimePath) !== executableName()) {
+	if (
+		!relative ||
+		relative.startsWith("..") ||
+		path.isAbsolute(relative) ||
+		path.basename(resolvedRuntimePath) !== executableName()
+	) {
 		throw new Error("Managed runtime path is invalid");
 	}
 	const markerValue = SlotMarkerSchema.assert(JSON.parse(await Bun.file(path.join(slotPath, "release.json")).text()));
@@ -191,7 +200,9 @@ function runtimeEnvironment(input: {
 			role: input.role,
 			launchId: input.claim.launchId,
 			bootstrapProcessId: input.claim.bootstrapProcessId,
-			...(input.request ? { handoffFile: path.join(input.paths.handoffDir, `${input.request.nonce}.${input.role}.json`) } : {}),
+			...(input.request
+				? { handoffFile: path.join(input.paths.handoffDir, `${input.request.nonce}.${input.role}.json`) }
+				: {}),
 			...(input.request ? { handoffNonce: input.request.nonce } : {}),
 			releaseSequence: input.runtime.manifest.releaseSequence,
 			releaseVersion: input.runtime.manifest.upstreamVersion,
@@ -235,7 +246,7 @@ async function waitForCandidateReady(
 	child: RuntimeProcess,
 ): Promise<CandidateReadyWait> {
 	let exitCode: number | undefined;
-	void child.exited.then((code) => {
+	void child.exited.then(code => {
 		exitCode = code;
 	});
 	const normalExit = () =>
@@ -264,10 +275,12 @@ async function retireFailedCandidate(child: RuntimeProcess): Promise<boolean> {
 	} catch {
 		return false;
 	}
-	return (await Promise.race([
-		child.exited.then(() => true),
-		Bun.sleep(AUTO_BOT_FAILED_CANDIDATE_RETIREMENT_TIMEOUT_MS).then(() => false),
-	])) === true;
+	return (
+		(await Promise.race([
+			child.exited.then(() => true),
+			Bun.sleep(AUTO_BOT_FAILED_CANDIDATE_RETIREMENT_TIMEOUT_MS).then(() => false),
+		])) === true
+	);
 }
 
 function journalMatch(
@@ -282,10 +295,7 @@ function journalMatch(
 	};
 }
 
-function isClaimedBy(
-	record: Pick<AutoBotPendingRestart, "claim">,
-	claim: AutoBotHandoffClaim,
-): boolean {
+function isClaimedBy(record: Pick<AutoBotPendingRestart, "claim">, claim: AutoBotHandoffClaim): boolean {
 	return sameAutoBotHandoffClaim(record.claim, claim);
 }
 
@@ -304,15 +314,9 @@ async function discardAutoBotHandoffIfOwned(paths: AutoBotPaths, expected: AutoB
 	}
 }
 
-type CandidateJournalRecord = Pick<
-	AutoBotPendingRestart,
-	"owner" | "request" | "runtimePath" | "previousRuntimePath"
->;
+type CandidateJournalRecord = Pick<AutoBotPendingRestart, "owner" | "request" | "runtimePath" | "previousRuntimePath">;
 
-function candidateHandoffMatchesJournal(
-	handoff: AutoBotHandoffRecord,
-	record: CandidateJournalRecord,
-): boolean {
+function candidateHandoffMatchesJournal(handoff: AutoBotHandoffRecord, record: CandidateJournalRecord): boolean {
 	const request = record.request;
 	return (
 		handoff.role === "candidate" &&
@@ -339,7 +343,10 @@ async function readCandidateHandoffForJournal(
 	paths: AutoBotPaths,
 	record: CandidateJournalRecord,
 ): Promise<AutoBotHandoffRecord | undefined> {
-	const handoff = await readAutoBotHandoff(paths, path.join(paths.handoffDir, `${record.request.nonce}.candidate.json`));
+	const handoff = await readAutoBotHandoff(
+		paths,
+		path.join(paths.handoffDir, `${record.request.nonce}.candidate.json`),
+	);
 	return handoff && candidateHandoffMatchesJournal(handoff, record) ? handoff : undefined;
 }
 
@@ -372,7 +379,6 @@ async function abandonPendingRestart(
 ): Promise<void> {
 	await abandonCandidateRestart(paths, pending, claim);
 }
-
 
 /** Promotion retains its authenticated handoff, but releases only exact journals. */
 async function clearCandidateRestartOwnership(
@@ -613,7 +619,26 @@ function runtimeMatchesRestartTarget(runtime: StagedRuntime, target: AutoBotRest
 		manifest.webBundleId === target.webBundleId
 	);
 }
+export type AutoBotCandidateFailureKind = "runtime-rejected" | "startup-failed";
 
+export function shouldQuarantineAutoBotCandidateFailure(
+	preferred: AutoBotActivePointer | undefined,
+	target: AutoBotRestartRequest["target"],
+	failure: AutoBotCandidateFailureKind,
+): boolean {
+	if (failure !== "runtime-rejected" || !preferred) return true;
+	if (preferred.manifest.releaseSequence > target.releaseSequence) return false;
+	const manifest = preferred.manifest;
+	return !(
+		manifest.releaseSequence === target.releaseSequence &&
+		manifest.upstreamVersion === target.upstreamVersion &&
+		manifest.forkCommit === target.forkCommit &&
+		manifest.sessionFormatVersion === target.sessionFormatVersion &&
+		manifest.collabProtocolVersion === target.collabProtocolVersion &&
+		manifest.compatibilityEpoch === target.compatibilityEpoch &&
+		manifest.webBundleId === target.webBundleId
+	);
+}
 
 type FallbackPromotionWait = "promoted" | "normal-exit" | "timed-out" | { readonly exitCode: number };
 
@@ -623,7 +648,7 @@ async function waitForFallbackPromotion(
 	child: RuntimeProcess,
 ): Promise<FallbackPromotionWait> {
 	let exitCode: number | undefined;
-	void child.exited.then((code) => {
+	void child.exited.then(code => {
 		exitCode = code;
 	});
 	const normalExit = () =>
@@ -675,11 +700,7 @@ async function launchFallback(
 	}
 	const fallbackHandoff = await withAutoBotHandoffLock(paths, async () => {
 		const current = await readAutoBotPendingRestart(paths);
-		if (
-			!current ||
-			!isClaimedBy(current, claim) ||
-			!matchesAutoBotHandoffJournal(current, journalMatch(pending))
-		) {
+		if (!current || !isClaimedBy(current, claim) || !matchesAutoBotHandoffJournal(current, journalMatch(pending))) {
 			return undefined;
 		}
 		await discardCandidateHandoffIfOwned(paths, current);
@@ -727,7 +748,15 @@ async function launchFallback(
 		}
 		return 1;
 	}
-	const exitCode = await supervisePromotedRuntime(paths, identity, claim, active, fallbackRuntime, child, terminationRequested);
+	const exitCode = await supervisePromotedRuntime(
+		paths,
+		identity,
+		claim,
+		active,
+		fallbackRuntime,
+		child,
+		terminationRequested,
+	);
 	await withAutoBotHandoffLock(paths, () => discardAutoBotHandoffIfOwned(paths, fallbackHandoff));
 	return exitCode;
 }
@@ -770,7 +799,22 @@ async function activateCandidate(
 					await writeAutoBotCandidateRejection(paths, pending.request);
 				}
 			}).catch(() => undefined);
-			await quarantineAutoBotRelease(paths, pending.request.target).catch(() => undefined);
+			let preferred: AutoBotActivePointer | undefined;
+			try {
+				preferred = await readAutoBotActivePointer(paths);
+			} catch {
+				// An unreadable preferred pointer is not evidence that this release
+				// is healthy; retain the conservative quarantine behavior.
+			}
+			if (
+				shouldQuarantineAutoBotCandidateFailure(
+					preferred,
+					pending.request.target,
+					ready === "rejected" ? "runtime-rejected" : "startup-failed",
+				)
+			) {
+				await quarantineAutoBotRelease(paths, pending.request.target).catch(() => undefined);
+			}
 			return launchFallback(paths, identity, claim, active, pending, child.pid, terminationRequested);
 		}
 		return 1;
@@ -788,9 +832,7 @@ async function activateCandidate(
 		recoveryState: "candidate-running",
 	};
 	if (
-		!(await withAutoBotHandoffLock(paths, () =>
-			commitAutoBotPendingRestart(paths, journalMatch(pending), committed),
-		))
+		!(await withAutoBotHandoffLock(paths, () => commitAutoBotPendingRestart(paths, journalMatch(pending), committed)))
 	) {
 		return 1;
 	}
@@ -1010,7 +1052,12 @@ async function resumeCommittedCandidate(
 			await writeAutoBotActivation(paths, running.request);
 		}
 	});
-	const acknowledgement = await waitForCandidateActivationAcknowledgement(paths, running.request, candidate.runtimePath, child);
+	const acknowledgement = await waitForCandidateActivationAcknowledgement(
+		paths,
+		running.request,
+		candidate.runtimePath,
+		child,
+	);
 	if (acknowledgement === "normal-exit") return stopNormally();
 	if (acknowledgement !== "acknowledged") {
 		if (acknowledgement !== "timed-out") return finishExitedCandidate();
@@ -1033,6 +1080,173 @@ async function resumeCommittedCandidate(
 	return supervisePromotedRuntime(paths, identity, claim, promoted, candidate, child, terminationRequested);
 }
 
+export async function resolveFreshLaunchHandoff(
+	paths: AutoBotPaths,
+	claim: AutoBotHandoffClaim,
+): Promise<CommittedRecovery> {
+	const recovery = await claimOrphanedCommittedRestart(paths, claim);
+	if (recovery.kind === "claimed" || recovery.kind === "normal-exit") return recovery;
+	await withAutoBotHandoffLock(paths, async () => {
+		// Parse the complete record even though it carries no authority for
+		// this claim. Malformed local state remains fail-closed; a valid
+		// foreign record remains byte-for-byte untouched.
+		await readAutoBotPendingRestart(paths);
+	});
+	return recovery;
+}
+
+export interface AutoBotFreshLaunchPreparationDeps {
+	readonly recover: (paths: AutoBotPaths) => Promise<void>;
+	readonly refresh: (paths: AutoBotPaths) => Promise<AutoBotInstallationRefreshResult>;
+	readonly readActive: (paths: AutoBotPaths) => Promise<AutoBotActivePointer | undefined>;
+	readonly verifyActive: (paths: AutoBotPaths, active: AutoBotActivePointer) => Promise<void>;
+	readonly writeDiagnostic: (paths: AutoBotPaths, event: AutoBotUpdateDiagnosticInput) => Promise<void>;
+	readonly isChannelUnavailable: (error: unknown) => boolean;
+}
+
+async function verifyFreshLaunchActivePointer(paths: AutoBotPaths, active: AutoBotActivePointer): Promise<void> {
+	if (active.manifest.minimumBootstrapVersion !== BOOTSTRAP_VERSION) {
+		throw new Error("Preferred AutoBot runtime requires an unsupported bootstrap protocol");
+	}
+	const runtime = await readStagedRuntime(paths, active.runtimePath);
+	if (
+		runtime.slotId !== active.slotId ||
+		runtime.runtimePath !== active.runtimePath ||
+		runtime.runtimeSha256 !== active.runtimeSha256 ||
+		serializeAutoBotReleaseManifest(runtime.manifest) !== serializeAutoBotReleaseManifest(active.manifest)
+	) {
+		throw new Error("Preferred AutoBot runtime does not match its active pointer");
+	}
+}
+
+const freshLaunchPreparationDeps: AutoBotFreshLaunchPreparationDeps = {
+	recover: recoverAutoBotInstallation,
+	refresh: refreshAutoBotInstallation,
+	readActive: readAutoBotActivePointer,
+	verifyActive: verifyFreshLaunchActivePointer,
+	writeDiagnostic: writeAutoBotUpdateDiagnostic,
+	isChannelUnavailable: error => error instanceof AutoBotInstallationChannelUnavailableError,
+};
+
+async function recordFreshLaunchDiagnostic(
+	paths: AutoBotPaths,
+	deps: AutoBotFreshLaunchPreparationDeps,
+	event: AutoBotUpdateDiagnosticInput,
+): Promise<void> {
+	try {
+		await deps.writeDiagnostic(paths, event);
+	} catch (error) {
+		process.stderr.write("AutoBot update diagnostic could not be recorded.\n");
+		throw error;
+	}
+}
+async function recoverFreshLaunchPublication(
+	paths: AutoBotPaths,
+	launchId: string,
+	deps: AutoBotFreshLaunchPreparationDeps,
+): Promise<void> {
+	try {
+		await deps.recover(paths);
+	} catch (error) {
+		try {
+			await recordFreshLaunchDiagnostic(paths, deps, {
+				phase: "fresh-launch-refresh",
+				outcome: "failed",
+				reason: "publication-recovery-pending",
+				launchId,
+			});
+		} catch {
+			// recordFreshLaunchDiagnostic emitted a fixed, non-sensitive error.
+		}
+		throw error;
+	}
+}
+
+/**
+ * Recover installation publication before consulting the preferred pointer.
+ * Transport unavailability may use the reverified installed slot. An exact
+ * quarantined channel target may use a different reverified installed slot;
+ * every signature, staging, or publication error remains fail-closed.
+ */
+export async function prepareAutoBotFreshLaunch(
+	paths: AutoBotPaths,
+	launchId: string,
+	deps: AutoBotFreshLaunchPreparationDeps,
+): Promise<AutoBotActivePointer> {
+	await recoverFreshLaunchPublication(paths, launchId, deps);
+	let refreshed: AutoBotInstallationRefreshResult;
+	try {
+		refreshed = await deps.refresh(paths);
+	} catch (error) {
+		const channelUnavailable = deps.isChannelUnavailable(error);
+		const quarantined = error instanceof AutoBotInstallationQuarantinedError ? error : undefined;
+		if (!channelUnavailable && !quarantined) throw error;
+		await recoverFreshLaunchPublication(paths, launchId, deps);
+		const installed = await deps.readActive(paths);
+		if (!installed) throw new Error("AutoBot bootstrap has no verified installed runtime for safe fallback");
+		if (
+			quarantined &&
+			installed.manifest.releaseSequence === quarantined.releaseSequence &&
+			installed.manifest.forkCommit === quarantined.forkCommit
+		) {
+			throw error;
+		}
+		await deps.verifyActive(paths, installed);
+		await recordFreshLaunchDiagnostic(paths, deps, {
+			phase: "fresh-launch-refresh",
+			outcome: "deferred",
+			reason: quarantined ? "update-quarantined" : "offline-installed-fallback",
+			releaseSequence: installed.manifest.releaseSequence,
+			launchId,
+		});
+		return installed;
+	}
+	await deps.verifyActive(paths, refreshed.active);
+	await recordFreshLaunchDiagnostic(paths, deps, {
+		phase: "fresh-launch-refresh",
+		outcome: refreshed.changed ? "completed" : "unchanged",
+		reason: "refresh-completed",
+		releaseSequence: refreshed.active.manifest.releaseSequence,
+		launchId,
+	});
+	return refreshed.active;
+}
+export function isAutoBotReadOnlyUpdateStatusInvocation(argv: readonly string[]): boolean {
+	let index = 0;
+	while (index < argv.length) {
+		const argument = argv[index];
+		if (argument === "--profile") {
+			const profile = argv[index + 1];
+			if (!profile || profile.startsWith("-")) return false;
+			index += 2;
+			continue;
+		}
+		if (argument.startsWith("--profile=")) {
+			if (argument.length === "--profile=".length) return false;
+			index++;
+			continue;
+		}
+		break;
+	}
+	return argv.length - index === 2 && argv[index] === "update" && argv[index + 1] === "--status";
+}
+
+export async function selectAutoBotLaunchActive(
+	paths: AutoBotPaths,
+	launchId: string,
+	argv: readonly string[],
+	deps: AutoBotFreshLaunchPreparationDeps,
+): Promise<{ readonly active: AutoBotActivePointer; readonly readOnlyStatus: boolean }> {
+	const readOnlyStatus = isAutoBotReadOnlyUpdateStatusInvocation(argv);
+	if (!readOnlyStatus) {
+		return { active: await prepareAutoBotFreshLaunch(paths, launchId, deps), readOnlyStatus };
+	}
+	const active = await deps.readActive(paths);
+	if (!active) throw new Error("AutoBot bootstrap active runtime pointer is missing");
+	await deps.verifyActive(paths, active);
+	return { active, readOnlyStatus };
+}
+
 async function runBootstrap(): Promise<number> {
 	const root = resolveAutoBotBootstrapRoot();
 	const paths = autoBotPaths(root);
@@ -1041,12 +1255,13 @@ async function runBootstrap(): Promise<number> {
 	}
 	const identity = readAutoBotInstallationIdentitySync(paths);
 	if (!identity) throw new Error("AutoBot bootstrap installation identity is missing");
-	const active = readAutoBotActivePointerSync(paths);
-	if (!active) throw new Error("AutoBot bootstrap active runtime pointer is missing");
 	const claim: AutoBotHandoffClaim = {
 		launchId: randomBytes(32).toString("base64url"),
 		bootstrapProcessId: process.pid,
 	};
+	const argv = process.argv.slice(2);
+	const selection = await selectAutoBotLaunchActive(paths, claim.launchId, argv, freshLaunchPreparationDeps);
+	const active = selection.active;
 	// This fresh lease remains held through every child supervision path.
 	const lifetimeLease = await acquireAutoBotFileLock(autoBotLaunchLeaseLockPath(paths, claim.launchId));
 
@@ -1058,18 +1273,19 @@ async function runBootstrap(): Promise<number> {
 	process.on("SIGTERM", preserveChildTerminalOwnership);
 	process.on("SIGHUP", preserveChildTerminalOwnership);
 	try {
-		const recovery = await claimOrphanedCommittedRestart(paths, claim);
+		const recovery: CommittedRecovery = selection.readOnlyStatus
+			? { kind: "none" }
+			: await resolveFreshLaunchHandoff(paths, claim);
 		if (recovery.kind === "normal-exit") return 0;
-		if (recovery.kind === "blocked") return 1;
 		if (recovery.kind === "claimed") {
 			// Await under this try: returning the promise directly would run the
 			// finally block and release this bootstrap's lifetime lease early.
 			return await resumeCommittedCandidate(paths, identity, claim, recovery.committed, () => terminationRequested);
 		}
 
-		// Pending is deliberately non-adoptable. A foreign or orphaned
-		// pre-commit owner is untouched rather than risking a duplicate launch.
-		if (await withAutoBotHandoffLock(paths, () => readAutoBotPendingRestart(paths))) return 1;
+		// A live/uncertain committed owner or any pre-commit journal remains
+		// untouched and unauthorizing. It must not block an independent new
+		// session from launching the preferred runtime.
 
 		const activeRuntime = await readStagedRuntime(paths, active.runtimePath);
 		const child = startRuntime({
@@ -1079,11 +1295,19 @@ async function runBootstrap(): Promise<number> {
 			runtime: activeRuntime,
 			role: "active",
 			cwd: process.cwd(),
-			argv: process.argv.slice(2),
+			argv,
 		});
 		// Await under this try so finally cannot release the lifetime lease while
 		// the active child (and any nested handoff supervision) is still live.
-		return await supervisePromotedRuntime(paths, identity, claim, active, activeRuntime, child, () => terminationRequested);
+		return await supervisePromotedRuntime(
+			paths,
+			identity,
+			claim,
+			active,
+			activeRuntime,
+			child,
+			() => terminationRequested,
+		);
 	} finally {
 		process.off("SIGINT", preserveChildTerminalOwnership);
 		process.off("SIGTERM", preserveChildTerminalOwnership);

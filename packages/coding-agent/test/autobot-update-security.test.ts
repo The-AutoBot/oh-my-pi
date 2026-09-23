@@ -17,7 +17,7 @@ import {
 	type AutoBotReleaseManifest,
 	type AutoBotRestartTarget,
 } from "@oh-my-pi/pi-coding-agent/autobot-update/contract";
-import { fetchVerifiedAutoBotRelease } from "@oh-my-pi/pi-coding-agent/autobot-update/channel";
+import { AutoBotTransportError, fetchVerifiedAutoBotRelease } from "@oh-my-pi/pi-coding-agent/autobot-update/channel";
 import {
 	assertAutoBotDenyOnlyDarwinAclListing,
 	assertAutoBotPrivateDirectoryAndOptionalFiles,
@@ -314,9 +314,11 @@ describe("AutoBot signed channel redirects", () => {
 				}) as typeof fetch,
 			}),
 		);
+		expect(getReaderError).toBeInstanceOf(AutoBotTransportError);
 		expectChannelErrorToRedact(getReaderError, sensitiveUrl);
 
 		let incompleteBodyCancelled = false;
+		let readCount = 0;
 		const readError = await rejectionOf(
 			fetchVerifiedAutoBotRelease(channel, {
 				fetchImpl: (async (_input, _init) => {
@@ -327,6 +329,9 @@ describe("AutoBot signed channel redirects", () => {
 						body: {
 							getReader: () => ({
 								read: async () => {
+									if (readCount++ === 0) {
+										return { done: false, value: new TextEncoder().encode('{"partial":') };
+									}
 									throw new Error(sensitiveUrl);
 								},
 								cancel: async () => {
@@ -339,8 +344,44 @@ describe("AutoBot signed channel redirects", () => {
 				}) as typeof fetch,
 			}),
 		);
+		expect(readError).toBeInstanceOf(AutoBotTransportError);
 		expectChannelErrorToRedact(readError, sensitiveUrl);
 		expect(incompleteBodyCancelled).toBeTrue();
+	});
+
+	test("keeps malformed JSON and signature rejection distinct from transport disconnects", async () => {
+		const generated = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+		if (!isCryptoKeyPair(generated)) throw new Error("Ed25519 key generation did not return a key pair");
+		const channel = {
+			schemaVersion: 1 as const,
+			envelopeUrl: "https://channel.example.invalid/current.json",
+			collabPortalUrl: "https://collab.example.invalid/live",
+			trustedKeys: {
+				current: Buffer.from(await crypto.subtle.exportKey("spki", generated.publicKey)).toString("base64"),
+			},
+			allowedArtifactOrigins: [],
+		};
+		const malformed = await rejectionOf(
+			fetchVerifiedAutoBotRelease(channel, {
+				fetchImpl: (async () => new Response("{", { status: 200 })) as unknown as typeof fetch,
+			}),
+		);
+		expect(malformed).not.toBeInstanceOf(AutoBotTransportError);
+		expect(malformed.message).toContain("not valid UTF-8 JSON");
+
+		const payload = serializeAutoBotReleaseManifest(releaseManifest(8));
+		const invalidSignature = JSON.stringify({
+			keyId: "current",
+			payload,
+			signature: Buffer.alloc(64).toString("base64"),
+		});
+		const rejectedSignature = await rejectionOf(
+			fetchVerifiedAutoBotRelease(channel, {
+				fetchImpl: (async () => new Response(invalidSignature, { status: 200 })) as unknown as typeof fetch,
+			}),
+		);
+		expect(rejectedSignature).not.toBeInstanceOf(AutoBotTransportError);
+		expect(rejectedSignature.message).toContain("signature verification failed");
 	});
 });
 

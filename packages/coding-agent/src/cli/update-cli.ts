@@ -14,8 +14,22 @@ import { $env, $which, APP_NAME, compareVersions, isEnoent, VERSION } from "@oh-
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { $ } from "bun";
+import * as logger from "@oh-my-pi/pi-utils/logger";
+import {
+	readAutoBotUpdateDiagnostics,
+	writeAutoBotUpdateDiagnostic,
+	type AutoBotUpdateDiagnostic,
+} from "../autobot-update/diagnostics";
+import {
+	AUTO_BOT_ENV,
+	readAuthenticatedAutoBotEnvironment,
+	type AuthenticatedAutoBotEnvironment,
+} from "../autobot-update/identity";
+import { refreshAutoBotInstallation } from "../autobot-update/installation";
+import { assertAutoBotPrivateDirectoryAndOptionalFiles } from "../autobot-update/permissions";
 import { settings } from "../config/settings";
 import { isAutoBotMuslLinux, type MuslDetectionOptions } from "../autobot-update/platform";
+import { readAutoBotActivePointer } from "../autobot-update/state";
 import { theme } from "../modes/theme/theme";
 import {
 	isTimeoutError,
@@ -415,18 +429,33 @@ export interface BinaryReplacementOptions {
  */
 export function parseUpdateArgs(
 	args: string[],
-): { force: boolean; check: boolean; plugins: boolean; channel?: UpdateChannel } | undefined {
+): { force: boolean; check: boolean; status: boolean; plugins: boolean; channel?: UpdateChannel } | undefined {
 	if (args.length === 0 || args[0] !== "update") {
 		return undefined;
 	}
 
 	const canary = args.includes("--canary");
 	const stable = args.includes("--stable");
+	const status = args.includes("--status");
 	if (canary && stable) throw new Error("--canary and --stable are mutually exclusive");
+	if (
+		status &&
+		(canary ||
+			stable ||
+			args.includes("--force") ||
+			args.includes("-f") ||
+			args.includes("--check") ||
+			args.includes("-c") ||
+			args.includes("--plugins") ||
+			args.includes("-l"))
+	) {
+		throw new Error("--status cannot be combined with other update options");
+	}
 
 	return {
 		force: args.includes("--force") || args.includes("-f"),
 		check: args.includes("--check") || args.includes("-c"),
+		status,
 		plugins: args.includes("--plugins") || args.includes("-l"),
 		channel: canary ? "canary" : stable ? "stable" : undefined,
 	};
@@ -2031,15 +2060,221 @@ function persistChannel(channel: UpdateChannel): void {
 	}
 }
 
+const MANAGED_REASON_DESCRIPTIONS: Readonly<Record<string, string>> = {
+	"agent-transition-active": "wait for the agent lifecycle transition to finish, then retry",
+	"authentication-changed": "the authenticated managed launch changed; run the command again from the active launch",
+	"automatic-mode-active": "wait for the automatic mode or session transition to finish, then retry",
+	"browser-session-active": "close the session's managed browser tabs, then retry",
+	"channel-unavailable": "the signed release channel is temporarily unavailable; retry when connectivity is restored",
+	"collab-controller-shutdown": "restart the collaboration session before retrying the update",
+	"collab-reservation-active": "wait for the collaboration restart reservation to finish, then retry",
+	"collab-session-busy": "wait for collaboration work to finish, then retry",
+	"collab-session-transition": "wait for the collaboration session transition to finish, then retry",
+	"collab-target-incompatible": "update connected collaboration clients to a compatible release before retrying",
+	"compatibility-epoch-mismatch": "restart OMP normally so the managed launcher can select a compatible release",
+	"compaction-pending": "wait for queued compaction work to finish, then retry",
+	"composer-draft-pending": "send or discard the unsent draft and attachments, then retry",
+	"computer-session-active": "close the session's desktop-computer control session, then retry",
+	"coordinator-bundle-unavailable":
+		"repair or refresh the managed installation to restore its verified coordinator bundle",
+	"coordinator-deferred":
+		"the session coordinator deferred the restart; wait for its current work to finish, then retry",
+	"coordinator-preparation-invalid": "restart OMP normally to obtain a fresh session-coordinator reservation",
+	"coordinator-service-unavailable": "restart OMP normally to restore the managed session-coordinator service",
+	"debugger-session-active": "terminate the active debugger session, then retry",
+	"extension-override": "restart without command-line extension, hook, or plugin overrides before updating",
+	"external-editor-active": "close the external editor that owns the current draft, then retry",
+	"handoff-budget-expired": "the safe restart window expired; retry the update",
+	"handoff-contended": "another session owns the restart handoff; wait for it to finish, then retry",
+	"handoff-invalid": "restart OMP normally before retrying the managed update",
+	"handoff-write-failed": "the restart handoff could not be recorded safely; check local storage and retry",
+	"hub-service-active": "stop session-owned hub services and background processes, then retry",
+	"hub-service-inspection-failed": "check session-owned hub services, stop any that remain active, and retry",
+	"installation-refresh-failed":
+		"the signed release could not be verified or published; retry or repair the managed installation",
+	"interactive-request-active": "finish the interactive side request, then retry",
+	"interactive-state-unsafe": "return the session to an idle interactive state, then retry",
+	"interactive-teardown": "wait for interactive teardown to finish, then retry",
+	"javascript-evaluation-active": "close active JavaScript evaluation contexts, then retry",
+	"mcp-connection-active":
+		"wait for MCP connection and tool loading to finish, then retry; configured servers reconnect after restart",
+	"mcp-request-active":
+		"wait for MCP calls, incoming request handlers, and response delivery to finish, then retry; configured servers reconnect after restart",
+	"mcp-restart-quiescence-unavailable":
+		"wait for the MCP transport to become idle, then retry; configured servers reconnect after restart",
+	"mcp-restart-quiescence-unsupported":
+		"disconnect the unsupported MCP transport or use a built-in transport that can quiesce safely",
+	"modal-interface-open": "close the modal interface, then retry",
+	"model-override": "restart without command-line provider or model overrides before updating",
+	"model-role-override": "restart without command-line model-role or thinking overrides before updating",
+	"offline-installed-fallback":
+		"the signed channel is unavailable; connectivity must recover before a newer release can activate",
+	"preflight-deferred": "return the session to an idle state and retry the managed update",
+	"preflight-failed": "the session safety check failed; retry from the active managed launch",
+	"prompt-pending": "wait for the submitted prompt to finish, then retry",
+	"provider-session-override": "restart without provider-session or prompt-cache overrides before updating",
+	"publication-recovered": "an interrupted release publication was recovered; no user action is required",
+	"publication-recovery-pending": "restart the managed launcher to recover the interrupted release publication",
+	"python-kernel-active": "close the active Python kernel session, then retry",
+	"refresh-completed": "the signed release refresh completed; no user action is required",
+	"release-quarantined": "the preferred release was rejected; wait for a replacement signed release",
+	"restart-context-invalid": "restart OMP normally before retrying the managed update",
+	"restart-preparation-deferred": "return the session to an idle resumable state, then retry",
+	"restart-preparation-failed": "restart preparation failed safely; retry from the active managed launch",
+	"runtime-api-key-override": "restart without a command-line API key override before updating",
+	"sequence-rejected": "the candidate failed release anti-rollback checks; wait for a corrected signed release",
+	"session-admission-changed":
+		"session activity changed during restart admission; wait for it to become idle, then retry",
+	"session-focus-changing": "wait for the session focus change to finish, then retry",
+	"session-not-persisted": "save the current session to disk before retrying",
+	"session-persistence-failed": "the session could not be saved; check local storage before retrying",
+	"session-work-active":
+		"wait for the current response, tool calls, and background session work to finish, then retry",
+	"signed-refresh-failed":
+		"the signed release could not be verified or published; retry or repair the managed installation",
+	"startup-override": "restart without command-line startup, skill, or time-limit overrides before updating",
+	"subagent-session-active": "wait for live subagents to finish or stop them, then retry",
+	"system-prompt-override": "restart without command-line system-prompt overrides before updating",
+	"update-changed": "the preferred update changed during preparation; run the command again",
+	"update-quarantined": "wait for a corrected signed update; a different verified installed release remains active",
+	"user-exit-pending": "allow the requested exit to finish before updating",
+};
+
+function managedReason(diagnostic: AutoBotUpdateDiagnostic): string {
+	if (!diagnostic.reason) return "none";
+	const description =
+		MANAGED_REASON_DESCRIPTIONS[diagnostic.reason] ??
+		(diagnostic.reason.startsWith("coordinator-")
+			? "the session coordinator deferred the restart; wait for coordinator activity to finish, then retry"
+			: diagnostic.reason.startsWith("collab-")
+				? "collaboration state deferred the restart; wait for collaboration activity to finish, then retry"
+				: "unrecognized managed update condition; consult support with this stable reason code");
+	return `${description} (${diagnostic.reason})`;
+}
+
+async function printManagedUpdateStatus(environment: AuthenticatedAutoBotEnvironment): Promise<void> {
+	await assertAutoBotPrivateDirectoryAndOptionalFiles(environment.paths.controlDir, [
+		environment.paths.activePointerPath,
+	]);
+	const [active, diagnostics] = await Promise.all([
+		readAutoBotActivePointer(environment.paths),
+		readAutoBotUpdateDiagnostics(environment.paths),
+	]);
+	console.log(chalk.bold("Managed update status"));
+	if (active) {
+		console.log(
+			`Preferred release: ${active.manifest.upstreamVersion} (sequence ${active.manifest.releaseSequence})`,
+		);
+	} else {
+		console.log("Preferred release: none");
+	}
+	if (diagnostics.length === 0) {
+		console.log("Latest update state: no diagnostic has been recorded");
+		return;
+	}
+	console.log("Latest update states:");
+	for (const diagnostic of diagnostics) {
+		console.log(
+			`  ${diagnostic.launchId === environment.launchId ? "current launch" : "other launch"}: ${diagnostic.outcome} during ${diagnostic.phase}; release sequence ${diagnostic.releaseSequence === undefined ? "unknown" : diagnostic.releaseSequence}; reason: ${managedReason(diagnostic)}`,
+		);
+	}
+}
+
+async function recordManagedCommandDiagnostic(
+	environment: AuthenticatedAutoBotEnvironment,
+	event: Omit<Parameters<typeof writeAutoBotUpdateDiagnostic>[1], "launchId">,
+): Promise<void> {
+	try {
+		await writeAutoBotUpdateDiagnostic(environment.paths, { ...event, launchId: environment.launchId });
+	} catch {
+		logger.error("AutoBot update diagnostic could not be persisted", {
+			phase: event.phase,
+			outcome: event.outcome,
+			releaseSequence: event.releaseSequence,
+		});
+	}
+}
+
+interface UpdateCommandDependencies {
+	readonly readManagedEnvironment?: () => AuthenticatedAutoBotEnvironment | undefined;
+	readonly refreshManagedInstallation?: typeof refreshAutoBotInstallation;
+}
+
+async function runManagedUpdateCommand(
+	environment: AuthenticatedAutoBotEnvironment,
+	opts: { readonly check: boolean; readonly channel?: UpdateChannel },
+	dependencies: UpdateCommandDependencies,
+): Promise<void> {
+	if (opts.channel !== undefined) {
+		throw new Error(
+			"Managed installations use their verified signed channel configuration; --canary and --stable do not apply",
+		);
+	}
+	if (opts.check) {
+		await printManagedUpdateStatus(environment);
+		console.log(chalk.dim(`Run ${APP_NAME} update without --check to refresh the signed channel.`));
+		return;
+	}
+	await recordManagedCommandDiagnostic(environment, {
+		phase: "command-refresh",
+		outcome: "started",
+		releaseSequence: environment.launchRelease.releaseSequence,
+	});
+	try {
+		const refresh = dependencies.refreshManagedInstallation ?? refreshAutoBotInstallation;
+		const result = await refresh(environment.paths);
+		await recordManagedCommandDiagnostic(environment, {
+			phase: "command-refresh",
+			outcome: result.changed ? "completed" : "unchanged",
+			releaseSequence: result.active.manifest.releaseSequence,
+		});
+		const state = result.changed ? "Updated preferred release" : "Preferred release is already current";
+		console.log(
+			chalk.green(
+				`${state}: ${result.active.manifest.upstreamVersion} (sequence ${result.active.manifest.releaseSequence})`,
+			),
+		);
+	} catch {
+		await recordManagedCommandDiagnostic(environment, {
+			phase: "command-refresh",
+			outcome: "failed",
+			reason: "signed-refresh-failed",
+			releaseSequence: environment.launchRelease.releaseSequence,
+		});
+		throw new Error("Managed update failed while verifying or publishing the signed release");
+	}
+}
+
 /**
  * Run the update command.
  */
-export async function runUpdateCommand(opts: {
-	force: boolean;
-	check: boolean;
-	channel?: UpdateChannel;
-}): Promise<void> {
+export async function runUpdateCommand(
+	opts: {
+		force: boolean;
+		check: boolean;
+		status?: boolean;
+		channel?: UpdateChannel;
+	},
+	dependencies: UpdateCommandDependencies = {},
+): Promise<void> {
+	const readManagedEnvironment = dependencies.readManagedEnvironment ?? readAuthenticatedAutoBotEnvironment;
+	const managedEnvironment = readManagedEnvironment();
+	if (process.env[AUTO_BOT_ENV.managed] === "1" && !managedEnvironment) {
+		throw new Error("Managed update refused because the authenticated installation environment is invalid");
+	}
 	console.log(chalk.dim(`Current version: ${VERSION}`));
+	if (opts.status) {
+		if (managedEnvironment) {
+			await printManagedUpdateStatus(managedEnvironment);
+		} else {
+			console.log("Managed update status: this is not an authenticated managed installation");
+		}
+		return;
+	}
+	if (managedEnvironment) {
+		await runManagedUpdateCommand(managedEnvironment, opts, dependencies);
+		return;
+	}
 	const persistedChannel = readPersistedChannel() ?? "stable";
 	const channel = opts.channel ?? persistedChannel;
 	const isChannelSwitch = opts.channel !== undefined && opts.channel !== persistedChannel;
@@ -2156,6 +2391,7 @@ ${chalk.bold("Usage:")}
 
 ${chalk.bold("Options:")}
   -c, --check     Check for updates without installing
+  --status        Show managed release and update state without network access
   -f, --force     Force reinstall even if up to date
   -l, --plugins   Update installed plugins
   --canary        Switch to the canary channel and update
@@ -2164,6 +2400,7 @@ ${chalk.bold("Options:")}
 ${chalk.bold("Examples:")}
   ${APP_NAME} update              Update to latest version
   ${APP_NAME} update --check      Check if updates are available
+  ${APP_NAME} update --status     Show managed update status without checking the network
   ${APP_NAME} update --force      Force reinstall
   ${APP_NAME} update -l           Update installed plugins
   ${APP_NAME} update --canary    Switch to the canary channel and update
