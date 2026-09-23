@@ -48,6 +48,7 @@ import {
 	assertCandidatePublicationBoundary,
 	assertDeclaredStagedDiff,
 	assertNoForbiddenWorktreeResidue,
+	assertPinnedInputAwareDiffCheck,
 	stageDeclaredRepair,
 } from "./autobot-publication-boundary.ts";
 import type { RepairIntent } from "./autobot-publication-boundary.ts";
@@ -1450,8 +1451,14 @@ async function assertNoUnmergedIndex(worktree: string): Promise<void> {
 	if (entries.stdout.length !== 0) throw new AutoBotReleaseError("Local integration has unresolved index entries");
 }
 
-async function assertDiffCheck(worktree: string, base?: string): Promise<void> {
+async function assertDiffCheck(worktree: string, base?: string, allowedInputCommit?: string): Promise<void> {
 	await runCommand(["git", "diff", "--check"], { cwd: worktree, capture: true });
+	if (base !== undefined && allowedInputCommit !== undefined) {
+		await assertPinnedInputAwareDiffCheck(worktree, base, undefined, allowedInputCommit);
+		const head = await currentCommit(worktree, "Integration whitespace-check HEAD");
+		await assertPinnedInputAwareDiffCheck(worktree, base, head, allowedInputCommit);
+		return;
+	}
 	await runCommand(["git", "diff", "--cached", "--check"], { cwd: worktree, capture: true });
 	if (base)
 		await runCommand(["git", "diff", "--check", requireCommit(base, "Diff base"), "HEAD"], {
@@ -1460,11 +1467,16 @@ async function assertDiffCheck(worktree: string, base?: string): Promise<void> {
 		});
 }
 
-async function assertCleanWorktree(worktree: string, localRef: string, base?: string): Promise<void> {
+async function assertCleanWorktree(
+	worktree: string,
+	localRef: string,
+	base?: string,
+	allowedInputCommit?: string,
+): Promise<void> {
 	await assertManagedBranch(worktree, localRef);
 	await assertNoUnmergedIndex(worktree);
 	if (await mergeHead(worktree)) throw new AutoBotReleaseError("Local integration retains an unfinished merge");
-	await assertDiffCheck(worktree, base);
+	await assertDiffCheck(worktree, base, allowedInputCommit);
 	await assertNoForbiddenWorktreeResidue(worktree);
 	const status = await runCommand(["git", "status", "--porcelain=v1", "-z"], { cwd: worktree, capture: true });
 	if (status.stdout.length !== 0)
@@ -1613,7 +1625,7 @@ async function finalizeMerge(
 		await assertNoUnmergedIndex(worktree);
 		if (repairIntent !== undefined) await assertDeclaredStagedDiff(worktree, base, repairIntent, other);
 		await assertNoForbiddenWorktreeResidue(worktree, other);
-		await assertDiffCheck(worktree, base);
+		await assertDiffCheck(worktree, base, other);
 		await runCommand(
 			[
 				"git",
@@ -1636,7 +1648,7 @@ async function finalizeMerge(
 	} else {
 		await assertExactMerge(worktree, commit, base, other, subject);
 	}
-	await assertCleanWorktree(worktree, localRef, base);
+	await assertCleanWorktree(worktree, localRef, base, other);
 	return commit;
 }
 
@@ -1674,7 +1686,7 @@ async function createSyntheticCandidateMerge(
 	await runCommand(["git", "update-ref", localRef, candidateCommit, base], { cwd: worktree, capture: true });
 	await assertManagedBranch(worktree, localRef);
 	await assertCandidateMerge(worktree, candidateCommit, upstreamCommit, base);
-	await assertCleanWorktree(worktree, localRef, base);
+	await assertCleanWorktree(worktree, localRef, base, upstreamCommit);
 	return candidateCommit;
 }
 
@@ -1682,6 +1694,7 @@ async function commitPendingChanges(
 	worktree: string,
 	localRef: string,
 	base: string,
+	allowedInputCommit: string,
 	subject: string,
 	repairIntent: RepairIntent,
 ): Promise<string> {
@@ -1690,7 +1703,7 @@ async function commitPendingChanges(
 	const before = await currentCommit(worktree, "Pre-commit integration HEAD");
 	await stageDeclaredRepair(worktree, repairIntent);
 	await assertNoUnmergedIndex(worktree);
-	await assertDiffCheck(worktree, base);
+	await assertDiffCheck(worktree, base, allowedInputCommit);
 	const status = await runCommand(["git", "status", "--porcelain=v1", "-z"], { cwd: worktree, capture: true });
 	if (status.stdout.length === 0) return before;
 	await runCommand(
@@ -1711,7 +1724,7 @@ async function commitPendingChanges(
 	if (!(await isAncestor(worktree, before, after))) {
 		throw new AutoBotReleaseError("Committed OMP changes did not preserve the previous integration history");
 	}
-	await assertCleanWorktree(worktree, localRef, base);
+	await assertCleanWorktree(worktree, localRef, base, allowedInputCommit);
 	return after;
 }
 
@@ -1747,8 +1760,9 @@ async function synchronizeAndCommitNativeReleaseMetadata(
 	worktree: string,
 	localRef: string,
 	base: string,
+	allowedInputCommit: string,
 ): Promise<{ readonly commit: string; readonly changed: boolean }> {
-	await assertCleanWorktree(worktree, localRef, base);
+	await assertCleanWorktree(worktree, localRef, base, allowedInputCommit);
 	const before = await currentCommit(worktree, "Pre-synchronization integration HEAD");
 	const changedPaths = await synchronizeNativeReleaseMetadata(worktree);
 	if (
@@ -1797,7 +1811,7 @@ async function synchronizeAndCommitNativeReleaseMetadata(
 		"Staged native release metadata diff",
 	);
 	assertExactPathSet(staged, changedPaths, "Staged native release metadata diff");
-	await assertDiffCheck(worktree, base);
+	await assertDiffCheck(worktree, base, allowedInputCommit);
 	await runCommand(
 		[
 			"git",
@@ -1816,7 +1830,7 @@ async function synchronizeAndCommitNativeReleaseMetadata(
 	if (!(await isAncestor(worktree, before, after))) {
 		throw new AutoBotReleaseError("Native release metadata synchronization did not preserve integration history");
 	}
-	await assertCleanWorktree(worktree, localRef, base);
+	await assertCleanWorktree(worktree, localRef, base, allowedInputCommit);
 	return { commit: after, changed: true };
 }
 
@@ -2179,6 +2193,7 @@ async function prepareCandidate(
 		managed.worktree,
 		managed.localRef,
 		canonicalCommit,
+		upstreamCommit,
 	);
 	currentHead = metadataSynchronization.commit;
 	sourceChanged = sourceChanged || metadataSynchronization.changed;
@@ -2221,6 +2236,7 @@ async function prepareCandidate(
 			managed.worktree,
 			managed.localRef,
 			beforeReview,
+			upstreamCommit,
 			`chore(autobot): compatibility review ${upstreamCommit.slice(0, 12)}`,
 			repairIntent,
 		);
@@ -2238,7 +2254,7 @@ async function prepareCandidate(
 		sourceChanged = sourceChanged || currentHead !== beforeReview;
 	}
 
-	await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+	await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 	const finalHead = await currentCommit(managed.worktree, "Prepared local candidate commit");
 	const candidateMerge = await latestCandidateMerge(managed.worktree, finalHead);
 	if (!candidateMerge || candidateMerge.upstreamCommit !== upstreamCommit) {
@@ -2503,7 +2519,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			if (!(await isAncestor(managed.worktree, upstreamCommit, retainedHead))) {
 				throw new AutoBotReleaseError("Prepared candidate does not retain its signed effective upstream commit");
 			}
-			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 			const candidate: LocalCandidate = {
 				sourceRoot: managed.worktree,
 				forkCommit: preparedPlan.forkCommit,
@@ -2556,7 +2572,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				expectedIntegrationCommit,
 			);
 			const published = await publishPreparedLocalRelease(config, candidate, mode.stageRoot, commandRecorder);
-			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 			if ((await currentCommit(managed.worktree, "Published prepared candidate HEAD")) !== candidate.forkCommit) {
 				throw new AutoBotReleaseError("Prepared publisher changed the retained candidate source");
 			}
@@ -2650,7 +2666,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 		if (!(await isAncestor(managed.worktree, upstreamCommit, finalHead))) {
 			throw new AutoBotReleaseError("Final local candidate does not retain the pinned upstream ancestor");
 		}
-		await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+		await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 		if (mode.kind === "verify") {
 			await assertRemoteInputs(
 				config,
@@ -2672,7 +2688,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			if (verified.kind !== "verified") {
 				throw new AutoBotReleaseError("Verification mode returned a publication result");
 			}
-			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+			await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 			if ((await currentCommit(managed.worktree, "Verified candidate HEAD")) !== candidate.forkCommit) {
 				throw new AutoBotReleaseError("Verifier changed the committed candidate source");
 			}
@@ -2741,7 +2757,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 			try {
 				await setPhase("publishing");
 				const published = await buildAndPublishLocalRelease(config, publishCandidate, commandRecorder);
-				await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+				await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 				if ((await currentCommit(managed.worktree, "Published candidate HEAD")) !== publishCandidate.forkCommit) {
 					throw new AutoBotReleaseError("Publisher changed the committed candidate source");
 				}
@@ -2801,6 +2817,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 					managed.worktree,
 					managed.localRef,
 					repairBase,
+					upstreamCommit,
 					`chore(autobot): repair candidate ${upstreamCommit.slice(0, 12)}`,
 					repairIntent,
 				);
@@ -2810,7 +2827,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 				if (!(await isAncestor(managed.worktree, repairBase, repairedHead))) {
 					throw new AutoBotReleaseError("OMP repair did not preserve the failed candidate ancestry");
 				}
-				await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+				await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 				const repairedMerge = await latestCandidateMerge(managed.worktree, repairedHead);
 				if (!repairedMerge || repairedMerge.upstreamCommit !== upstreamCommit) {
 					throw new AutoBotReleaseError("OMP repair removed the required candidate merge ancestry");
@@ -2865,6 +2882,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 						managed.worktree,
 						managed.localRef,
 						beforeReview,
+						upstreamCommit,
 						`chore(autobot): compatibility review ${upstreamCommit.slice(0, 12)}`,
 						repairIntent,
 					);
@@ -2873,7 +2891,7 @@ async function runLocalAutomation(configPath: string, mode: LocalAutomationMode 
 							"OMP compatibility work did not preserve the repaired candidate ancestry",
 						);
 					}
-					await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit);
+					await assertCleanWorktree(managed.worktree, managed.localRef, canonicalCommit, upstreamCommit);
 					const reviewedMerge = await latestCandidateMerge(managed.worktree, reviewedHead);
 					if (!reviewedMerge || reviewedMerge.upstreamCommit !== upstreamCommit) {
 						throw new AutoBotReleaseError("OMP compatibility work removed the required candidate merge ancestry");

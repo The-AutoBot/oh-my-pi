@@ -239,6 +239,167 @@ function literalPathspec(pathname: string): string {
 	return `:(literal)${pathname}`;
 }
 
+const MAX_GIT_PATHSPEC_BATCH_LENGTH = 12_000;
+
+function literalPathspecBatches(paths: readonly string[]): string[][] {
+	const batches: string[][] = [];
+	let batch: string[] = [];
+	let length = 0;
+	for (const pathname of paths) {
+		const pathspec = literalPathspec(pathname);
+		if (batch.length > 0 && length + pathspec.length + 1 > MAX_GIT_PATHSPEC_BATCH_LENGTH) {
+			batches.push(batch);
+			batch = [];
+			length = 0;
+		}
+		batch.push(pathspec);
+		length += pathspec.length + 1;
+	}
+	if (batch.length > 0) batches.push(batch);
+	return batches;
+}
+
+function sameTreeEntry(left: TreeEntry | undefined, right: TreeEntry | undefined): boolean {
+	return (
+		left !== undefined &&
+		right !== undefined &&
+		left.path === right.path &&
+		left.mode === right.mode &&
+		left.type === right.type &&
+		left.object === right.object
+	);
+}
+
+const INHERITED_WHITESPACE_KIND =
+	"(?:trailing whitespace|space before tab in indent|new blank line at EOF|indent with spaces|tab in indent)";
+const INHERITED_WHITESPACE_DIAGNOSTIC = new RegExp(
+	`^.+:\\d+: ${INHERITED_WHITESPACE_KIND}(?:, ${INHERITED_WHITESPACE_KIND})*\\.$`,
+	"u",
+);
+
+function assertOnlyInheritedWhitespaceDiagnostics(stdout: string, stderr: string): void {
+	if (stderr.length !== 0) throw new AutoBotReleaseError("Pinned-input integration diff check failed");
+	const lines = stdout.replace(/\r\n?/g, "\n").split("\n");
+	let diagnostics = 0;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index]!;
+		if (line.length === 0) continue;
+		if (/^.+:\d+: leftover conflict marker$/u.test(line)) {
+			throw new AutoBotReleaseError("Pinned-input integration contains a leftover conflict marker");
+		}
+		if (!INHERITED_WHITESPACE_DIAGNOSTIC.test(line)) {
+			throw new AutoBotReleaseError("Pinned-input integration produced an unknown diff-check diagnostic");
+		}
+		diagnostics++;
+		if (!line.endsWith(": new blank line at EOF.")) {
+			if (!lines[index + 1]?.startsWith("+")) {
+				throw new AutoBotReleaseError("Pinned-input integration produced a malformed diff-check diagnostic");
+			}
+			index++;
+		}
+	}
+	if (diagnostics === 0) throw new AutoBotReleaseError("Pinned-input integration diff check failed");
+}
+
+async function assertNoInheritedConflictMarkers(
+	worktree: string,
+	baseCommit: string,
+	targetCommit: string | undefined,
+	inheritedPaths: readonly string[],
+): Promise<void> {
+	for (const pathspecs of literalPathspecBatches(inheritedPaths)) {
+		const child = Bun.spawn(
+			[
+				"git",
+				"diff",
+				"--no-color",
+				...(targetCommit === undefined ? ["--cached"] : []),
+				"--check",
+				baseCommit,
+				...(targetCommit === undefined ? [] : [targetCommit]),
+				"--",
+				...pathspecs,
+			],
+			{ cwd: worktree, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+		);
+		const [exitCode, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		if (exitCode === 0) continue;
+		if (exitCode !== 2) throw new AutoBotReleaseError("Pinned-input integration diff check failed");
+		assertOnlyInheritedWhitespaceDiagnostics(stdout, stderr);
+	}
+}
+
+/**
+ * Check staged or committed integration whitespace while admitting only exact
+ * same-path entries inherited from an immutable pinned merge input.
+ */
+export async function assertPinnedInputAwareDiffCheck(
+	worktree: string,
+	baseCommit: string,
+	targetCommit: string | undefined,
+	allowedInputCommit: string,
+): Promise<void> {
+	const base = requireCommit(baseCommit, "Integration whitespace-check base");
+	const allowedInput = requireCommit(allowedInputCommit, "Pinned whitespace-check input");
+	const target =
+		targetCommit === undefined ? undefined : requireCommit(targetCommit, "Integration whitespace-check target");
+	const changedResult = await runCommand(
+		[
+			"git",
+			"diff",
+			...(target === undefined ? ["--cached"] : []),
+			"--name-only",
+			"--no-renames",
+			"-z",
+			base,
+			...(target === undefined ? [] : [target]),
+		],
+		{ cwd: worktree, capture: true },
+	);
+	const changedPaths = parseListedPaths(changedResult.stdout, "Integration whitespace-check paths");
+	if (changedPaths.length === 0) return;
+
+	const [allowedTree, candidateTree] = await Promise.all([
+		treeAt(worktree, allowedInput, "Pinned whitespace-check input"),
+		target === undefined
+			? runCommand(["git", "write-tree"], { cwd: worktree, capture: true }).then(result =>
+					treeAt(worktree, result.stdout.trim(), "Staged integration"),
+				)
+			: treeAt(worktree, target, "Committed integration"),
+	]);
+	const inheritedPaths: string[] = [];
+	const checkedPaths: string[] = [];
+	for (const pathname of changedPaths) {
+		if (sameTreeEntry(candidateTree.get(pathname), allowedTree.get(pathname))) inheritedPaths.push(pathname);
+		else checkedPaths.push(pathname);
+	}
+
+	await assertNoInheritedConflictMarkers(worktree, base, target, inheritedPaths);
+	for (const pathspecs of literalPathspecBatches(checkedPaths)) {
+		try {
+			await runCommand(
+				[
+					"git",
+					"diff",
+					...(target === undefined ? ["--cached"] : []),
+					"--check",
+					base,
+					...(target === undefined ? [] : [target]),
+					"--",
+					...pathspecs,
+				],
+				{ cwd: worktree, capture: true },
+			);
+		} catch (error) {
+			throw new AutoBotReleaseError("Local integration whitespace check failed", { cause: error });
+		}
+	}
+}
+
 /** Parse the one-time, controller-bound declaration written by local OMP. */
 export function parseRepairIntent(value: unknown, expectedNonce: string): RepairIntent {
 	if (!isRecord(value)) throw new AutoBotReleaseError("Local OMP repair intent must be a JSON object");

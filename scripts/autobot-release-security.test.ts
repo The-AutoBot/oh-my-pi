@@ -18,6 +18,7 @@ import {
 	type AutoBotReleaseManifest,
 } from "../packages/coding-agent/src/autobot-update/contract.ts";
 import { type AssetInput, type TrustedKeySet, verifySignedEnvelope } from "./autobot-release-common.ts";
+import { assertPinnedInputAwareDiffCheck } from "./autobot-publication-boundary.ts";
 import { COORDINATOR_CLIENT_FILENAME, type CoordinatorClientProvenance } from "./autobot-release-coordinator.ts";
 import {
 	createManagedBundle,
@@ -45,6 +46,13 @@ interface AssemblyFixture {
 	readonly coordinatorProvenance: CoordinatorClientProvenance;
 	readonly coordinatorSourcePath: string;
 	readonly coordinatorSourceSha256: string;
+}
+
+interface GitFixture {
+	readonly worktree: string;
+	readonly baseCommit: string;
+	readonly allowedInputCommit: string;
+	readonly inheritedPath: string;
 }
 
 interface SigningKeys {
@@ -82,6 +90,25 @@ async function createTemporaryDirectory(prefix: string): Promise<string> {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
 	temporaryDirectories.push(directory);
 	return directory;
+}
+
+function isolatedGitEnvironment(worktree: string): NodeJS.ProcessEnv {
+	const environment = { ...process.env };
+	for (const name of Object.keys(environment)) {
+		if (name.toUpperCase().startsWith("GIT_")) delete environment[name];
+	}
+	return {
+		...environment,
+		GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+		GIT_AUTHOR_EMAIL: "autobot-fixture@example.invalid",
+		GIT_AUTHOR_NAME: "AutoBot Fixture",
+		GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+		GIT_COMMITTER_EMAIL: "autobot-fixture@example.invalid",
+		GIT_COMMITTER_NAME: "AutoBot Fixture",
+		GIT_CONFIG_GLOBAL: path.join(worktree, ".gitconfig-global-unused"),
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_TERMINAL_PROMPT: "0",
+	};
 }
 
 function isCryptoKeyPair(value: CryptoKey | CryptoKeyPair): value is CryptoKeyPair {
@@ -123,6 +150,55 @@ async function run(command: readonly string[]): Promise<CommandResult> {
 		new Response(processHandle.stderr).text(),
 	]);
 	return { exitCode, stdout, stderr };
+}
+
+async function runGit(worktree: string, args: readonly string[]): Promise<CommandResult> {
+	const processHandle = Bun.spawn(["git", "-c", "core.autocrlf=false", ...args], {
+		cwd: worktree,
+		env: isolatedGitEnvironment(worktree),
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stdout, stderr] = await Promise.all([
+		processHandle.exited,
+		new Response(processHandle.stdout).text(),
+		new Response(processHandle.stderr).text(),
+	]);
+	return { exitCode, stdout, stderr };
+}
+
+async function git(worktree: string, args: readonly string[]): Promise<string> {
+	const result = await runGit(worktree, args);
+	if (result.exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed with exit code ${result.exitCode}: ${result.stderr}`);
+	}
+	return result.stdout.trim();
+}
+
+async function commitAll(worktree: string, message: string): Promise<string> {
+	await git(worktree, ["add", "-A"]);
+	await git(worktree, ["commit", "--quiet", "--no-gpg-sign", "-m", message]);
+	return git(worktree, ["rev-parse", "HEAD"]);
+}
+
+async function createPinnedWhitespaceFixture(): Promise<GitFixture> {
+	const worktree = await createTemporaryDirectory("omp-autobot-diff-check-");
+	await git(worktree, ["init", "--quiet"]);
+	await git(worktree, ["config", "user.name", "AutoBot Fixture"]);
+	await git(worktree, ["config", "user.email", "autobot-fixture@example.invalid"]);
+	await git(worktree, ["config", "commit.gpgsign", "false"]);
+	await git(worktree, ["config", "core.autocrlf", "false"]);
+
+	const inheritedPath = "inherited.txt";
+	await Bun.write(path.join(worktree, ".gitattributes"), `${inheritedPath} whitespace=blank-at-eof\n`);
+	await Bun.write(path.join(worktree, inheritedPath), "base content\n");
+	await Bun.write(path.join(worktree, "base.txt"), "stable base\n");
+	const baseCommit = await commitAll(worktree, "base");
+
+	await Bun.write(path.join(worktree, inheritedPath), "upstream content\n\n");
+	const allowedInputCommit = await commitAll(worktree, "pinned input");
+	return { worktree, baseCommit, allowedInputCommit, inheritedPath };
 }
 
 async function runReleaseScript(scriptName: string, args: readonly string[]): Promise<CommandResult> {
@@ -334,6 +410,144 @@ afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
 	);
+});
+
+describe("AutoBot pinned-input whitespace admission", () => {
+	test("admits an exact pinned blank-at-EOF blob in the index but rejects strict and authored whitespace", async () => {
+		const fixture = await createPinnedWhitespaceFixture();
+		const { worktree, baseCommit, allowedInputCommit, inheritedPath } = fixture;
+		const upstreamDiffCheck = await runGit(worktree, [
+			"diff",
+			"--check",
+			baseCommit,
+			allowedInputCommit,
+			"--",
+			inheritedPath,
+		]);
+		expect(upstreamDiffCheck.exitCode).not.toBe(0);
+		expect(`${upstreamDiffCheck.stdout}${upstreamDiffCheck.stderr}`).toContain("new blank line at EOF");
+
+		await git(worktree, ["reset", "--hard", baseCommit]);
+		await git(worktree, ["checkout", allowedInputCommit, "--", inheritedPath]);
+		await expect(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, undefined, allowedInputCommit),
+		).resolves.toBeUndefined();
+
+		const strictError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, undefined, baseCommit),
+		);
+		expect(strictError.message).toContain("Local integration whitespace check failed");
+
+		await Bun.write(path.join(worktree, inheritedPath), "upstream content  \n\n");
+		await git(worktree, ["add", "--", inheritedPath]);
+		const authoredSamePathError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, undefined, allowedInputCommit),
+		);
+		expect(authoredSamePathError.message).toContain("Local integration whitespace check failed");
+
+		await git(worktree, ["reset", "--hard", baseCommit]);
+		await git(worktree, ["checkout", allowedInputCommit, "--", inheritedPath]);
+		await Bun.write(path.join(worktree, "authored.txt"), "authored trailing whitespace \n");
+		await git(worktree, ["add", "-A"]);
+		const unrelatedError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, undefined, allowedInputCommit),
+		);
+		expect(unrelatedError.message).toContain("Local integration whitespace check failed");
+	});
+
+	test("admits an exact pinned blank-at-EOF blob in a commit but rejects a same-path authored mutation", async () => {
+		const { worktree, baseCommit, allowedInputCommit, inheritedPath } = await createPinnedWhitespaceFixture();
+		await git(worktree, ["reset", "--hard", baseCommit]);
+		await git(worktree, ["checkout", allowedInputCommit, "--", inheritedPath]);
+		await Bun.write(path.join(worktree, "producer.txt"), "clean producer change\n");
+		const inheritedTarget = await commitAll(worktree, "inherit pinned input");
+
+		await expect(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, inheritedTarget, allowedInputCommit),
+		).resolves.toBeUndefined();
+
+		await Bun.write(path.join(worktree, inheritedPath), "upstream content  \n\n");
+		const authoredTarget = await commitAll(worktree, "modify inherited path");
+		const authoredError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, authoredTarget, allowedInputCommit),
+		);
+		expect(authoredError.message).toContain("Local integration whitespace check failed");
+	});
+
+	test("admits an exact inherited line with both trailing whitespace and a space before tab", async () => {
+		const { worktree, baseCommit } = await createPinnedWhitespaceFixture();
+		const inheritedPath = "combined-whitespace.txt";
+		await git(worktree, ["reset", "--hard", baseCommit]);
+		await Bun.write(path.join(worktree, inheritedPath), " \tcontent: leftover conflict marker \n");
+		const combinedInput = await commitAll(worktree, "pinned input with combined whitespace");
+
+		const trailingCheck = await runGit(worktree, [
+			"-c",
+			"core.whitespace=trailing-space",
+			"diff",
+			"--check",
+			baseCommit,
+			combinedInput,
+			"--",
+			inheritedPath,
+		]);
+		expect(`${trailingCheck.stdout}${trailingCheck.stderr}`).toContain("trailing whitespace");
+		const spaceBeforeTabCheck = await runGit(worktree, [
+			"-c",
+			"core.whitespace=space-before-tab",
+			"diff",
+			"--check",
+			baseCommit,
+			combinedInput,
+			"--",
+			inheritedPath,
+		]);
+		expect(`${spaceBeforeTabCheck.stdout}${spaceBeforeTabCheck.stderr}`).toContain("space before tab in indent");
+
+		await git(worktree, ["reset", "--hard", baseCommit]);
+		await git(worktree, ["checkout", combinedInput, "--", inheritedPath]);
+		await expect(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, undefined, combinedInput),
+		).resolves.toBeUndefined();
+	});
+
+	test("fails closed for malformed and missing pinned input commits", async () => {
+		const { worktree, baseCommit, allowedInputCommit } = await createPinnedWhitespaceFixture();
+		const malformedError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, allowedInputCommit, "not-a-commit"),
+		);
+		expect(malformedError.message).toContain("must be a lowercase 40- or 64-character commit ID");
+
+		const missingError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, allowedInputCommit, "f".repeat(40)),
+		);
+		expect(missingError.message).toContain("git failed with exit code");
+	});
+
+	test("rejects an inherited conflict marker after an inherited blank-at-EOF diagnostic", async () => {
+		const { worktree, baseCommit } = await createPinnedWhitespaceFixture();
+		const blankEofPath = "!blank-eof.txt";
+		const markerPath = "+marker.txt";
+		await git(worktree, ["reset", "--hard", baseCommit]);
+		await Bun.write(path.join(worktree, blankEofPath), "inherited blank EOF\n\n");
+		await Bun.write(
+			path.join(worktree, markerPath),
+			"<<<<<<< HEAD\nproducer\n=======\nupstream\n>>>>>>> pinned-input\n",
+		);
+		const conflictInput = await commitAll(worktree, "pinned input with adjacent whitespace diagnostics");
+		const diagnostics = await runGit(worktree, ["diff", "--check", baseCommit, conflictInput]);
+		const diagnosticOutput = `${diagnostics.stdout}${diagnostics.stderr}`;
+		const blankEofDiagnostic = diagnosticOutput.indexOf("new blank line at EOF");
+		const markerDiagnostic = diagnosticOutput.indexOf(`${markerPath}:`);
+		expect(blankEofDiagnostic >= 0).toBeTrue();
+		expect(markerDiagnostic > blankEofDiagnostic).toBeTrue();
+		expect(diagnosticOutput).toContain("leftover conflict marker");
+
+		const conflictError = await rejectionOf(
+			assertPinnedInputAwareDiffCheck(worktree, baseCommit, conflictInput, conflictInput),
+		);
+		expect(conflictError.message).toContain("leftover conflict marker");
+	});
 });
 
 describe("AutoBot release signing", () => {
