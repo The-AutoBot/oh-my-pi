@@ -22,18 +22,18 @@ import {
 	type JsonValue,
 	type PreparedAutoBotRestart,
 } from "./autobot-update/contract";
+import { AUTO_BOT_FINAL_GUEST_ACK_LEASE_MS, AUTO_BOT_SESSION_DISPOSE_TIMEOUT_MS } from "./autobot-update/supervisor";
 import {
-	AUTO_BOT_FINAL_GUEST_ACK_LEASE_MS,
-	AUTO_BOT_SESSION_DISPOSE_TIMEOUT_MS,
-} from "./autobot-update/supervisor";
-import { authorizeAutoBotRestartExit, getAutoBotStartupHandoff, requestAutoBotNormalExit } from "./autobot-update/handoff";
+	authorizeAutoBotRestartExit,
+	getAutoBotStartupHandoff,
+	requestAutoBotNormalExit,
+} from "./autobot-update/handoff";
 import { readAuthenticatedAutoBotEnvironment } from "./autobot-update/identity";
 import { pathIsInside } from "./autobot-update/paths";
 
 const AUTO_BOT_RESTART_CONTEXT_VERSION = 1;
 const POSTMORTEM_CLEANUP_TIMEOUT_MS = 10_000;
 const STDOUT_DRAIN_TIMEOUT_MS = 5_000;
-
 
 type SafeLaunchFlags = Readonly<{
 	autoApprove: boolean;
@@ -115,11 +115,14 @@ export interface AutoBotCoordinatorPreparation {
 type PreparedRuntimeRestart = Readonly<{
 	admission: NonNullable<AutoBotUpdateAdmission>;
 	coordinator: AutoBotCoordinatorPreparation | undefined;
+	mcpQuiescence: { release(): void };
 	target: AutoBotRestartTarget;
 	predecessorTarget: AutoBotRestartTarget;
 }>;
 
-function primitiveRecord(value: JsonValue | AutoBotRestartLaunchContext | undefined): Record<string, JsonValue> | undefined {
+function primitiveRecord(
+	value: JsonValue | AutoBotRestartLaunchContext | undefined,
+): Record<string, JsonValue> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	return value as Record<string, JsonValue>;
 }
@@ -258,18 +261,24 @@ function safeCollabFallbackState(value: JsonValue | undefined): CollabAutoBotFal
 }
 
 function unsafeLaunchOverride(args: Args): string | undefined {
-	if (args.apiKey !== undefined) return "a runtime API key override is active";
-	if (args.systemPrompt !== undefined || args.appendSystemPrompt !== undefined) return "a custom system prompt override is active";
-	if (args.provider !== undefined || args.model !== undefined || args.models?.length) return "a model launch override is active";
+	if (args.apiKey !== undefined) return "runtime-api-key-override";
+	if (args.systemPrompt !== undefined || args.appendSystemPrompt !== undefined) return "system-prompt-override";
+	if (args.provider !== undefined || args.model !== undefined || args.models?.length) return "model-override";
 	if (args.smol !== undefined || args.slow !== undefined || args.plan !== undefined || args.thinking !== undefined) {
-		return "a model-role launch override is active";
+		return "model-role-override";
 	}
-	if (args.providerSessionId !== undefined || args.providerPromptCacheKey !== undefined) return "a provider session override is active";
+	if (args.providerSessionId !== undefined || args.providerPromptCacheKey !== undefined)
+		return "provider-session-override";
 	if (args.extensions?.length || args.hooks?.length || args.trustedExtensions?.length || args.pluginDirs?.length) {
-		return "a custom extension launch override is active";
+		return "extension-override";
 	}
-	if (args.skills?.length || args.prewalkInto !== undefined || args.planYoloInto !== undefined || args.maxTime !== undefined) {
-		return "a nonpersistent startup override is active";
+	if (
+		args.skills?.length ||
+		args.prewalkInto !== undefined ||
+		args.planYoloInto !== undefined ||
+		args.maxTime !== undefined
+	) {
+		return "startup-override";
 	}
 	return undefined;
 }
@@ -325,7 +334,19 @@ export function parseAutoBotRestartLaunchContext(
 	const flags = primitiveRecord(root.flags);
 	if (!configFiles || !flags) return undefined;
 	const boolNames = [
-		"autoApprove", "advisor", "externalThinking", "hideThinking", "noExtensions", "noLsp", "noPrewalk", "noPty", "noRules", "noSkills", "noTitle", "noTools", "prewalk",
+		"autoApprove",
+		"advisor",
+		"externalThinking",
+		"hideThinking",
+		"noExtensions",
+		"noLsp",
+		"noPrewalk",
+		"noPty",
+		"noRules",
+		"noSkills",
+		"noTitle",
+		"noTools",
+		"prewalk",
 	] as const;
 	const parsedFlags: Record<string, boolean | string | undefined> = {};
 	for (const name of boolNames) {
@@ -334,32 +355,40 @@ export function parseAutoBotRestartLaunchContext(
 		parsedFlags[name] = parsed;
 	}
 	const approvalMode = stringField(flags, "approvalMode");
-	if (approvalMode !== undefined && approvalMode !== "always-ask" && approvalMode !== "write" && approvalMode !== "yolo") return undefined;
+	if (
+		approvalMode !== undefined &&
+		approvalMode !== "always-ask" &&
+		approvalMode !== "write" &&
+		approvalMode !== "yolo"
+	)
+		return undefined;
 	const serviceTier = stringField(flags, "serviceTier");
-	const coordinator = root.coordinator === undefined
-		? undefined
-		: safeCoordinatorPreparation(
-				root.coordinator,
-				expectedCoordinator?.target ?? target,
-				expectedCoordinator?.predecessorTarget ?? target,
-			);
+	const coordinator =
+		root.coordinator === undefined
+			? undefined
+			: safeCoordinatorPreparation(
+					root.coordinator,
+					expectedCoordinator?.target ?? target,
+					expectedCoordinator?.predecessorTarget ?? target,
+				);
 	const collab = root.collab === undefined ? undefined : safeCollabFallbackState(root.collab);
 	if (root.coordinator !== undefined && coordinator === undefined) return undefined;
 	if (root.collab !== undefined && collab === undefined) return undefined;
 	return {
 		schemaVersion: AUTO_BOT_RESTART_CONTEXT_VERSION,
 		configFiles,
-		flags: { ...(parsedFlags as SafeLaunchFlags), ...(approvalMode === undefined ? {} : { approvalMode }), ...(serviceTier === undefined ? {} : { serviceTier: serviceTier as Args["serviceTier"] }) },
+		flags: {
+			...(parsedFlags as SafeLaunchFlags),
+			...(approvalMode === undefined ? {} : { approvalMode }),
+			...(serviceTier === undefined ? {} : { serviceTier: serviceTier as Args["serviceTier"] }),
+		},
 		...(coordinator === undefined ? {} : { coordinator }),
 		...(collab === undefined ? {} : { collab }),
 	};
 }
 
 /** Build a fresh candidate Args object; no original argv, prompt, model, or credential is replayed. */
-export function createAutoBotCandidateArgs(
-	request: AutoBotRestartRequest,
-	context: AutoBotRestartLaunchContext,
-): Args {
+export function createAutoBotCandidateArgs(request: AutoBotRestartRequest, context: AutoBotRestartLaunchContext): Args {
 	return {
 		cwd: request.cwd,
 		...(request.profile === undefined ? {} : { profile: request.profile }),
@@ -387,36 +416,87 @@ export function createAutoBotCandidateArgs(
 	};
 }
 
-async function liveResourceReason(session: AgentSession, mode: InteractiveMode): Promise<string | undefined> {
+async function liveResourceReason(
+	session: AgentSession,
+	mode: InteractiveMode,
+	ignoreOwnedMcpQuiescence = false,
+): Promise<string | undefined> {
 	const browserOwnerId = session.sessionManager.getSessionId();
 	const evaluatorOwnerId = session.getEvalKernelOwnerId();
-	if (hasTabsForOwner(browserOwnerId)) return "a browser tab is still owned by this session";
-	if (hasLiveComputerSessionForOwner(evaluatorOwnerId)) return "a computer session is still owned by this session";
-	if (hasVmContextsForOwner(evaluatorOwnerId)) return "a JavaScript evaluation context is still owned by this session";
-	if (hasPythonKernelSessionForOwner(evaluatorOwnerId)) return "a Python kernel is still owned by this session";
-	if (dapSessionManager.listSessions().some(item => item.status !== "terminated")) return "a DAP debugger session is still live";
+	if (hasTabsForOwner(browserOwnerId)) return "browser-session-active";
+	if (hasLiveComputerSessionForOwner(evaluatorOwnerId)) return "computer-session-active";
+	if (hasVmContextsForOwner(evaluatorOwnerId)) return "javascript-evaluation-active";
+	if (hasPythonKernelSessionForOwner(evaluatorOwnerId)) return "python-kernel-active";
+	if (dapSessionManager.listSessions().some(item => item.status !== "terminated")) return "debugger-session-active";
 
-	for (const name of mode.mcpManager?.getConnectedServers() ?? []) {
-		const transport = mode.mcpManager?.getConnection(name)?.transport;
-		if (!transport || transport.hasStatefulSession !== false) {
-			return `the MCP transport "${name}" has state that could not be safely recreated`;
-		}
+	const mcpReason = mode.mcpManager?.restartQuiescenceReason;
+	if (mcpReason !== undefined && !(ignoreOwnedMcpQuiescence && mcpReason === "mcp-restart-quiescence-unavailable")) {
+		return mcpReason;
 	}
 
 	const sessionId = session.sessionManager.getSessionId();
 	if (!sessionId) return undefined;
 	try {
 		const daemons = await listKnownProjectDaemons(session.sessionManager.getCwd());
-		if (daemons?.some(daemon => daemon.owner === sessionId && daemon.state !== "exited" && daemon.state !== "failed")) {
-			return "a user-owned hub service is still running";
+		if (
+			daemons?.some(daemon => daemon.owner === sessionId && daemon.state !== "exited" && daemon.state !== "failed")
+		) {
+			return "hub-service-active";
 		}
-	} catch (error) {
-		logger.warn("AutoBot update deferred because a session-owned hub service could not be inspected", {
-			error: String(error),
-		});
-		return "a session-owned hub service could not be verified safe";
+	} catch {
+		logger.warn("AutoBot update deferred because session-owned hub services could not be inspected");
+		return "hub-service-inspection-failed";
 	}
 	return undefined;
+}
+
+function acquireMcpRestartQuiescence(mode: InteractiveMode): { guard?: { release(): void }; reason?: string } {
+	const manager = mode.mcpManager;
+	if (!manager) return { guard: { release: () => {} } };
+	const reason = manager.restartQuiescenceReason;
+	if (reason !== undefined) return { reason };
+	const guard = manager.acquireRestartQuiescence();
+	if (guard) return { guard };
+	return { reason: manager.restartQuiescenceReason ?? "mcp-restart-quiescence-unavailable" };
+}
+
+function interactiveDeferralCode(reason: string): string {
+	switch (reason) {
+		case "interactive teardown is active":
+			return "interactive-teardown";
+		case "an explicit user exit is pending":
+			return "user-exit-pending";
+		case "a modal interface is open":
+			return "modal-interface-open";
+		case "session focus is changing":
+			return "session-focus-changing";
+		case "an external editor owns the draft":
+			return "external-editor-active";
+		case "the composer has an unsent draft or attachment":
+			return "composer-draft-pending";
+		case "a submitted prompt is still pending":
+			return "prompt-pending";
+		case "session work is still active":
+			return "session-work-active";
+		case "compaction has queued messages":
+			return "compaction-pending";
+		case "an automatic mode or session transition is active":
+			return "automatic-mode-active";
+		case "an interactive side request is active":
+			return "interactive-request-active";
+		case "a non-main agent still has a live session":
+			return "subagent-session-active";
+		case "an agent lifecycle transition is active":
+			return "agent-transition-active";
+		default:
+			return "interactive-state-unsafe";
+	}
+}
+
+function coordinatorDeferralCode(reason: string): string {
+	return reason.length <= 84 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(reason)
+		? `coordinator-${reason}`
+		: "coordinator-deferred";
 }
 
 /**
@@ -459,7 +539,10 @@ async function abandonAutoBotCoordinatorReservation(
 			firstError ??= error;
 		}
 	}
-	throw new AggregateError([firstError], "AutoBot coordinator reservation could not be abandoned for an explicit user exit");
+	throw new AggregateError(
+		[firstError],
+		"AutoBot coordinator reservation could not be abandoned for an explicit user exit",
+	);
 }
 
 function canonicalExpiry(value: string | undefined): string | undefined {
@@ -560,11 +643,11 @@ export function getAutoBotCoordinatorStartupRegistration(): AutoBotCoordinatorSt
 	};
 }
 
-
-/** Runtime-owned hourly update hooks for one already-running interactive session. */
+/** Managed update hooks for one already-running interactive session. */
 export class AutoBotRuntime {
 	#prepared: PreparedRuntimeRestart | undefined;
 	#fallbackCoordinatorActivationStarted = false;
+	#lastRestartDeferralReason: string | undefined;
 
 	constructor(
 		readonly session: AgentSession,
@@ -582,12 +665,12 @@ export class AutoBotRuntime {
 		return {
 			canPrepareRestart: (target, predecessorTarget) => this.canPrepareRestart(target, predecessorTarget),
 			prepareRestart: (target, predecessorTarget) => this.prepareRestart(target, predecessorTarget),
+			getRestartDeferralReason: () => this.#lastRestartDeferralReason,
 			commitRestart: request => this.commitRestart(request),
 			abortRestart: (request, reason) => this.abortRestart(request, reason),
 			restorePredecessorFallback: fallback => this.restorePredecessorFallback(fallback),
 		};
 	}
-
 
 	/**
 	 * Read-only early admission gate for a shared managed installation. It must
@@ -597,31 +680,50 @@ export class AutoBotRuntime {
 	async canPrepareRestart(
 		target: AutoBotRestartTarget,
 		predecessorTarget: AutoBotRestartTarget,
-	): Promise<boolean> {
+	): Promise<{ readonly canPrepare: true } | { readonly canPrepare: false; readonly reason: string }> {
 		try {
 			if (
 				target.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH ||
 				predecessorTarget.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH
 			) {
-				return false;
+				return { canPrepare: false, reason: "compatibility-epoch-mismatch" };
 			}
-			if (unsafeLaunchOverride(this.launchArgs) !== undefined) return false;
-			if (!this.session.sessionManager.isSessionOnDisk()) return false;
-			if ((await liveResourceReason(this.session, this.mode)) !== undefined) return false;
-			if (this.mode.getAutoBotUpdateDeferralReason() !== undefined) return false;
+			const launchOverride = unsafeLaunchOverride(this.launchArgs);
+			if (launchOverride !== undefined) return { canPrepare: false, reason: launchOverride };
+			const resourceReason = await liveResourceReason(this.session, this.mode);
+			if (resourceReason !== undefined) return { canPrepare: false, reason: resourceReason };
+			const interactiveReason = this.mode.getAutoBotUpdateDeferralReason();
+			if (interactiveReason !== undefined) {
+				return { canPrepare: false, reason: interactiveDeferralCode(interactiveReason) };
+			}
 
 			const service = this.session.autoBotUpdateCoordinator;
-			if (!service || !this.mode.collabController.canPrepareUpdate(target).safe) return false;
-			if (!(await service.canPrepare(target)).canPrepare) return false;
+			if (!service) {
+				return {
+					canPrepare: false,
+					reason: getVerifiedAutoBotCoordinatorPaths()
+						? "coordinator-service-unavailable"
+						: "coordinator-bundle-unavailable",
+				};
+			}
+			const collabSafety = this.mode.collabController.canPrepareUpdate(target);
+			if (!collabSafety.safe) return { canPrepare: false, reason: `collab-${collabSafety.reason}` };
+			const coordinatorSafety = await service.canPrepare(target);
+			if (!coordinatorSafety.canPrepare) {
+				return { canPrepare: false, reason: coordinatorDeferralCode(coordinatorSafety.reason) };
+			}
 
-			return (
-				this.session.sessionManager.isSessionOnDisk() &&
-				(await liveResourceReason(this.session, this.mode)) === undefined &&
-				this.mode.getAutoBotUpdateDeferralReason() === undefined &&
-				this.mode.collabController.canPrepareUpdate(target).safe
-			);
+			const lateResourceReason = await liveResourceReason(this.session, this.mode);
+			if (lateResourceReason !== undefined) return { canPrepare: false, reason: lateResourceReason };
+			const lateInteractiveReason = this.mode.getAutoBotUpdateDeferralReason();
+			if (lateInteractiveReason !== undefined) {
+				return { canPrepare: false, reason: interactiveDeferralCode(lateInteractiveReason) };
+			}
+			const lateCollabSafety = this.mode.collabController.canPrepareUpdate(target);
+			if (!lateCollabSafety.safe) return { canPrepare: false, reason: `collab-${lateCollabSafety.reason}` };
+			return { canPrepare: true };
 		} catch {
-			return false;
+			return { canPrepare: false, reason: "preflight-failed" };
 		}
 	}
 
@@ -629,27 +731,45 @@ export class AutoBotRuntime {
 		target: AutoBotRestartTarget,
 		predecessorTarget: AutoBotRestartTarget,
 	): Promise<PreparedAutoBotRestart | undefined> {
+		this.#lastRestartDeferralReason = undefined;
 		if (
 			target.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH ||
 			predecessorTarget.compatibilityEpoch !== AUTO_BOT_COMPATIBILITY_EPOCH
 		) {
+			this.#lastRestartDeferralReason = "compatibility-epoch-mismatch";
 			return undefined;
 		}
-		if (unsafeLaunchOverride(this.launchArgs) !== undefined) return undefined;
-		if (!this.session.sessionManager.isSessionOnDisk()) return undefined;
-		if ((await liveResourceReason(this.session, this.mode)) !== undefined) return undefined;
+		const launchOverride = unsafeLaunchOverride(this.launchArgs);
+		if (launchOverride !== undefined) {
+			this.#lastRestartDeferralReason = launchOverride;
+			return undefined;
+		}
+		const resourceReason = await liveResourceReason(this.session, this.mode);
+		if (resourceReason !== undefined) {
+			this.#lastRestartDeferralReason = resourceReason;
+			return undefined;
+		}
 		const admission = this.mode.beginAutoBotUpdateAdmission();
-		if (!admission || !this.mode.isAutoBotUpdateAdmissionValid(admission)) return undefined;
+		if (!admission || !this.mode.isAutoBotUpdateAdmissionValid(admission)) {
+			this.#lastRestartDeferralReason = "session-admission-changed";
+			return undefined;
+		}
 
 		const service = this.session.autoBotUpdateCoordinator;
 		let coordinator: AutoBotCoordinatorPreparation | undefined;
 		let cancellationAttempted = false;
+		let mcpQuiescence: { release(): void } | undefined;
 		if (!service) {
 			this.mode.cancelAutoBotUpdateAdmission(admission);
+			this.#lastRestartDeferralReason = getVerifiedAutoBotCoordinatorPaths()
+				? "coordinator-service-unavailable"
+				: "coordinator-bundle-unavailable";
 			return undefined;
 		}
 		let cancellationFailure: unknown;
-		const cancel = async (): Promise<undefined> => {
+		const cancel = async (reason: string): Promise<undefined> => {
+			mcpQuiescence?.release();
+			mcpQuiescence = undefined;
 			let abandonedForExit = false;
 			if (!cancellationAttempted) {
 				cancellationAttempted = true;
@@ -686,21 +806,36 @@ export class AutoBotRuntime {
 			} else {
 				this.mode.cancelAutoBotUpdateAdmission(admission);
 			}
+			this.#lastRestartDeferralReason = reason;
 			return undefined;
 		};
 
 		try {
+			const quiescence = acquireMcpRestartQuiescence(this.mode);
+			const mcpGuard = quiescence.guard;
+			if (!mcpGuard) return await cancel(quiescence.reason ?? "mcp-restart-quiescence-unavailable");
+			mcpQuiescence = mcpGuard;
+			const sessionId = this.session.sessionManager.getSessionId();
+			await this.session.sessionManager.ensureOnDisk();
 			await this.session.sessionManager.flush();
 			if (
-				!this.mode.isAutoBotUpdateAdmissionValid(admission) ||
-				(await liveResourceReason(this.session, this.mode)) !== undefined
+				!this.session.sessionManager.isSessionOnDisk() ||
+				this.session.sessionManager.getSessionId() !== sessionId
 			) {
-				return await cancel();
+				return await cancel(
+					this.session.sessionManager.isSessionOnDisk()
+						? "session-identity-changed"
+						: "session-persistence-failed",
+				);
 			}
+			const lateResourceReason = await liveResourceReason(this.session, this.mode, true);
+			if (!this.mode.isAutoBotUpdateAdmissionValid(admission)) return await cancel("session-admission-changed");
+			if (lateResourceReason !== undefined) return await cancel(lateResourceReason);
 			const collabSafety = this.mode.collabController.canPrepareUpdate(target);
-			if (!collabSafety.safe) return await cancel();
+			if (!collabSafety.safe) return await cancel(`collab-${collabSafety.reason}`);
 			const coordinatorSafety = await service.canPrepare(target);
-			if (!coordinatorSafety.canPrepare || !this.mode.isAutoBotUpdateAdmissionValid(admission)) return await cancel();
+			if (!coordinatorSafety.canPrepare) return await cancel(coordinatorDeferralCode(coordinatorSafety.reason));
+			if (!this.mode.isAutoBotUpdateAdmissionValid(admission)) return await cancel("session-admission-changed");
 			coordinator = await service.prepare({
 				successorInstanceId: randomUUID(),
 				target,
@@ -719,21 +854,18 @@ export class AutoBotRuntime {
 				!Number.isSafeInteger(coordinator.leaseDurationMs) ||
 				coordinator.leaseDurationMs <= 0
 			) {
-				return await cancel();
+				return await cancel("coordinator-preparation-invalid");
 			}
-			if (
-				!this.mode.isAutoBotUpdateAdmissionValid(admission) ||
-				(await liveResourceReason(this.session, this.mode)) !== undefined
-			) {
-				return await cancel();
-			}
+			const finalResourceReason = await liveResourceReason(this.session, this.mode, true);
+			if (!this.mode.isAutoBotUpdateAdmissionValid(admission)) return await cancel("session-admission-changed");
+			if (finalResourceReason !== undefined) return await cancel(finalResourceReason);
 			const context = createAutoBotRestartLaunchContext(
 				this.launchArgs,
 				coordinator,
 				this.mode.collabController.captureAutoBotFallbackState(),
 			);
-			if (!context) return await cancel();
-			this.#prepared = { admission, coordinator, target, predecessorTarget };
+			if (!context) return await cancel("restart-context-invalid");
+			this.#prepared = { admission, coordinator, mcpQuiescence: mcpGuard, target, predecessorTarget };
 			return {
 				sessionFile: this.session.sessionManager.getSessionFile()!,
 				sessionId: this.session.sessionManager.getSessionId(),
@@ -746,11 +878,10 @@ export class AutoBotRuntime {
 			};
 		} catch (error) {
 			try {
-				await cancel();
+				await cancel("restart-preparation-failed");
 			} catch (rollbackError) {
 				logger.error("AutoBot update preparation rollback could not cancel a coordinator reservation", {
-					error: String(error),
-					rollbackError: String(rollbackError),
+					reason: "coordinator-rollback-failed",
 				});
 				if (rollbackError === error) throw rollbackError;
 				throw new AggregateError(
@@ -758,7 +889,8 @@ export class AutoBotRuntime {
 					"AutoBot update preparation failed and its coordinator reservation could not be cancelled",
 				);
 			}
-			logger.warn("AutoBot update preparation deferred", { error: String(error) });
+			logger.warn("AutoBot update preparation deferred", { reason: "restart-preparation-failed" });
+			this.#lastRestartDeferralReason = "restart-preparation-failed";
 			return undefined;
 		}
 	}
@@ -767,6 +899,7 @@ export class AutoBotRuntime {
 		const prepared = this.#prepared;
 		this.#prepared = undefined;
 		if (!prepared) return;
+		prepared.mcpQuiescence.release();
 		let abandonedForExit = false;
 		try {
 			if (this.mode.isAutoBotUpdateExitRequested(prepared.admission)) {
@@ -900,9 +1033,10 @@ export class AutoBotRuntime {
 			!prepared ||
 			!sameTarget(prepared.target, request.target) ||
 			!sameTarget(prepared.predecessorTarget, request.predecessorTarget) ||
-			(prepared.coordinator !== undefined && request.fallbackInstanceId !== prepared.coordinator.fallbackInstanceId) ||
+			(prepared.coordinator !== undefined &&
+				request.fallbackInstanceId !== prepared.coordinator.fallbackInstanceId) ||
 			!this.mode.isAutoBotUpdateAdmissionValid(prepared.admission) ||
-			(await liveResourceReason(this.session, this.mode)) !== undefined
+			(await liveResourceReason(this.session, this.mode, true)) !== undefined
 		) {
 			await this.abortRestart(request, "restart admission is no longer valid");
 			if (userExitRequested) return;
@@ -935,7 +1069,7 @@ export class AutoBotRuntime {
 			if (prepared.coordinator) await coordinator!.commit(prepared.coordinator);
 			if (
 				!this.mode.isAutoBotUpdateAdmissionValid(prepared.admission) ||
-				(await liveResourceReason(this.session, this.mode)) !== undefined
+				(await liveResourceReason(this.session, this.mode, true)) !== undefined
 			) {
 				throw new Error("AutoBot restart admission changed during coordinator retirement");
 			}
@@ -947,7 +1081,7 @@ export class AutoBotRuntime {
 			if (
 				collab.kind !== "prepared" ||
 				!this.mode.isAutoBotUpdateAdmissionValid(prepared.admission) ||
-				(await liveResourceReason(this.session, this.mode)) !== undefined
+				(await liveResourceReason(this.session, this.mode, true)) !== undefined
 			) {
 				throw new Error("AutoBot final collaboration admission was deferred");
 			}
@@ -986,7 +1120,11 @@ export class AutoBotRuntime {
 				AUTO_BOT_SESSION_DISPOSE_TIMEOUT_MS,
 				"Timed out disposing predecessor for AutoBot update",
 			);
-			await withTimeout(postmortem.cleanup(), POSTMORTEM_CLEANUP_TIMEOUT_MS, "Timed out running AutoBot postmortem cleanup");
+			await withTimeout(
+				postmortem.cleanup(),
+				POSTMORTEM_CLEANUP_TIMEOUT_MS,
+				"Timed out running AutoBot postmortem cleanup",
+			);
 			await withTimeout(postmortem.drainStdout(), STDOUT_DRAIN_TIMEOUT_MS, "Timed out draining AutoBot stdout");
 			if (this.mode.isAutoBotUpdateExitRequested(prepared.admission)) {
 				await abandonCoordinatorForExplicitExit();
@@ -1005,6 +1143,7 @@ export class AutoBotRuntime {
 				this.mode.collabController.cancelPreparedUpdate(collab.reservation);
 			}
 			if (!irreversibleHandoffStarted && !predecessorStopped) {
+				prepared.mcpQuiescence.release();
 				let rollbackError: unknown;
 				let userExitRequested = this.mode.isAutoBotUpdateExitRequested(prepared.admission);
 				try {
@@ -1034,8 +1173,7 @@ export class AutoBotRuntime {
 				this.mode.cancelAutoBotUpdateAdmission(prepared.admission);
 				if (rollbackError !== undefined) {
 					logger.error("AutoBot restart rollback could not reopen the predecessor coordinator reservation", {
-						error: String(error),
-						rollbackError: String(rollbackError),
+						reason: "coordinator-rollback-failed",
 					});
 					throw new AggregateError(
 						[error, rollbackError],

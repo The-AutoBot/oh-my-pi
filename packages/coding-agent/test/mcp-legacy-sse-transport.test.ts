@@ -98,6 +98,10 @@ describe("legacy MCP HTTP+SSE transport", () => {
 
 			expect(postTargets).toContain("/mcp/messages/?session_id=legacy-session");
 			expect(tools).toEqual([{ name: "crawl", inputSchema: { type: "object" } }]);
+			const guard = connection.transport.acquireRestartQuiescence?.();
+			expect(guard).toBeDefined();
+			await expect(connection.transport.request("tools/list")).rejects.toThrow("quiesced for runtime restart");
+			guard!.release();
 		} finally {
 			await connection.transport.close();
 		}

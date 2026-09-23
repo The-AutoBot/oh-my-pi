@@ -43,10 +43,7 @@ const AUTO_BOT_COLLAB_WEB_ROOT_FILE = /^(?!managed-bundle\.json$)[A-Za-z0-9][A-Z
  */
 export function isAutoBotCollabWebFilePath(value: string): boolean {
 	const segments = value.split("/");
-	if (
-		value.length > AUTO_BOT_MAX_COLLAB_WEB_PATH_BYTES ||
-		segments.length > AUTO_BOT_MAX_COLLAB_WEB_PATH_SEGMENTS
-	) {
+	if (value.length > AUTO_BOT_MAX_COLLAB_WEB_PATH_BYTES || segments.length > AUTO_BOT_MAX_COLLAB_WEB_PATH_SEGMENTS) {
 		return false;
 	}
 	if (segments.length === 1) return AUTO_BOT_COLLAB_WEB_ROOT_FILE.test(value);
@@ -201,16 +198,22 @@ export interface AutoBotHandoffClaim {
  * After activation is sent, an absent acknowledgement is indeterminate and
  * MUST NOT trigger a fallback or abort.
  */
+export type AutoBotRestartAdmission =
+	| { readonly canPrepare: true }
+	| { readonly canPrepare: false; readonly reason: string };
+
 export interface AutoBotUpdateHooks {
 	/** Nonmutating early admission; `prepareRestart` MUST repeat every safety check late. */
 	canPrepareRestart(
 		target: AutoBotRestartTarget,
 		predecessorTarget: AutoBotRestartTarget,
-	): Promise<boolean>;
+	): Promise<AutoBotRestartAdmission>;
 	prepareRestart(
 		target: AutoBotRestartTarget,
 		predecessorTarget: AutoBotRestartTarget,
 	): Promise<PreparedAutoBotRestart | undefined>;
+	/** Latest stable reason from a `prepareRestart` deferral in this session. */
+	getRestartDeferralReason?(): string | undefined;
 	commitRestart(request: AutoBotRestartRequest): Promise<void>;
 	abortRestart?(request: AutoBotRestartRequest, reason: AutoBotRestartAbortReason): Promise<void>;
 	/** Must restore exact broker/browser predecessor ownership before fallback accepts work. */
@@ -224,7 +227,6 @@ export type AutoBotRestartAbortReason =
 	| "handoff-invalid"
 	| "handoff-write-failed"
 	| "handoff-contended";
-
 
 /** Protected old-build restoration after the new candidate fails before activation. */
 export interface AutoBotPredecessorFallback {
@@ -292,7 +294,8 @@ const CANONICAL_ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\
 const MAX_RELEASE_PAYLOAD_BYTES = 1_000_000;
 
 function record(value: unknown, name: string): Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${name} must be an object`);
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new Error(`${name} must be an object`);
 	return value as Record<string, unknown>;
 }
 
@@ -380,7 +383,11 @@ export function parseAutoBotReleaseManifest(value: unknown): AutoBotReleaseManif
 	if (manifest.collabProtocolVersion !== AUTO_BOT_COLLAB_PROTOCOL_VERSION) {
 		throw new Error(`Unsupported collaboration protocol version: ${String(manifest.collabProtocolVersion)}`);
 	}
-	const publishedAt = requiredString(manifest.publishedAt, "release manifest.publishedAt", CANONICAL_ISO_TIMESTAMP_PATTERN);
+	const publishedAt = requiredString(
+		manifest.publishedAt,
+		"release manifest.publishedAt",
+		CANONICAL_ISO_TIMESTAMP_PATTERN,
+	);
 	if (new Date(publishedAt).toISOString() !== publishedAt) {
 		throw new Error("release manifest.publishedAt must be a canonical ISO-8601 UTC timestamp");
 	}
@@ -391,15 +398,26 @@ export function parseAutoBotReleaseManifest(value: unknown): AutoBotReleaseManif
 	const identities = new Set<string>();
 	for (const asset of assets) {
 		const identity = `${asset.kind}\u0000${asset.target}`;
-		if (identities.has(identity)) throw new Error(`release manifest contains duplicate asset ${asset.kind}/${asset.target}`);
+		if (identities.has(identity))
+			throw new Error(`release manifest contains duplicate asset ${asset.kind}/${asset.target}`);
 		identities.add(identity);
 	}
 	return {
 		schemaVersion: AUTO_BOT_RELEASE_SCHEMA_VERSION,
 		releaseSequence: positiveSafeInteger(manifest.releaseSequence, "release manifest.releaseSequence"),
-		upstreamVersion: boundedString(manifest.upstreamVersion, "release manifest.upstreamVersion", 128, UPSTREAM_VERSION_PATTERN),
+		upstreamVersion: boundedString(
+			manifest.upstreamVersion,
+			"release manifest.upstreamVersion",
+			128,
+			UPSTREAM_VERSION_PATTERN,
+		),
 		forkCommit: boundedString(manifest.forkCommit, "release manifest.forkCommit", 64, FULL_COMMIT_PATTERN),
-		upstreamCommit: boundedString(manifest.upstreamCommit, "release manifest.upstreamCommit", 64, FULL_COMMIT_PATTERN),
+		upstreamCommit: boundedString(
+			manifest.upstreamCommit,
+			"release manifest.upstreamCommit",
+			64,
+			FULL_COMMIT_PATTERN,
+		),
 		publishedAt,
 		minimumBootstrapVersion: AUTO_BOT_MINIMUM_BOOTSTRAP_VERSION,
 		sessionFormatVersion: AUTO_BOT_SESSION_FORMAT_VERSION,
@@ -466,7 +484,8 @@ export function parseSignedAutoBotReleaseEnvelope(value: unknown): SignedAutoBot
 	} catch {
 		throw new Error("signed release envelope.signature must be base64");
 	}
-	if (signatureBytes.byteLength !== 64) throw new Error("signed release envelope.signature must be an Ed25519 signature");
+	if (signatureBytes.byteLength !== 64)
+		throw new Error("signed release envelope.signature must be an Ed25519 signature");
 	return {
 		payload,
 		signature,
@@ -522,10 +541,7 @@ export function assertJsonValue(value: unknown): asserts value is JsonValue {
 	visit(value, 0);
 }
 
-function parseAutoBotLaunchReleaseFields(
-	release: Record<string, unknown>,
-	name: string,
-): AutoBotLaunchRelease {
+function parseAutoBotLaunchReleaseFields(release: Record<string, unknown>, name: string): AutoBotLaunchRelease {
 	if (release.sessionFormatVersion !== AUTO_BOT_SESSION_FORMAT_VERSION) {
 		throw new Error(`${name} has an unsupported session format version`);
 	}
@@ -702,10 +718,13 @@ export function parseAutoBotHandoffRecord(value: unknown): AutoBotHandoffRecord 
 		"previousRuntimePath",
 		"createdAt",
 	]);
-	if (handoff.protocolVersion !== AUTO_BOT_HANDOFF_PROTOCOL_VERSION) throw new Error("restart handoff has an unsupported protocol");
-	if (handoff.role !== "candidate" && handoff.role !== "fallback") throw new Error("restart handoff has an invalid role");
+	if (handoff.protocolVersion !== AUTO_BOT_HANDOFF_PROTOCOL_VERSION)
+		throw new Error("restart handoff has an unsupported protocol");
+	if (handoff.role !== "candidate" && handoff.role !== "fallback")
+		throw new Error("restart handoff has an invalid role");
 	const request = parseRestartRequestFields(handoff, "restart handoff");
-	const attemptedTarget = handoff.attemptedTarget === undefined ? undefined : parseAutoBotRestartTarget(handoff.attemptedTarget);
+	const attemptedTarget =
+		handoff.attemptedTarget === undefined ? undefined : parseAutoBotRestartTarget(handoff.attemptedTarget);
 	if (handoff.role === "candidate" && attemptedTarget !== undefined) {
 		throw new Error("Candidate handoff must not include an attempted target");
 	}
@@ -721,7 +740,8 @@ export function parseAutoBotHandoffRecord(value: unknown): AutoBotHandoffRecord 
 		}
 	}
 	const createdAt = requiredString(handoff.createdAt, "restart handoff.createdAt", CANONICAL_ISO_TIMESTAMP_PATTERN);
-	if (new Date(createdAt).toISOString() !== createdAt) throw new Error("restart handoff.createdAt must be canonical UTC");
+	if (new Date(createdAt).toISOString() !== createdAt)
+		throw new Error("restart handoff.createdAt must be canonical UTC");
 	return {
 		...request,
 		owner: parseAutoBotHandoffOwner(handoff.owner),

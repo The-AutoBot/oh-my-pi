@@ -98,8 +98,22 @@ describe("update command plugin dispatch", () => {
 		const command = new Update(["--check", "--force"], TEST_CONFIG);
 		await command.run();
 
-		expect(updateSpy).toHaveBeenCalledWith({ force: true, check: true, channel: undefined });
+		expect(updateSpy).toHaveBeenCalledWith({ force: true, check: true, status: false, channel: undefined });
 		expect(pluginSpy).not.toHaveBeenCalled();
+	});
+
+	it("routes --status as a read-only app update operation", async () => {
+		const updateSpy = spyOn(updateCli, "runUpdateCommand").mockResolvedValue(undefined);
+
+		const command = new Update(["--status"], TEST_CONFIG);
+		await command.run();
+
+		expect(updateSpy).toHaveBeenCalledWith({ force: false, check: false, status: true, channel: undefined });
+	});
+
+	it("rejects combining --status with mutating or network-check options", async () => {
+		const command = new Update(["--status", "--check"], TEST_CONFIG);
+		await expect(command.run()).rejects.toThrow("--status cannot be combined");
 	});
 });
 
@@ -108,6 +122,7 @@ describe("parseUpdateArgs", () => {
 		expect(parseUpdateArgs(["update", "-l"])).toEqual({
 			force: false,
 			check: false,
+			status: false,
 			plugins: true,
 			channel: undefined,
 		});
@@ -117,11 +132,18 @@ describe("parseUpdateArgs", () => {
 		expect(parseUpdateArgs(["update", "--canary"])?.channel).toBe("canary");
 		expect(parseUpdateArgs(["update", "--stable"])?.channel).toBe("stable");
 		expect(parseUpdateArgs(["update"])?.channel).toBeUndefined();
+		expect(parseUpdateArgs(["update", "--status"])?.status).toBe(true);
 	});
 
 	it("rejects conflicting update channels", () => {
 		expect(() => parseUpdateArgs(["update", "--canary", "--stable"])).toThrow(
 			"--canary and --stable are mutually exclusive",
+		);
+	});
+
+	it("rejects combining status with other update modes", () => {
+		expect(() => parseUpdateArgs(["update", "--status", "--check"])).toThrow(
+			"--status cannot be combined with other update options",
 		);
 	});
 });

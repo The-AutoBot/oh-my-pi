@@ -17,8 +17,12 @@ import {
 	type AutoBotReleaseManifest,
 	type AutoBotRestartTarget,
 } from "@oh-my-pi/pi-coding-agent/autobot-update/contract";
-import { fetchVerifiedAutoBotRelease } from "@oh-my-pi/pi-coding-agent/autobot-update/channel";
-import { assertAutoBotDenyOnlyDarwinAclListing } from "@oh-my-pi/pi-coding-agent/autobot-update/permissions";
+import { AutoBotTransportError, fetchVerifiedAutoBotRelease } from "@oh-my-pi/pi-coding-agent/autobot-update/channel";
+import {
+	assertAutoBotDenyOnlyDarwinAclListing,
+	assertAutoBotPrivateDirectoryAndOptionalFiles,
+	ensureAutoBotPrivateDirectory,
+} from "@oh-my-pi/pi-coding-agent/autobot-update/permissions";
 import { __projectAutoBotHandoffProfileEnvironmentForTests } from "@oh-my-pi/pi-coding-agent/autobot-update/bootstrap";
 import {
 	hasAutoBotMinimumRemainingHandoffTime,
@@ -106,11 +110,7 @@ function restartTargetForManifest(manifest: AutoBotReleaseManifest): AutoBotRest
 	};
 }
 
-function activePointer(
-	paths: AutoBotPaths,
-	releaseSequence: number,
-	slotId: string,
-): AutoBotActivePointer {
+function activePointer(paths: AutoBotPaths, releaseSequence: number, slotId: string): AutoBotActivePointer {
 	return {
 		schemaVersion: 1,
 		slotId,
@@ -125,6 +125,12 @@ async function createTemporaryDirectory(): Promise<string> {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-autobot-replay-security-"));
 	temporaryDirectories.push(directory);
 	return directory;
+}
+
+async function createPrivateTemporaryDirectory(): Promise<string> {
+	const directory = await fs.mkdtemp(path.join(os.homedir(), ".omp-autobot-permissions-"));
+	temporaryDirectories.push(directory);
+	return ensureAutoBotPrivateDirectory(directory);
 }
 
 async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
@@ -186,34 +192,40 @@ function handoffInput(
 }
 
 afterEach(async () => {
-	await Promise.all(temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	await Promise.all(
+		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 });
 
 describe("AutoBot release replay fence", () => {
-	test("allows an exact repeat but rejects rollback and equivocation before staging", async () => {
-		const paths = autoBotPaths(await createTemporaryDirectory());
-		const accepted = releaseManifest(7);
-		const acceptedPayloadSha256 = "d".repeat(64);
-		await advanceAutoBotSequenceHighWater(paths, accepted, acceptedPayloadSha256);
+	test(
+		"allows an exact repeat but rejects rollback and equivocation before staging",
+		async () => {
+			const paths = autoBotPaths(await createTemporaryDirectory());
+			const accepted = releaseManifest(7);
+			const acceptedPayloadSha256 = "d".repeat(64);
+			await advanceAutoBotSequenceHighWater(paths, accepted, acceptedPayloadSha256);
 
-		await assertAutoBotSequenceAllowed(paths, accepted, acceptedPayloadSha256);
-		const rollbackError = await rejectionOf(
-			assertAutoBotSequenceAllowed(paths, releaseManifest(6), "e".repeat(64)),
-		);
-		expect(rollbackError.message).toContain("lower than the accepted high-water mark");
-		const equivocationError = await rejectionOf(
-			assertAutoBotSequenceAllowed(paths, releaseManifest(7), "e".repeat(64)),
-		);
-		expect(equivocationError.message).toContain("conflicts with the accepted signed payload");
+			await assertAutoBotSequenceAllowed(paths, accepted, acceptedPayloadSha256);
+			const rollbackError = await rejectionOf(
+				assertAutoBotSequenceAllowed(paths, releaseManifest(6), "e".repeat(64)),
+			);
+			expect(rollbackError.message).toContain("lower than the accepted high-water mark");
+			const equivocationError = await rejectionOf(
+				assertAutoBotSequenceAllowed(paths, releaseManifest(7), "e".repeat(64)),
+			);
+			expect(equivocationError.message).toContain("conflicts with the accepted signed payload");
 
-		const highWater = await readAutoBotSequenceHighWater(paths);
-		expect(highWater).toMatchObject({
-			releaseSequence: accepted.releaseSequence,
-			payloadSha256: acceptedPayloadSha256,
-		});
-		const runtimeDirectoryError = await rejectionOf(fs.lstat(paths.runtimeDir));
-		expect((runtimeDirectoryError as NodeJS.ErrnoException).code).toBe("ENOENT");
-	}, windowsFilesystemSecurityTestTimeoutMs);
+			const highWater = await readAutoBotSequenceHighWater(paths);
+			expect(highWater).toMatchObject({
+				releaseSequence: accepted.releaseSequence,
+				payloadSha256: acceptedPayloadSha256,
+			});
+			const runtimeDirectoryError = await rejectionOf(fs.lstat(paths.runtimeDir));
+			expect((runtimeDirectoryError as NodeJS.ErrnoException).code).toBe("ENOENT");
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot signed channel redirects", () => {
@@ -302,9 +314,11 @@ describe("AutoBot signed channel redirects", () => {
 				}) as typeof fetch,
 			}),
 		);
+		expect(getReaderError).toBeInstanceOf(AutoBotTransportError);
 		expectChannelErrorToRedact(getReaderError, sensitiveUrl);
 
 		let incompleteBodyCancelled = false;
+		let readCount = 0;
 		const readError = await rejectionOf(
 			fetchVerifiedAutoBotRelease(channel, {
 				fetchImpl: (async (_input, _init) => {
@@ -315,6 +329,9 @@ describe("AutoBot signed channel redirects", () => {
 						body: {
 							getReader: () => ({
 								read: async () => {
+									if (readCount++ === 0) {
+										return { done: false, value: new TextEncoder().encode('{"partial":') };
+									}
 									throw new Error(sensitiveUrl);
 								},
 								cancel: async () => {
@@ -327,44 +344,88 @@ describe("AutoBot signed channel redirects", () => {
 				}) as typeof fetch,
 			}),
 		);
+		expect(readError).toBeInstanceOf(AutoBotTransportError);
 		expectChannelErrorToRedact(readError, sensitiveUrl);
 		expect(incompleteBodyCancelled).toBeTrue();
+	});
+
+	test("keeps malformed JSON and signature rejection distinct from transport disconnects", async () => {
+		const generated = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+		if (!isCryptoKeyPair(generated)) throw new Error("Ed25519 key generation did not return a key pair");
+		const channel = {
+			schemaVersion: 1 as const,
+			envelopeUrl: "https://channel.example.invalid/current.json",
+			collabPortalUrl: "https://collab.example.invalid/live",
+			trustedKeys: {
+				current: Buffer.from(await crypto.subtle.exportKey("spki", generated.publicKey)).toString("base64"),
+			},
+			allowedArtifactOrigins: [],
+		};
+		const malformed = await rejectionOf(
+			fetchVerifiedAutoBotRelease(channel, {
+				fetchImpl: (async () => new Response("{", { status: 200 })) as unknown as typeof fetch,
+			}),
+		);
+		expect(malformed).not.toBeInstanceOf(AutoBotTransportError);
+		expect(malformed.message).toContain("not valid UTF-8 JSON");
+
+		const payload = serializeAutoBotReleaseManifest(releaseManifest(8));
+		const invalidSignature = JSON.stringify({
+			keyId: "current",
+			payload,
+			signature: Buffer.alloc(64).toString("base64"),
+		});
+		const rejectedSignature = await rejectionOf(
+			fetchVerifiedAutoBotRelease(channel, {
+				fetchImpl: (async () => new Response(invalidSignature, { status: 200 })) as unknown as typeof fetch,
+			}),
+		);
+		expect(rejectedSignature).not.toBeInstanceOf(AutoBotTransportError);
+		expect(rejectedSignature.message).toContain("signature verification failed");
 	});
 });
 
 describe("AutoBot failed candidate quarantine", () => {
-	test("quarantines only the exact failed R43 release", async () => {
-		const paths = autoBotPaths(await createTemporaryDirectory());
-		const failedR43 = releaseManifest(43);
-		const newerR44 = releaseManifest(44);
+	test(
+		"quarantines only the exact failed R43 release",
+		async () => {
+			const paths = autoBotPaths(await createTemporaryDirectory());
+			const failedR43 = releaseManifest(43);
+			const newerR44 = releaseManifest(44);
 
-		await quarantineAutoBotRelease(paths, restartTargetForManifest(failedR43));
+			await quarantineAutoBotRelease(paths, restartTargetForManifest(failedR43));
 
-		expect(await isAutoBotReleaseQuarantined(paths, failedR43)).toBeTrue();
-		expect(await isAutoBotReleaseQuarantined(paths, newerR44)).toBeFalse();
-	}, windowsFilesystemSecurityTestTimeoutMs);
+			expect(await isAutoBotReleaseQuarantined(paths, failedR43)).toBeTrue();
+			expect(await isAutoBotReleaseQuarantined(paths, newerR44)).toBeFalse();
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot installation-wide active pointer", () => {
-	test("keeps an R42 session's predecessor independent from a newer global pointer", async () => {
-		const paths = autoBotPaths(await createTemporaryDirectory());
-		const r42Fallback = activePointer(paths, 42, "r42-fallback");
-		const r43 = activePointer(paths, 43, "r43");
-		const competingR43 = activePointer(paths, 43, "r43-competing");
+	test(
+		"keeps an R42 session's predecessor independent from a newer global pointer",
+		async () => {
+			const paths = autoBotPaths(await createTemporaryDirectory());
+			const r42Fallback = activePointer(paths, 42, "r42-fallback");
+			const r43 = activePointer(paths, 43, "r43");
+			const competingR43 = activePointer(paths, 43, "r43-competing");
 
-		expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r42Fallback);
-		expect(await advanceAutoBotActivePointer(paths, r43)).toEqual(r43);
+			expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r42Fallback);
+			expect(await advanceAutoBotActivePointer(paths, r43)).toEqual(r43);
 
-		const plan = planAutoBotLaunchUpdate(launchRelease(42), releaseManifest(44));
-		expect(plan).toMatchObject({
-			target: { releaseSequence: 44, handoffBudgetMs: 390_000 },
-			predecessorTarget: { releaseSequence: 42, handoffBudgetMs: 390_000 },
-		});
+			const plan = planAutoBotLaunchUpdate(launchRelease(42), releaseManifest(44));
+			expect(plan).toMatchObject({
+				target: { releaseSequence: 44, handoffBudgetMs: 390_000 },
+				predecessorTarget: { releaseSequence: 42, handoffBudgetMs: 390_000 },
+			});
 
-		expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r43);
-		expect(await advanceAutoBotActivePointer(paths, competingR43)).toEqual(r43);
-		expect(await readAutoBotActivePointer(paths)).toEqual(r43);
-	}, windowsFilesystemSecurityTestTimeoutMs);
+			expect(await advanceAutoBotActivePointer(paths, r42Fallback)).toEqual(r43);
+			expect(await advanceAutoBotActivePointer(paths, competingR43)).toEqual(r43);
+			expect(await readAutoBotActivePointer(paths)).toEqual(r43);
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot restart handoff contracts", () => {
@@ -403,9 +464,7 @@ describe("AutoBot restart handoff contracts", () => {
 		const predecessorTarget = restartTarget(42);
 		const request = restartRequestInput(candidateTarget, predecessorTarget);
 
-		expect(() =>
-			parseAutoBotHandoffRecord(handoffInput(request, { attemptedTarget: candidateTarget })),
-		).toThrow();
+		expect(() => parseAutoBotHandoffRecord(handoffInput(request, { attemptedTarget: candidateTarget }))).toThrow();
 		expect(() =>
 			parseAutoBotHandoffRecord(
 				handoffInput(request, {
@@ -572,7 +631,10 @@ describe("Managed AutoBot session environment", () => {
 		const home = await createTemporaryDirectory();
 		const project = await createTemporaryDirectory();
 		await fs.mkdir(path.join(home, ".env"));
-		await fs.writeFile(path.join(project, ".env"), "OMP_SESSION_BUS_ROLE=coordinator\nOMP_SESSION_BUS_NAME=project-name\n");
+		await fs.writeFile(
+			path.join(project, ".env"),
+			"OMP_SESSION_BUS_ROLE=coordinator\nOMP_SESSION_BUS_NAME=project-name\n",
+		);
 		const launchEnvironment: NodeJS.ProcessEnv = {
 			OMP_SESSION_BUS_ENDPOINT: "wss://inherited.example.test/bus",
 			OMP_SESSION_BUS_ROLE: "participant",
@@ -591,6 +653,71 @@ describe("Managed AutoBot session environment", () => {
 
 		expect(environment).toEqual(launchEnvironment);
 	});
+});
+
+describe("AutoBot managed directory cohorts", () => {
+	test(
+		"accepts absent optional files and rejects paths outside the managed directory",
+		async () => {
+			const directory = await createPrivateTemporaryDirectory();
+			const present = path.join(directory, "state.db");
+			await fs.writeFile(present, "state");
+			await fs.chmod(present, 0o600);
+
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [present, path.join(directory, "state.db-wal")]),
+			).resolves.toBe(await fs.realpath(directory));
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [path.join(directory, "nested", "state.db")]),
+			).rejects.toThrow("immediate children");
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [path.join(path.dirname(directory), "state.db")]),
+			).rejects.toThrow("immediate children");
+			await expect(
+				assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [path.dirname(directory)]),
+			).rejects.toThrow("immediate children");
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
+
+	test(
+		"rejects a present optional reparse point instead of following it",
+		async () => {
+			const directory = await createPrivateTemporaryDirectory();
+			const target = await createPrivateTemporaryDirectory();
+			const linkedFile = path.join(directory, "state.db");
+			await fs.symlink(target, linkedFile, process.platform === "win32" ? "junction" : "dir");
+
+			await expect(assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [linkedFile])).rejects.toThrow(
+				"real regular file",
+			);
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
+
+	test(
+		"rejects a regular optional file writable by another identity",
+		async () => {
+			const directory = await createPrivateTemporaryDirectory();
+			const unsafe = path.join(directory, "state.db");
+			await fs.writeFile(unsafe, "state");
+			if (process.platform === "win32") {
+				const icacls = path.join(process.env.SystemRoot ?? "", "System32", "icacls.exe");
+				const child = Bun.spawn([icacls, unsafe, "/grant", "*S-1-1-0:W"], {
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+				});
+				const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				if (exitCode !== 0) throw new Error(`Cannot prepare unsafe ACL fixture: ${stderr}`);
+			} else {
+				await fs.chmod(unsafe, 0o666);
+			}
+
+			await expect(assertAutoBotPrivateDirectoryAndOptionalFiles(directory, [unsafe])).rejects.toThrow();
+		},
+		windowsFilesystemSecurityTestTimeoutMs,
+	);
 });
 
 describe("AutoBot macOS ACL listings", () => {

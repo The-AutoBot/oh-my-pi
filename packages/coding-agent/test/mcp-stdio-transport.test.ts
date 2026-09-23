@@ -725,6 +725,21 @@ describe("StdioTransport.notify", () => {
 		await expect(transport.notify("noop")).rejects.toThrow("Transport not connected");
 	});
 
+	it("blocks new work reversibly while connected and idle", async () => {
+		transport = new StdioTransport({
+			type: "stdio",
+			command: "bun",
+			args: ["-e", "process.stdin.resume()"],
+		});
+		await transport.connect();
+
+		const guard = transport.acquireRestartQuiescence();
+		expect(guard).toBeDefined();
+		await expect(transport.notify("noop")).rejects.toThrow("quiesced for runtime restart");
+		guard!.release();
+		await expect(transport.notify("noop")).resolves.toBeUndefined();
+	});
+
 	it("rejects with 'Transport not connected' after close()", async () => {
 		transport = new StdioTransport({
 			type: "stdio",
