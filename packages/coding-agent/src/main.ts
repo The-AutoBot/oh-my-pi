@@ -38,6 +38,7 @@ import {
 	type AutoBotPredecessorFallback,
 	type AutoBotRestartCandidate,
 	type AutoBotRestartRequest,
+	type AutoBotUpdateHandle,
 } from "./autobot-update/contract";
 import { requestAutoBotNormalExit } from "./autobot-update/handoff";
 import {
@@ -2529,11 +2530,13 @@ export async function runRootCommand(
 					await interactiveMode.completeAutoBotProtectedStartupExit();
 					return true;
 				};
+				let autoBotUpdateHandle: AutoBotUpdateHandle | undefined;
 				const activationGate = candidate
 					? async (interactiveMode: InteractiveMode): Promise<void> => {
 							if (await completeProtectedAutoBotExit(interactiveMode, true)) return;
 							const runtime = new AutoBotRuntime(session, parsedArgs, interactiveMode, getActiveProfile());
 							const updateHandle = startAutoBotUpdates(runtime.hooks);
+							autoBotUpdateHandle = updateHandle;
 							const managedCandidate = updateHandle.candidate;
 							if (!managedCandidate || managedCandidate.request.nonce !== candidate.request.nonce) {
 								throw new Error("AutoBot candidate scheduler did not return the authenticated handoff");
@@ -2581,6 +2584,7 @@ export async function runRootCommand(
 								if (await completeProtectedAutoBotExit(interactiveMode, true)) return;
 								const runtime = new AutoBotRuntime(session, parsedArgs, interactiveMode, getActiveProfile());
 								const updateHandle = startAutoBotUpdates(runtime.hooks);
+								autoBotUpdateHandle = updateHandle;
 								if (!updateHandle.startup) {
 									throw new Error("AutoBot predecessor fallback did not expose its protected startup gate");
 								}
@@ -2614,7 +2618,7 @@ export async function runRootCommand(
 					: async (interactiveMode: InteractiveMode): Promise<void> => {
 							const runtime = new AutoBotRuntime(session, parsedArgs, interactiveMode, getActiveProfile());
 							try {
-								startAutoBotUpdates(runtime.hooks);
+								autoBotUpdateHandle = startAutoBotUpdates(runtime.hooks);
 							} catch (error) {
 								if (error instanceof AutoBotManagedRuntimeRequiredError) {
 									logger.warn(error.message);
@@ -2653,6 +2657,7 @@ export async function runRootCommand(
 						afterStartup,
 					);
 				} finally {
+					autoBotUpdateHandle?.dispose();
 					startupLease?.dispose();
 				}
 			} else {

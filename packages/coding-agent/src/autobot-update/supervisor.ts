@@ -1,3 +1,4 @@
+import { logger } from "@oh-my-pi/pi-utils";
 import { randomBytes } from "node:crypto";
 import { isAutoBotCustomBuild } from "./build-metadata";
 import { withAutoBotFileLock } from "./lock";
@@ -7,6 +8,7 @@ import {
 	type AutoBotLaunchRelease,
 	type AutoBotReleaseManifest,
 	type AutoBotRestartCandidate,
+	type AutoBotRestartAdmission,
 	type AutoBotRestartRequest,
 	type AutoBotRestartTarget,
 	type PreparedAutoBotRestart,
@@ -14,7 +16,7 @@ import {
 	type AutoBotUpdateHooks,
 	sameAutoBotRestartTarget,
 } from "./contract";
-import { fetchVerifiedAutoBotRelease, readAutoBotChannelConfig } from "./channel";
+import { writeAutoBotUpdateDiagnostic } from "./diagnostics";
 import {
 	createAutoBotHandoff,
 	discardAutoBotHandoff,
@@ -22,9 +24,15 @@ import {
 	hasAutoBotStartupHandoffPromotion,
 	promoteAutoBotStartupHandoff,
 } from "./handoff";
-import { readAuthenticatedAutoBotEnvironment } from "./identity";
+import { readAuthenticatedAutoBotEnvironment, type AuthenticatedAutoBotEnvironment } from "./identity";
+import {
+	AutoBotInstallationChannelUnavailableError,
+	refreshAutoBotInstallation,
+	AutoBotInstallationQuarantinedError,
+	type AutoBotInstallationRefreshResult,
+} from "./installation";
 import { autoBotPaths, type AutoBotPaths } from "./paths";
-import { stageVerifiedAutoBotRelease, type StagedAutoBotRelease } from "./stage";
+import type { StagedAutoBotRelease } from "./stage";
 import {
 	advanceAutoBotSequenceHighWater,
 	assertAutoBotSequenceAllowed,
@@ -187,12 +195,38 @@ function assertMinimumRemainingHandoffTime(request: AutoBotRestartRequest, prepa
 	}
 }
 
+function stableDiagnosticReason(reason: string | undefined, fallback: string): string {
+	return reason !== undefined && reason.length <= 96 && /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(reason)
+		? reason
+		: fallback;
+}
 function stagedMatchesUpdate(
 	staged: StagedAutoBotRelease,
 	target: AutoBotRestartTarget,
 	payloadSha256: string,
 ): boolean {
 	return staged.payloadSha256 === payloadSha256 && sameAutoBotRestartTarget(restartTarget(staged.manifest), target);
+}
+
+async function recordUpdateState(
+	paths: AutoBotPaths,
+	environment: AuthenticatedAutoBotEnvironment,
+	phase: string,
+	outcome: "started" | "available" | "unchanged" | "deferred" | "completed" | "failed",
+	reason: string | undefined,
+	releaseSequence: number,
+): Promise<void> {
+	try {
+		await writeAutoBotUpdateDiagnostic(paths, {
+			phase,
+			outcome,
+			...(reason === undefined ? {} : { reason }),
+			releaseSequence,
+			launchId: environment.launchId,
+		});
+	} catch {
+		logger.error("AutoBot update diagnostic could not be persisted", { phase, outcome });
+	}
 }
 
 async function abortPreparedRestart(
@@ -203,7 +237,7 @@ async function abortPreparedRestart(
 	try {
 		await hooks.abortRestart?.(request, reason);
 	} catch {
-		// The update is already deferred; never let cleanup failure force a restart.
+		logger.error("AutoBot update preparation cleanup failed", { reason });
 	}
 }
 
@@ -220,55 +254,94 @@ async function runUpdateCycle(
 ): Promise<boolean> {
 	const environment = readAuthenticatedAutoBotEnvironment();
 	if (!environment || environment.role !== permittedRole || environment.paths.root !== paths.root) return false;
-	const channel = await readAutoBotChannelConfig(paths.channelConfigPath);
-	if (!channel) throw new Error("AutoBot managed channel configuration is missing");
-	const release = await fetchVerifiedAutoBotRelease(channel);
-	const update = planAutoBotLaunchUpdate(environment.launchRelease, release.manifest);
-	if (!update) return false;
-	const { target, predecessorTarget } = update;
-	let canPrepare = false;
+	await recordUpdateState(
+		paths,
+		environment,
+		"installation-refresh",
+		"started",
+		undefined,
+		environment.launchRelease.releaseSequence,
+	);
+	let refreshed: AutoBotInstallationRefreshResult;
 	try {
-		canPrepare = await hooks.canPrepareRestart(target, predecessorTarget);
-	} catch {
+		refreshed = await refreshAutoBotInstallation(paths);
+	} catch (error) {
+		await recordUpdateState(
+			paths,
+			environment,
+			"installation-refresh",
+			"failed",
+			error instanceof AutoBotInstallationChannelUnavailableError
+				? "channel-unavailable"
+				: error instanceof AutoBotInstallationQuarantinedError
+					? "release-quarantined"
+					: "installation-refresh-failed",
+			environment.launchRelease.releaseSequence,
+		);
+		throw error;
+	}
+	const { release, staged } = refreshed;
+	const update = planAutoBotLaunchUpdate(environment.launchRelease, release.manifest);
+	if (!update) {
+		await recordUpdateState(
+			paths,
+			environment,
+			"installation-refresh",
+			"unchanged",
+			undefined,
+			release.manifest.releaseSequence,
+		);
 		return false;
 	}
-	if (!canPrepare) return false;
+	await recordUpdateState(
+		paths,
+		environment,
+		"session-admission",
+		"available",
+		undefined,
+		release.manifest.releaseSequence,
+	);
+	const { target, predecessorTarget } = update;
+	let admission: AutoBotRestartAdmission;
+	try {
+		admission = await hooks.canPrepareRestart(target, predecessorTarget);
+	} catch {
+		await recordUpdateState(
+			paths,
+			environment,
+			"session-admission",
+			"deferred",
+			"preflight-failed",
+			release.manifest.releaseSequence,
+		);
+		return false;
+	}
+	if (!admission.canPrepare) {
+		await recordUpdateState(
+			paths,
+			environment,
+			"session-admission",
+			"deferred",
+			stableDiagnosticReason(admission.reason, "preflight-deferred"),
+			release.manifest.releaseSequence,
+		);
+		return false;
+	}
 
-	// Stage verified immutable bytes first. This may be slow on protected
-	// Windows installs, so it intentionally precedes any broker reservation.
-	const staged = await withAutoBotFileLock(paths.updateLockPath, async () => {
-		const current = readAuthenticatedAutoBotEnvironment();
-		if (
-			!current ||
-			current.role !== permittedRole ||
-			current.paths.root !== paths.root ||
-			current.launchId !== environment.launchId ||
-			current.bootstrapProcessId !== environment.bootstrapProcessId ||
-			current.runtimePath !== environment.runtimePath
-		) {
-			return undefined;
-		}
-		try {
-			await assertAutoBotSequenceAllowed(paths, release.manifest, release.payloadSha256);
-		} catch {
-			return undefined;
-		}
-		if (await isAutoBotReleaseQuarantined(paths, release.manifest)) return undefined;
-		const currentUpdate = planAutoBotLaunchUpdate(current.launchRelease, release.manifest);
-		if (
-			!currentUpdate ||
-			!sameAutoBotRestartTarget(currentUpdate.target, target) ||
-			!sameAutoBotRestartTarget(currentUpdate.predecessorTarget, predecessorTarget)
-		) {
-			return undefined;
-		}
-		return stageVerifiedAutoBotRelease(paths, release);
-	});
-	if (!staged) return false;
 
 	const preparedAt = performance.now();
 	const prepared = await hooks.prepareRestart(target, predecessorTarget);
-	if (!prepared) return false;
+	if (!prepared) {
+		await recordUpdateState(
+			paths,
+			environment,
+			"restart-preparation",
+			"deferred",
+			stableDiagnosticReason(hooks.getRestartDeferralReason?.(), "restart-preparation-deferred"),
+			release.manifest.releaseSequence,
+		);
+		return false;
+	}
 	const provisional: AutoBotRestartRequest = {
 		...prepared,
 		target,
@@ -280,10 +353,25 @@ async function runUpdateCycle(
 		request = provisionalRestartRequest(prepared, target, predecessorTarget, provisional.nonce);
 	} catch (error) {
 		await abortPreparedRestart(hooks, provisional, "handoff-invalid");
+		await recordUpdateState(
+			paths,
+			environment,
+			"restart-preparation",
+			"failed",
+			"handoff-invalid",
+			release.manifest.releaseSequence,
+		);
 		throw new Error("AutoBot update preparation returned an invalid restart request", { cause: error });
 	}
 
-	type Finalization = "owned" | "contended" | "invalid";
+	type Finalization =
+		| "owned"
+		| "handoff-contended"
+		| "authentication-changed"
+		| "sequence-rejected"
+		| "release-quarantined"
+		| "update-changed"
+		| "handoff-budget-expired";
 	let finalization: Finalization;
 	try {
 		finalization = await withAutoBotFileLock(paths.updateLockPath, async () =>
@@ -297,14 +385,14 @@ async function runUpdateCycle(
 					current.bootstrapProcessId !== environment.bootstrapProcessId ||
 					current.runtimePath !== environment.runtimePath
 				) {
-					return "invalid";
+					return "authentication-changed";
 				}
 				try {
 					await assertAutoBotSequenceAllowed(paths, release.manifest, release.payloadSha256);
 				} catch {
-					return "invalid";
+					return "sequence-rejected";
 				}
-				if (await isAutoBotReleaseQuarantined(paths, release.manifest)) return "invalid";
+				if (await isAutoBotReleaseQuarantined(paths, release.manifest)) return "release-quarantined";
 				const currentUpdate = planAutoBotLaunchUpdate(current.launchRelease, release.manifest);
 				if (
 					!currentUpdate ||
@@ -312,15 +400,15 @@ async function runUpdateCycle(
 					!sameAutoBotRestartTarget(currentUpdate.predecessorTarget, predecessorTarget) ||
 					!stagedMatchesUpdate(staged, target, release.payloadSha256)
 				) {
-					return "invalid";
+					return "update-changed";
 				}
 				if ((await readAutoBotPendingRestart(paths)) || (await readAutoBotCommittedRestart(paths))) {
-					return "contended";
+					return "handoff-contended";
 				}
 				try {
 					assertMinimumRemainingHandoffTime(request, preparedAt);
 				} catch {
-					return "invalid";
+					return "handoff-budget-expired";
 				}
 
 				// Advancing high-water without an owner journal on a subsequent
@@ -359,7 +447,7 @@ async function runUpdateCycle(
 						}))
 					) {
 						await discardAutoBotHandoff(paths, handoff);
-						return "contended";
+						return "handoff-contended";
 					}
 				} catch (error) {
 					await discardAutoBotHandoff(paths, handoff);
@@ -370,20 +458,46 @@ async function runUpdateCycle(
 		);
 	} catch (error) {
 		await abortPreparedRestart(hooks, request, "handoff-write-failed");
+		await recordUpdateState(
+			paths,
+			environment,
+			"handoff",
+			"failed",
+			"handoff-write-failed",
+			release.manifest.releaseSequence,
+		);
 		throw error;
 	}
-	if (finalization === "contended") {
+	if (finalization === "handoff-contended") {
 		await abortPreparedRestart(hooks, request, "handoff-contended");
+		await recordUpdateState(
+			paths,
+			environment,
+			"handoff",
+			"deferred",
+			"handoff-contended",
+			release.manifest.releaseSequence,
+		);
 		return false;
 	}
-	if (finalization === "invalid") {
+	if (finalization !== "owned") {
 		await abortPreparedRestart(hooks, request, "handoff-invalid");
+		await recordUpdateState(
+			paths,
+			environment,
+			"handoff",
+			"deferred",
+			finalization,
+			release.manifest.releaseSequence,
+		);
 		return false;
 	}
 
+	await recordUpdateState(paths, environment, "handoff", "started", undefined, release.manifest.releaseSequence);
 	// Calling commit is the irreversible boundary. Never clean up or fall back
 	// after this call begins: a launcher may already have stopped the predecessor.
 	await hooks.commitRestart(request);
+	await recordUpdateState(paths, environment, "handoff", "completed", undefined, release.manifest.releaseSequence);
 	return true;
 }
 
@@ -410,31 +524,52 @@ export async function runAutoBotUpdateCycle(hooks: AutoBotUpdateHooks): Promise<
 }
 
 /**
- * Start the hourly idle-only update poll. Candidate handoff discovery is
- * synchronous and may be called before normal CLI/session parsing.
+ * Start an immediate, non-overlapping update loop. The next poll is measured
+ * from completion, so lock contention and slow downloads never create a queue.
  */
+export function startAutoBotPollingLoop(
+	runCycle: () => Promise<unknown>,
+	intervalMs = AUTO_BOT_UPDATE_INTERVAL_MS,
+): Pick<AutoBotUpdateHandle, "dispose"> {
+	let disposed = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const poll = async (): Promise<void> => {
+		if (disposed) return;
+		try {
+			await runCycle();
+		} catch {
+			logger.error("AutoBot update poll failed", { reason: "update-cycle-failed" });
+		} finally {
+			if (!disposed) {
+				timer = setTimeout(() => void poll(), intervalMs);
+				timer.unref?.();
+			}
+		}
+	};
+	void poll();
+	return {
+		dispose() {
+			disposed = true;
+			if (timer !== undefined) clearTimeout(timer);
+			timer = undefined;
+		},
+	};
+}
+
+/** Start managed polling after the runtime's authenticated role is active. */
 export function startAutoBotUpdates(hooks: AutoBotUpdateHooks): AutoBotUpdateHandle {
 	if (!isVerifiedAutoBotManagedRuntime() && isAutoBotCustomBuild()) throw new AutoBotManagedRuntimeRequiredError();
 
+	let polling: Pick<AutoBotUpdateHandle, "dispose"> | undefined;
 	let disposed = false;
-	let timer: ReturnType<typeof setInterval> | undefined;
-	let cycleRunning = false;
 	const dispose = () => {
 		disposed = true;
-		if (timer !== undefined) clearInterval(timer);
-		timer = undefined;
+		polling?.dispose();
+		polling = undefined;
 	};
 	const startPollingAfterAuthenticatedPromotion = (role: "active" | "candidate" | "fallback") => {
-		if (disposed || timer !== undefined) return;
-		timer = setInterval(() => {
-			if (cycleRunning) return;
-			cycleRunning = true;
-			void runAutoBotUpdateCycleForPromotedRole(hooks, role)
-				.catch(() => undefined)
-				.finally(() => {
-					cycleRunning = false;
-				});
-		}, AUTO_BOT_UPDATE_INTERVAL_MS);
+		if (disposed || polling !== undefined) return;
+		polling = startAutoBotPollingLoop(() => runAutoBotUpdateCycleForPromotedRole(hooks, role));
 	};
 	const handle = (input: Omit<AutoBotUpdateHandle, "dispose">): AutoBotUpdateHandle => ({
 		...input,

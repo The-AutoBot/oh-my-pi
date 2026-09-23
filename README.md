@@ -719,9 +719,9 @@ or migrated through that reviewed managed path.
 
 AutoBot is a separate, operator-managed distribution path for a signed `omp`
 runtime. It is not the ordinary `omp.sh`, package-manager, or source
-installation flow. Its bootstrap is immutable: it accepts only a locally
-configured signed channel and locally trusted Ed25519 public keys, then stages
-verified runtimes under its private installation root.
+installation flow. Its stable bootstrap uses only a locally configured signed
+channel and locally trusted Ed25519 public keys, stages verified runtimes in
+immutable release slots, and publishes an installation-wide preferred release.
 
 #### Operator setup and weekly local producer
 
@@ -981,7 +981,7 @@ explicit environment is supplied. Operators can therefore isolate Git settings
 with a process-local `GIT_CONFIG_GLOBAL`; the publisher does not itself create
 that isolation file.
 
-#### Install or migrate the immutable bootstrap
+#### Install or migrate the managed bootstrap
 
 Run the installer from a reviewed checkout with explicit values:
 
@@ -1004,8 +1004,12 @@ bun scripts/autobot-install.ts ... --migrate-legacy
 
 The installer does not read the root, channel, key, portal, or artifact
 allowlist from dotenv, bunfig, package metadata, or the current project.
-For an already managed root it does not overwrite the active runtime or stable
-launcher; it stages a verified release for the managed handoff. Migration
+For an already managed root it first recovers any authenticated publication
+journal, then verifies and publishes the selected release. On Windows, stable
+launcher replacement retains a mapped backup and is journaled for idempotent
+recovery; processes already mapped to older bytes continue running. The
+installation-wide preferred pointer advances monotonically, so an older live
+session cannot roll back the release selected by later launches. Migration
 refuses live legacy users/workers, records signed state first, and atomically
 replaces the legacy launcher only as its final action. Supply every exact
 HTTPS artifact origin needed by signed asset redirects—wildcards, paths,
@@ -1015,24 +1019,50 @@ The installer never modifies `PATH`. To invoke the stable managed launcher as
 plain `omp`, the operator must prepend the installation root to `PATH` and
 keep that root in place; no alias, shim, or copied launcher is required.
 
-#### Hourly safe-idle handoff
+#### Publication, polling, and per-session handoff
 
-After authenticated startup, one update cycle at a time polls hourly. A newer
-same-compatibility release is staged before any broker reservation or shared
-handoff lock. The active session must be persisted and safe to replace: no
-agent-owned browser tab, computer/eval/Python/DAP session, stateful MCP
-transport, or owned hub service. These checks, collaboration preflight, and
-broker preflight are repeated at the mutation boundary. Deferred or contended
-work stays deferred.
+The hourly upstream-integration and signed-promotion producer schedules above
+are unchanged. Managed runtimes have a separate consumer loop: after
+authenticated startup they check immediately, then start the next check
+30 seconds after the preceding cycle completes. A verified newer compatible
+release is staged and published as the installation-wide preference without
+waiting for every running session to become idle. Fresh launches refresh the
+signed channel and select that preference independently of any per-session
+handoff or journal owned by an older process.
 
-Connected browser guests are a separate safe-idle condition, not an
-agent-owned-tool-resource veto. The authenticated coordinator and local
-discovery record bind the replacement to the exact process/session/generation.
-Every connected managed guest must negotiate the restart capability and confirm
-its browser-local draft is recoverable; a post-acknowledgement edit or
-capability change cancels the preparation. After replacement, guests discover
-the exact new session and must fully reload before using changed capabilities.
-An older or manually connected incompatible guest defers the handoff rather
+Only channel transport unavailability permits a fresh launch to fall back to a
+reverified installed release. Invalid signatures, malformed or conflicting
+content, unsafe publication state, and other verification failures fail closed.
+`omp update --status` is the exception to fresh-launch refresh: for a managed
+installation it performs no network access or mutation and reports the latest
+phase, outcome, release sequence, timestamp, and stable reason code. Deferral
+codes identify actionable blockers such as active session work or resources,
+collaboration readiness, MCP traffic, connection work, or coordinator
+contention. A normal `omp update` launched through the managed bootstrap uses
+the same signed managed route; the command's unmanaged behavior is unchanged.
+
+Each running session remains pinned to its own launch release until its own
+handoff succeeds. Busy sessions neither block publication nor prevent idle
+sessions and new launches from using a newer release. A handoff requires only
+that session to be persisted and locally ready: no active agent-owned browser
+tab, computer/eval/Python/DAP resource, owned hub service, unsafe interactive
+state, or incompatible collaboration guest. These checks, collaboration
+preflight, and broker preflight are repeated at the mutation boundary; deferred
+or contended work is retried by a later cycle.
+
+An idle MCP connection does not by itself block replacement. Connecting or
+reconnecting servers, outbound calls, inbound request handlers, and pending
+response writes do defer it. Once idle, a reversible manager/transport fence
+prevents new MCP work during the boundary; aborting the handoff releases the
+fence. A successful replacement reconnects MCP servers in the successor, so
+session-local MCP server state is reset rather than carried across the restart.
+
+Connected browser guests are a separate local-readiness condition. Every
+connected managed guest must negotiate the restart capability and confirm its
+browser-local draft is recoverable; a post-acknowledgement edit or capability
+change cancels the preparation. After replacement, guests discover the exact
+new session and must fully reload before using changed capabilities. An older
+or manually connected incompatible guest defers that session's handoff rather
 than being forcibly replaced; browser-local drafts remain local.
 
 The replacement resumes the exact persisted session file with its exact
@@ -1053,9 +1083,11 @@ compare-and-swap journals. The bootstrap owns its child for the whole launch
 and peeks at normal exit only after a child exits `0`: a valid foreign-owned
 pending journal is left alone, while malformed or unauthenticated authority
 fails closed. A pre-activation candidate failure may restore only its recorded
-predecessor, with the broker/browser ownership restored before accepting work.
+predecessor, with broker/browser ownership restored before accepting work.
 Once activation begins, a missing acknowledgement is indeterminate: no global
-rollback or unrelated fallback is attempted.
+rollback or unrelated fallback is attempted. Already-running legacy binaries
+do not acquire this publication, polling, or handoff policy until they restart
+through, or update into, the corrected managed installation.
 
 ---
 

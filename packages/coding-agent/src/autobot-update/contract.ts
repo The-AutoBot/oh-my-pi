@@ -198,13 +198,22 @@ export interface AutoBotHandoffClaim {
  * After activation is sent, an absent acknowledgement is indeterminate and
  * MUST NOT trigger a fallback or abort.
  */
+export type AutoBotRestartAdmission =
+	| { readonly canPrepare: true }
+	| { readonly canPrepare: false; readonly reason: string };
+
 export interface AutoBotUpdateHooks {
 	/** Nonmutating early admission; `prepareRestart` MUST repeat every safety check late. */
-	canPrepareRestart(target: AutoBotRestartTarget, predecessorTarget: AutoBotRestartTarget): Promise<boolean>;
+	canPrepareRestart(
+		target: AutoBotRestartTarget,
+		predecessorTarget: AutoBotRestartTarget,
+	): Promise<AutoBotRestartAdmission>;
 	prepareRestart(
 		target: AutoBotRestartTarget,
 		predecessorTarget: AutoBotRestartTarget,
 	): Promise<PreparedAutoBotRestart | undefined>;
+	/** Latest stable reason from a `prepareRestart` deferral in this session. */
+	getRestartDeferralReason?(): string | undefined;
 	commitRestart(request: AutoBotRestartRequest): Promise<void>;
 	abortRestart?(request: AutoBotRestartRequest, reason: AutoBotRestartAbortReason): Promise<void>;
 	/** Must restore exact broker/browser predecessor ownership before fallback accepts work. */

@@ -12,6 +12,7 @@ import {
 	AUTO_BOT_MINIMUM_BOOTSTRAP_VERSION,
 	AUTO_BOT_RELEASE_SCHEMA_VERSION,
 	AUTO_BOT_SESSION_FORMAT_VERSION,
+	serializeAutoBotReleaseManifest,
 } from "../packages/coding-agent/src/autobot-update/contract.ts";
 import { AUTO_BOT_ACTIVATION_ACK_TIMEOUT_MS } from "../packages/coding-agent/src/autobot-update/timing.ts";
 import type {
@@ -27,9 +28,10 @@ import {
 	writeAutoBotActivationAcknowledgement,
 	writeAutoBotCandidateReady,
 } from "../packages/coding-agent/src/autobot-update/handoff.ts";
-import { ensureAutoBotInstallationIdentity } from "../packages/coding-agent/src/autobot-update/identity.ts";
 import { acquireAutoBotFileLock } from "../packages/coding-agent/src/autobot-update/lock.ts";
+import { ensureAutoBotInstallationIdentity } from "../packages/coding-agent/src/autobot-update/identity.ts";
 import {
+	autoBotBootstrapSlotPath,
 	autoBotHandoffPath,
 	autoBotLaunchLeaseLockPath,
 	autoBotPaths,
@@ -38,12 +40,15 @@ import {
 import type { AutoBotPaths } from "../packages/coding-agent/src/autobot-update/paths.ts";
 import { ensureAutoBotPrivateDirectory } from "../packages/coding-agent/src/autobot-update/permissions.ts";
 import { currentAutoBotRuntimeTarget } from "../packages/coding-agent/src/autobot-update/platform.ts";
+import { runInstallation } from "./autobot-install.ts";
 import {
+	advanceAutoBotSequenceHighWater,
 	commitAutoBotPendingRestart,
 	createAutoBotPendingRestart,
 	readAutoBotActivePointer,
 	readAutoBotCommittedRestart,
 	readAutoBotPendingRestart,
+	quarantineAutoBotRelease,
 	withAutoBotHandoffLock,
 	writeAutoBotActivePointer,
 } from "../packages/coding-agent/src/autobot-update/state.ts";
@@ -52,7 +57,7 @@ import type {
 	AutoBotHandoffJournalMatch,
 	AutoBotPendingRestart,
 } from "../packages/coding-agent/src/autobot-update/state.ts";
-import { sha256File } from "../packages/coding-agent/src/autobot-update/storage.ts";
+import { sha256File, writeJsonAtomically } from "../packages/coding-agent/src/autobot-update/storage.ts";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const temporaryDirectories: string[] = [];
@@ -113,7 +118,6 @@ function isCryptoKeyPair(value: unknown): value is CryptoKeyPair {
 		value.privateKey instanceof CryptoKey
 	);
 }
-
 async function createTrustedPublicKey(directory: string): Promise<string> {
 	const generated = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
 	if (!isCryptoKeyPair(generated)) throw new Error("Ed25519 key generation did not return a key pair");
@@ -312,6 +316,38 @@ function releaseManifest(
 	};
 }
 
+async function signedInstallerRequest(manifest: AutoBotReleaseManifest) {
+	const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+	if (!isCryptoKeyPair(keys)) throw new Error("Ed25519 fixture key generation failed");
+	const payload = serializeAutoBotReleaseManifest(manifest);
+	const signature = Buffer.from(
+		await crypto.subtle.sign("Ed25519", keys.privateKey, new TextEncoder().encode(payload)),
+	).toString("base64");
+	const channel = {
+		schemaVersion: 1 as const,
+		envelopeUrl: "https://new-channel.example.invalid/current.json",
+		collabPortalUrl: "https://new-portal.example.invalid/live",
+		trustedKeys: {
+			fixture: Buffer.from(await crypto.subtle.exportKey("spki", keys.publicKey)).toString("base64"),
+		},
+		allowedArtifactOrigins: ["https://assets.example.invalid"],
+	};
+	return {
+		channel,
+		fetchImpl: (async () =>
+			new Response(JSON.stringify({ payload, signature, keyId: "fixture" }), {
+				status: 200,
+			})) as unknown as typeof fetch,
+	};
+}
+
+async function completeManagedInstallerFixture(fixture: BootstrapFixture): Promise<void> {
+	const slot = await ensureAutoBotPrivateDirectory(autoBotBootstrapSlotPath(fixture.paths, "1-fixture-active"));
+	const bootstrap = path.join(slot, legacyExecutableName());
+	await fs.copyFile(fixture.bootstrapPath, bootstrap);
+	if (process.platform !== "win32") await fs.chmod(bootstrap, 0o700);
+}
+
 function restartTarget(manifest: AutoBotReleaseManifest): AutoBotRestartTarget {
 	return {
 		releaseSequence: manifest.releaseSequence,
@@ -427,6 +463,13 @@ async function createBootstrapFixture(): Promise<BootstrapFixture> {
 	const root = await createPrivateRoot();
 	const paths = autoBotPaths(root);
 	await ensureAutoBotInstallationIdentity(paths);
+	await writeJsonAtomically(paths.channelConfigPath, {
+		schemaVersion: 1,
+		envelopeUrl: "https://127.0.0.1:1/current.json",
+		collabPortalUrl: "https://portal.example.invalid/live",
+		trustedKeys: { fixture: Buffer.from("offline-fixture").toString("base64") },
+		allowedArtifactOrigins: [],
+	});
 	const bootstrapSource = await ensureStandaloneBootstrap();
 	const runtimeSource = await ensureFixtureRuntime();
 	const bootstrapPath = path.join(root, legacyExecutableName());
@@ -1612,7 +1655,7 @@ test("returns zero when the promoted runtime exits under a foreign handoff lock"
 	expect(foreignCommittedPresent).toBe(false);
 }, 600_000);
 
-test("refuses a live owner lease then CAS-reclaims a safely abandoned committed candidate", async () => {
+test("launches independently while a live owner lease exists then CAS-reclaims an abandoned candidate", async () => {
 	const fixture = await createBootstrapFixture();
 	const oldBootstrapProcessId = await createDefinitelyDeadProcessId();
 	const oldPredecessorProcessId = await createDefinitelyDeadProcessId();
@@ -1639,14 +1682,12 @@ test("refuses a live owner lease then CAS-reclaims a safely abandoned committed 
 	let blockedGatePath: string | undefined;
 	const liveOwnerLease = await acquireAutoBotFileLock(leasePath);
 	try {
-		const blocked = await startBootstrap(fixture);
-		blockedGatePath = blocked.gatePath;
-		const [blockedExitCode] = await Promise.all([blocked.bootstrap.exited, blocked.stderr]);
-		activeBootstrapRuns.delete(blocked);
-		expect(blockedExitCode).toBe(1);
-		expect(await Bun.file(blocked.evidencePath).exists()).toBeFalse();
-		expect(await Bun.file(blocked.gatePath).exists()).toBeFalse();
+		const independent = await startBootstrap(fixture);
+		blockedGatePath = independent.gatePath;
+		const evidence = await runtimeEvidence(independent);
+		expect(evidence.role).toBe("active");
 		expect(await readAutoBotCommittedRestart(fixture.paths)).toEqual(committed);
+		expect((await releaseBootstrap(independent)).exitCode).toBe(0);
 	} finally {
 		liveOwnerLease.release();
 	}
@@ -1830,4 +1871,80 @@ test.skipIf(process.platform === "win32")("refuses writable legacy roots before 
 	expect((await fs.stat(legacyPath)).mode & 0o777).toBe(0o755);
 	expect(await Bun.file(path.join(root, ".autobot")).exists()).toBeFalse();
 	expect(await fs.readdir(root)).toEqual([legacyExecutableName()]);
+});
+
+test("installer rollback rejection leaves the established channel unchanged", async () => {
+	const fixture = await createBootstrapFixture();
+	await completeManagedInstallerFixture(fixture);
+	const request = await signedInstallerRequest(fixture.candidateManifest);
+	const establishedChannel = {
+		...request.channel,
+		envelopeUrl: "https://established-channel.example.invalid/current.json",
+		collabPortalUrl: "https://established-portal.example.invalid/live",
+	};
+	await writeJsonAtomically(fixture.paths.channelConfigPath, establishedChannel);
+	await advanceAutoBotSequenceHighWater(
+		fixture.paths,
+		{ ...fixture.candidateManifest, releaseSequence: fixture.candidateManifest.releaseSequence + 1 },
+		"f".repeat(64),
+	);
+
+	await expect(
+		runInstallation(
+			{ root: fixture.root, channel: request.channel, migrateLegacy: false },
+			{ fetchImpl: request.fetchImpl },
+		),
+	).rejects.toThrow("lower than the accepted high-water mark");
+	expect(JSON.parse(await Bun.file(fixture.paths.channelConfigPath).text())).toEqual(establishedChannel);
+});
+
+test("installer quarantine rejection leaves the established channel unchanged", async () => {
+	const fixture = await createBootstrapFixture();
+	await completeManagedInstallerFixture(fixture);
+	const request = await signedInstallerRequest(fixture.candidateManifest);
+	const establishedChannel = {
+		...request.channel,
+		envelopeUrl: "https://established-channel.example.invalid/current.json",
+		collabPortalUrl: "https://established-portal.example.invalid/live",
+	};
+	await writeJsonAtomically(fixture.paths.channelConfigPath, establishedChannel);
+	await quarantineAutoBotRelease(fixture.paths, restartTarget(fixture.candidateManifest));
+
+	await expect(
+		runInstallation(
+			{ root: fixture.root, channel: request.channel, migrateLegacy: false },
+			{ fetchImpl: request.fetchImpl },
+		),
+	).rejects.toThrow("quarantined");
+	expect(JSON.parse(await Bun.file(fixture.paths.channelConfigPath).text())).toEqual(establishedChannel);
+});
+
+test("quarantined migration candidate is rejected without replacing the established channel", async () => {
+	const fixture = await createBootstrapFixture();
+	const request = await signedInstallerRequest(fixture.candidateManifest);
+	await completeManagedInstallerFixture(fixture);
+	const establishedChannel = {
+		...request.channel,
+		envelopeUrl: "https://established-channel.example.invalid/current.json",
+		collabPortalUrl: "https://established-portal.example.invalid/live",
+	};
+	await writeJsonAtomically(fixture.paths.channelConfigPath, establishedChannel);
+	await quarantineAutoBotRelease(fixture.paths, restartTarget(fixture.candidateManifest));
+	const stableStat = await fs.stat(fixture.bootstrapPath);
+	await writeJsonAtomically(path.join(fixture.paths.controlDir, "legacy-migration.json"), {
+		schemaVersion: 1,
+		legacyPath: fixture.bootstrapPath,
+		legacySha256: await sha256File(fixture.bootstrapPath),
+		legacySize: stableStat.size,
+		legacyNlink: 1,
+		startedAt: fixtureTimestamp,
+	});
+
+	await expect(
+		runInstallation(
+			{ root: fixture.root, channel: request.channel, migrateLegacy: true },
+			{ fetchImpl: request.fetchImpl },
+		),
+	).rejects.toThrow("quarantined");
+	expect(JSON.parse(await Bun.file(fixture.paths.channelConfigPath).text())).toEqual(establishedChannel);
 });

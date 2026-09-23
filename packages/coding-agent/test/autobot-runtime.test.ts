@@ -68,6 +68,11 @@ function runtimeForPreflight(
 	isCollabSafe: () => boolean,
 	canPrepare: () => Promise<AutoBotCoordinatorPreflight>,
 	onReservation: () => void,
+	transport?: {
+		readonly hasActiveRequests?: boolean;
+		acquireRestartQuiescence?: () => { release(): void } | undefined;
+	},
+	interactiveReason?: string,
 ): AutoBotRuntime {
 	const session = {
 		sessionManager: {
@@ -88,7 +93,16 @@ function runtimeForPreflight(
 		},
 	} satisfies PreflightSession;
 	const mode = {
-		getAutoBotUpdateDeferralReason: () => undefined,
+		mcpManager: transport
+			? {
+					get restartQuiescenceReason(): string | undefined {
+						if (transport.hasActiveRequests === true) return "mcp-request-active";
+						return transport.acquireRestartQuiescence ? undefined : "mcp-restart-quiescence-unsupported";
+					},
+					acquireRestartQuiescence: () => transport.acquireRestartQuiescence?.(),
+				}
+			: undefined,
+		getAutoBotUpdateDeferralReason: () => interactiveReason,
 		beginAutoBotUpdateAdmission: () => {
 			throw new Error("read-only preflight must not begin update admission");
 		},
@@ -125,8 +139,157 @@ test("AutoBot preflight defers without reserving when browser safety changes dur
 	collabSafe = false;
 	preflight.resolve({ canPrepare: true });
 
-	expect(await result).toBeFalse();
+	expect(await result).toEqual({ canPrepare: false, reason: "collab-guest-incompatible" });
 	expect(reservations).toBe(0);
+});
+
+test("AutoBot preflight admits an idle explicitly reconnectable MCP transport", async () => {
+	const runtime = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: true }),
+		() => {},
+		{ hasActiveRequests: false, acquireRestartQuiescence: () => ({ release: () => {} }) },
+	);
+
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: true,
+	});
+});
+
+test("AutoBot preflight reports active and unsupported MCP transports without disturbing them", async () => {
+	const active = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: true }),
+		() => {},
+		{ hasActiveRequests: true, acquireRestartQuiescence: () => ({ release: () => {} }) },
+	);
+	expect(await active.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "mcp-request-active",
+	});
+
+	const unsupported = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: true }),
+		() => {},
+		{ hasActiveRequests: false },
+	);
+	expect(await unsupported.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "mcp-restart-quiescence-unsupported",
+	});
+});
+
+test("AutoBot preflight preserves coordinator deferral reason as a stable code", async () => {
+	const runtime = runtimeForPreflight(
+		() => true,
+		async () => ({ canPrepare: false, reason: "reservation-contended" }),
+		() => {},
+	);
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "coordinator-reservation-contended",
+	});
+});
+
+test("AutoBot preflight reports a busy session without reserving shared handoff state", async () => {
+	let coordinatorChecks = 0;
+	const runtime = runtimeForPreflight(
+		() => true,
+		async () => {
+			coordinatorChecks++;
+			return { canPrepare: true };
+		},
+		() => {},
+		undefined,
+		"session work is still active",
+	);
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: false,
+		reason: "session-work-active",
+	});
+	expect(coordinatorChecks).toBe(0);
+});
+
+test("AutoBot preparation materializes an idle empty session without changing its identity", async () => {
+	const sessionId = "empty-session";
+	const sessionFile = "/tmp/empty-session.jsonl";
+	const admission = {};
+	let onDisk = false;
+	let mcpQuiesced = false;
+	let ensureCalls = 0;
+	const preparation = {
+		reservationId: "reservation",
+		fallbackInstanceId: "fallback",
+		predecessorInstanceId: "predecessor",
+		successorInstanceId: "successor",
+		predecessorTarget: request.predecessorTarget,
+		expiresAt: "2030-01-01T00:00:00.000Z",
+		leaseDurationMs: 600_000,
+		target: request.target,
+		handoff: { manualRoom: "preserve" as const, collab: "preserve" as const },
+	};
+	const session = {
+		sessionManager: {
+			isSessionOnDisk: () => onDisk,
+			ensureOnDisk: async () => {
+				ensureCalls++;
+				onDisk = true;
+			},
+			flush: async () => {},
+			getSessionFile: () => sessionFile,
+			getSessionId: () => sessionId,
+			getCwd: () => process.cwd(),
+		},
+		getEvalKernelOwnerId: () => sessionId,
+		autoBotUpdateCoordinator: {
+			canPrepare: async () => ({ canPrepare: true as const }),
+			prepare: async () => preparation,
+			cancel: async () => {},
+			abandon: async () => {},
+		},
+	};
+	const mode = {
+		mcpManager: {
+			get restartQuiescenceReason(): string | undefined {
+				return mcpQuiesced ? "mcp-restart-quiescence-unavailable" : undefined;
+			},
+			acquireRestartQuiescence: () => {
+				if (mcpQuiesced) return undefined;
+				mcpQuiesced = true;
+				return {
+					release: () => {
+						mcpQuiesced = false;
+					},
+				};
+			},
+		},
+		getAutoBotUpdateDeferralReason: () => undefined,
+		beginAutoBotUpdateAdmission: () => admission,
+		isAutoBotUpdateAdmissionValid: (value: unknown) => value === admission,
+		isAutoBotUpdateExitRequested: () => false,
+		cancelAutoBotUpdateAdmission: () => {},
+		collabController: {
+			canPrepareUpdate: () => ({ safe: true as const }),
+			captureAutoBotFallbackState: () => ({ wasHosting: false as const }),
+		},
+	};
+	const runtime = new AutoBotRuntime(
+		session as unknown as ConstructorParameters<typeof AutoBotRuntime>[0],
+		parseArgs([]),
+		mode as unknown as ConstructorParameters<typeof AutoBotRuntime>[2],
+		undefined,
+	);
+
+	expect(await runtime.hooks.canPrepareRestart(request.target, request.predecessorTarget)).toEqual({
+		canPrepare: true,
+	});
+	const prepared = await runtime.hooks.prepareRestart!(request.target, request.predecessorTarget);
+	expect(ensureCalls).toBe(1);
+	expect(prepared).toMatchObject({ sessionId, sessionFile });
+	expect(mcpQuiesced).toBe(true);
+	await runtime.hooks.abortRestart!(request, "candidate-rejected");
+	expect(mcpQuiesced).toBe(false);
 });
 
 test("AutoBot restart capsule rejects nonpersistent credential and prompt overrides", () => {

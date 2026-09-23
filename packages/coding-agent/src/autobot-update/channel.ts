@@ -43,6 +43,14 @@ export interface AutoBotFetchDeps {
 	readonly fetchImpl?: typeof fetch;
 }
 
+/** A redacted network/response-stream failure, distinct from authenticated content rejection. */
+export class AutoBotTransportError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "AutoBotTransportError";
+	}
+}
+
 const ChannelConfigSchema = type({
 	schemaVersion: "1",
 	envelopeUrl: "string > 0",
@@ -151,7 +159,15 @@ export function assertAutoBotChannelConfig(value: unknown): AutoBotChannelConfig
 }
 
 async function discardResponseBody(response: Response): Promise<void> {
-	if (response.body) await response.body.cancel().catch(() => undefined);
+	const cancel = response.body?.cancel;
+	if (typeof cancel === "function") await cancel.call(response.body).catch(() => undefined);
+}
+function openResponseReader(body: NonNullable<Response["body"]>, label: string) {
+	try {
+		return body.getReader();
+	} catch {
+		throw new AutoBotTransportError(`${label} response stream failed`);
+	}
 }
 
 async function fetchApproved(
@@ -173,7 +189,7 @@ async function fetchApproved(
 		} catch {
 			// Fetch implementations may include a presigned redirect URL in their
 			// native error text. Never surface that credential-bearing detail.
-			throw new Error(`${label} request failed`);
+			throw new AutoBotTransportError(`${label} request failed`);
 		}
 		if (response.status >= 300 && response.status < 400) {
 			try {
@@ -204,19 +220,15 @@ async function fetchApproved(
 async function boundedResponseBytes(response: Response, label: string): Promise<Uint8Array> {
 	let responseConsumed = false;
 	try {
-		if (!response.body) throw new Error(`${label} has no response body`);
+		const body = response.body;
+		if (!body) throw new Error(`${label} has no response body`);
 		const contentLength = response.headers.get("content-length");
 		if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_CHANNEL_BYTES)) {
 			throw new Error(`${label} exceeds the maximum size`);
 		}
 		const chunks: Uint8Array[] = [];
 		let size = 0;
-		let reader: ReadableStreamDefaultReader<Uint8Array>;
-		try {
-			reader = response.body.getReader();
-		} catch {
-			throw new Error(`${label} response stream failed`);
-		}
+		const reader = openResponseReader(body, label);
 		let streamCompleted = false;
 		try {
 			while (true) {
@@ -224,7 +236,7 @@ async function boundedResponseBytes(response: Response, label: string): Promise<
 				try {
 					result = await reader.read();
 				} catch {
-					throw new Error(`${label} response stream failed`);
+					throw new AutoBotTransportError(`${label} response stream failed`);
 				}
 				if (result.done) {
 					streamCompleted = true;
@@ -254,29 +266,19 @@ async function boundedResponseBytes(response: Response, label: string): Promise<
 	}
 }
 
-/** Fetch, verify, and parse a channel document without accepting channel-provided keys or origins. */
-export async function fetchVerifiedAutoBotRelease(
+/** Verify retained envelope bytes against installation-pinned trust without network access. */
+export async function verifyAutoBotReleaseEnvelope(
 	config: AutoBotChannelConfig,
-	deps: AutoBotFetchDeps = {},
+	envelopeJson: string,
 ): Promise<VerifiedAutoBotRelease> {
 	const checkedConfig = parseChannelConfig(config);
 	const allowedOrigins: Record<string, true> = Object.assign(Object.create(null), {
 		[secureUrl(checkedConfig.envelopeUrl, "AutoBot envelope URL").origin]: true,
 	}) as Record<string, true>;
 	for (const origin of checkedConfig.allowedArtifactOrigins) allowedOrigins[origin] = true;
-	const response = await fetchApproved(
-		checkedConfig.envelopeUrl,
-		allowedOrigins,
-		"AutoBot release channel",
-		CHANNEL_TIMEOUT_MS,
-		deps.fetchImpl ?? fetch,
-	);
 	let envelopeValue: unknown;
-	let envelopeJson: string;
 	try {
-		envelopeJson = new TextDecoder("utf-8", { fatal: true }).decode(
-			await boundedResponseBytes(response, "AutoBot release channel"),
-		);
+
 		envelopeValue = JSON.parse(envelopeJson);
 	} catch (error) {
 		throw new Error("AutoBot release channel is not valid UTF-8 JSON", { cause: error });
@@ -303,6 +305,35 @@ export async function fetchVerifiedAutoBotRelease(
 		payloadSha256: createHash("sha256").update(payloadBytes).digest("hex"),
 		allowedArtifactOrigins: allowedOrigins,
 	};
+}
+
+/** Fetch, verify, and parse a channel document without accepting channel-provided keys or origins. */
+export async function fetchVerifiedAutoBotRelease(
+	config: AutoBotChannelConfig,
+	deps: AutoBotFetchDeps = {},
+): Promise<VerifiedAutoBotRelease> {
+	const checkedConfig = parseChannelConfig(config);
+	const allowedOrigins: Record<string, true> = Object.assign(Object.create(null), {
+		[secureUrl(checkedConfig.envelopeUrl, "AutoBot envelope URL").origin]: true,
+	}) as Record<string, true>;
+	for (const origin of checkedConfig.allowedArtifactOrigins) allowedOrigins[origin] = true;
+	const response = await fetchApproved(
+		checkedConfig.envelopeUrl,
+		allowedOrigins,
+		"AutoBot release channel",
+		CHANNEL_TIMEOUT_MS,
+		deps.fetchImpl ?? fetch,
+	);
+	let envelopeJson: string;
+	try {
+		envelopeJson = new TextDecoder("utf-8", { fatal: true }).decode(
+			await boundedResponseBytes(response, "AutoBot release channel"),
+		);
+	} catch (error) {
+		if (error instanceof AutoBotTransportError) throw error;
+		throw new Error("AutoBot release channel is not valid UTF-8 JSON", { cause: error });
+	}
+	return verifyAutoBotReleaseEnvelope(checkedConfig, envelopeJson);
 }
 
 async function writeChunk(file: fs.FileHandle, chunk: Uint8Array): Promise<void> {
@@ -334,7 +365,8 @@ export async function downloadVerifiedAutoBotAsset(input: {
 		);
 		let responseConsumed = false;
 		try {
-			if (!response.body) throw new Error(`AutoBot ${asset.kind} asset has no response body`);
+			const body = response.body;
+			if (!body) throw new Error(`AutoBot ${asset.kind} asset has no response body`);
 			const contentLength = response.headers.get("content-length");
 			if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) !== asset.size)) {
 				throw new Error(`AutoBot ${asset.kind} asset content length does not match signed size`);
@@ -343,12 +375,7 @@ export async function downloadVerifiedAutoBotAsset(input: {
 			const hash = createHash("sha256");
 			let size = 0;
 			try {
-				let reader: ReadableStreamDefaultReader<Uint8Array>;
-				try {
-					reader = response.body.getReader();
-				} catch {
-					throw new Error(`AutoBot ${asset.kind} asset response stream failed`);
-				}
+				const reader = openResponseReader(body, `AutoBot ${asset.kind} asset`);
 				let streamCompleted = false;
 				try {
 					while (true) {
@@ -356,7 +383,7 @@ export async function downloadVerifiedAutoBotAsset(input: {
 						try {
 							result = await reader.read();
 						} catch {
-							throw new Error(`AutoBot ${asset.kind} asset response stream failed`);
+							throw new AutoBotTransportError(`AutoBot ${asset.kind} asset response stream failed`);
 						}
 						if (result.done) {
 							streamCompleted = true;

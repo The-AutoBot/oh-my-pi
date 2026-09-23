@@ -14,6 +14,13 @@
 - Local Windows application releases can now reuse a matching, independently versioned native compatibility generation across application-only version bumps without rebuilding Rust or running broad per-build qualification suites.
 - Signed local producers now require `nativeAddonDirectory` plus a pinned native build-provenance digest, validate the current native-input fingerprint and exact artifact bytes before application builds, and retain immutable prepared publication and update/recovery safeguards.
 - Managed AutoBot updates now run serially at safe idle and resume the exact persisted session/profile/cwd/current model without replaying the original prompt. The broker reservation is 390 seconds (270-second execution floor plus 120-second pre-commit margin); candidates have a 60-second ready deadline.
+- Added operator guidance for the signed AutoBot channel, managed bootstrap installation/legacy migration, and its external hourly integration and promotion workflows.
+- Added `omp update --status` for managed installations: it is read-only and offline, and reports the latest update phase, outcome, release, and actionable deferral reason.
+
+### Changed
+
+- Maintained custom 18.2.3 collaboration builds use repository-pinned Bun 1.4.0 with a matching source-built native addon through the maintained build scripts, preserving compiled `import.meta` startup.
+- Managed AutoBot releases now publish an installation-wide preferred version for fresh launches independently of per-session handoffs. Runtime polling starts immediately and repeats 30 seconds after each completed cycle without changing the hourly producer schedules; busy sessions remain pinned while locally ready sessions update independently, and managed `omp update` uses the signed managed route.
 
 ### Fixed
 
@@ -121,6 +128,8 @@
 ### Changed
 
 - Unified thinking-level detection, unexpected-stop detection, and AI-assisted staging around a shared judgment system with automatic fallback across configured models when TypeSafe is unavailable or cannot complete a request. AI-assisted staging now evaluates files as a single batched judgment while preserving one yes/no decision per file.
+- Managed handoffs now admit idle MCP connections behind a reversible traffic fence, defer for connecting/reconnecting work plus outbound calls and inbound handler/response writes, and reconnect MCP servers in the successor with session-local server state reset.
+- Managed Windows launcher publication now retains a mapped backup and recoverable journal while advancing the preferred release monotonically, so live older processes continue on their pinned bytes and cannot roll back new launches.
 
 ## [18.2.3] - 2026-09-17
 

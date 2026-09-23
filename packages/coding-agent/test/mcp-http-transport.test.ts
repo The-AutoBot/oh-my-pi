@@ -921,3 +921,102 @@ describe("MCP Streamable HTTP GET listener resumption", () => {
 		}
 	});
 });
+
+describe("MCP restart quiescence", () => {
+	it("blocks new work reversibly while admitting a connected idle transport", async () => {
+		let posts = 0;
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				posts++;
+				const body = (await req.json()) as { id: string | number };
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: { ok: true } });
+			},
+		});
+		const transport = await connectedTransport();
+		const guard = transport.acquireRestartQuiescence();
+		expect(guard).toBeDefined();
+		await expect(transport.request("tools/list")).rejects.toThrow("quiesced for runtime restart");
+		expect(posts).toBe(0);
+
+		guard!.release();
+		await expect(transport.request("tools/list")).resolves.toEqual({ ok: true });
+		expect(posts).toBe(1);
+		await transport.close();
+	});
+
+	it("does not quiesce an outbound request before its response settles", async () => {
+		const requestArrived = Promise.withResolvers<void>();
+		const responseGate = Promise.withResolvers<void>();
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const body = (await req.json()) as { id: string | number };
+				requestArrived.resolve();
+				await responseGate.promise;
+				return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+			},
+		});
+		const transport = await connectedTransport();
+		const requestPromise = transport.request("tools/call");
+		await requestArrived.promise;
+
+		expect(transport.hasActiveRequests).toBe(true);
+		expect(transport.acquireRestartQuiescence()).toBeUndefined();
+		responseGate.resolve();
+		await requestPromise;
+		const guard = transport.acquireRestartQuiescence();
+		expect(guard).toBeDefined();
+		guard!.release();
+		await transport.close();
+	});
+
+	it("keeps an inbound handler active through response delivery", async () => {
+		const handlerStarted = Promise.withResolvers<void>();
+		const handlerGate = Promise.withResolvers<void>();
+		const responseDelivered = Promise.withResolvers<void>();
+		const responseGate = Promise.withResolvers<void>();
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method === "GET") {
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.enqueue(
+									encoder.encode(
+										'data: {"jsonrpc":"2.0","id":"server-1","method":"roots/list","params":{}}\n\n',
+									),
+								);
+							},
+						}),
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				}
+				const body = (await req.json()) as { id?: string | number };
+				if (body.id === "server-1") {
+					responseDelivered.resolve();
+					await responseGate.promise;
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+		const transport = await connectedTransport(0);
+		transport.onRequest = async () => {
+			handlerStarted.resolve();
+			await handlerGate.promise;
+			return { roots: [] };
+		};
+		await transport.startSSEListener();
+		await handlerStarted.promise;
+
+		expect(transport.hasActiveRequests).toBe(true);
+		expect(transport.acquireRestartQuiescence()).toBeUndefined();
+		handlerGate.resolve();
+		await responseDelivered.promise;
+		expect(transport.hasActiveRequests).toBe(true);
+		expect(transport.acquireRestartQuiescence()).toBeUndefined();
+		responseGate.resolve();
+		await transport.close();
+	});
+});

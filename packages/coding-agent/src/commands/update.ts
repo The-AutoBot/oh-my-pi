@@ -14,6 +14,7 @@ export default class Update extends Command {
 	static flags = {
 		force: Flags.boolean({ char: "f", description: "Force update", default: false }),
 		check: Flags.boolean({ char: "c", description: "Check for updates without installing", default: false }),
+		status: Flags.boolean({ description: "Show managed update status without network access", default: false }),
 		plugins: Flags.boolean({ char: "l", description: "Update installed plugins", default: false }),
 		canary: Flags.boolean({ description: "Switch to the canary channel and update", default: false }),
 		stable: Flags.boolean({ description: "Switch back to the stable channel", default: false }),
@@ -22,6 +23,7 @@ export default class Update extends Command {
 	static examples = [
 		"omp update",
 		"omp update --check",
+		"omp update --status",
 		"omp update --canary",
 		"# If GitHub rate-limits release metadata, set GITHUB_TOKEN or GH_TOKEN\n  GITHUB_TOKEN=... omp update",
 	];
@@ -30,12 +32,16 @@ export default class Update extends Command {
 		const { flags } = await this.parse(Update);
 		await initTheme();
 		if (flags.canary && flags.stable) throw new CliUsageError("--canary and --stable are mutually exclusive");
+		if (flags.status && (flags.force || flags.check || flags.plugins || flags.canary || flags.stable)) {
+			throw new CliUsageError("--status cannot be combined with other update options");
+		}
 		if (flags.plugins) {
 			await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: {} });
 		} else {
 			await updateCli.runUpdateCommand({
 				force: flags.force,
 				check: flags.check,
+				status: flags.status,
 				channel: flags.canary ? "canary" : flags.stable ? "stable" : undefined,
 			});
 		}

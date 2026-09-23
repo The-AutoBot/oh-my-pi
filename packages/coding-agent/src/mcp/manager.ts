@@ -293,6 +293,8 @@ export class MCPManager {
 	 * attempt is pending.
 	 */
 	#lostRemoteServers = new Map<string, { timer: NodeJS.Timeout | undefined; delayMs: number }>();
+	#restartQuiescence: symbol | undefined;
+	readonly #restartDeferredReconnects = new Set<string>();
 
 	constructor(
 		private cwd: string,
@@ -300,6 +302,59 @@ export class MCPManager {
 		private loadConfigs: MCPConfigLoader = loadAllMCPConfigs,
 		private reconnectPolicy: MCPReconnectPolicy = DEFAULT_RECONNECT_POLICY,
 	) {}
+
+	/**
+	 * Atomically fence connection creation/reconnection and quiesce every
+	 * currently connected transport. Pending connection work makes admission
+	 * fail closed; releasing the guard restores the manager unchanged.
+	 */
+	acquireRestartQuiescence(): { release(): void } | undefined {
+		if (
+			this.#restartQuiescence !== undefined ||
+			this.#pendingConnections.size > 0 ||
+			this.#pendingToolLoads.size > 0 ||
+			this.#pendingReconnections.size > 0
+		) {
+			return undefined;
+		}
+		const token = Symbol();
+		this.#restartQuiescence = token;
+		const transports: Array<{ release(): void }> = [];
+		const release = (): void => {
+			for (let index = transports.length - 1; index >= 0; index--) transports[index]!.release();
+			transports.length = 0;
+			if (this.#restartQuiescence !== token) return;
+			this.#restartQuiescence = undefined;
+			const reconnects = Array.from(this.#restartDeferredReconnects);
+			this.#restartDeferredReconnects.clear();
+			for (const name of reconnects) void this.reconnectServer(name);
+		};
+		for (const connection of this.#connections.values()) {
+			const acquire = connection.transport.acquireRestartQuiescence;
+			if (!acquire) {
+				release();
+				return undefined;
+			}
+			const guard = acquire.call(connection.transport);
+			if (!guard) {
+				release();
+				return undefined;
+			}
+			transports.push(guard);
+		}
+		return { release };
+	}
+
+	get restartQuiescenceReason(): string | undefined {
+		if (this.#pendingConnections.size > 0 || this.#pendingToolLoads.size > 0 || this.#pendingReconnections.size > 0) {
+			return "mcp-connection-active";
+		}
+		for (const connection of this.#connections.values()) {
+			if (connection.transport.hasActiveRequests === true) return "mcp-request-active";
+			if (!connection.transport.acquireRestartQuiescence) return "mcp-restart-quiescence-unsupported";
+		}
+		return this.#restartQuiescence === undefined ? undefined : "mcp-restart-quiescence-unavailable";
+	}
 
 	/**
 	 * Register a listener for MCP connection lifecycle events
@@ -589,6 +644,9 @@ export class MCPManager {
 		sources: Record<string, SourceMeta>,
 		onStatus?: (event: McpConnectionStatusEvent) => void,
 	): Promise<MCPLoadResult> {
+		if (this.#restartQuiescence !== undefined) {
+			throw new Error("MCP manager is quiesced for runtime restart");
+		}
 		const notify = (event: McpConnectionStatusEvent) => {
 			onStatus?.(event);
 			this.#emitConnectionStatus(event);
@@ -1122,6 +1180,7 @@ export class MCPManager {
 		this.#pendingResourceRefresh.delete(name);
 		this.#reconnectHistory.delete(name);
 		this.#forgetLostServer(name);
+		this.#restartDeferredReconnects.delete(name);
 
 		const connection = this.#connections.get(name);
 
@@ -1155,6 +1214,7 @@ export class MCPManager {
 		this.#epoch++;
 		for (const name of this.#lostRemoteServers.keys()) this.#forgetLostServer(name);
 		const promises = Array.from(this.#connections, ([name, connection]) => this.#discardConnection(name, connection));
+		this.#restartDeferredReconnects.clear();
 		await Promise.allSettled(promises);
 
 		this.#pendingConnections.clear();
@@ -1187,6 +1247,10 @@ export class MCPManager {
 		name: string,
 		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge },
 	): Promise<MCPServerConnection | null> {
+		if (this.#restartQuiescence !== undefined) {
+			this.#restartDeferredReconnects.add(name);
+			return null;
+		}
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
 		}
@@ -1241,6 +1305,10 @@ export class MCPManager {
 		state.delayMs = Math.min(delayMs * 2, this.reconnectPolicy.retryMaxMs);
 		state.timer = setTimeout(() => {
 			state.timer = undefined;
+			if (this.#restartQuiescence !== undefined) {
+				this.#restartDeferredReconnects.add(name);
+				return;
+			}
 			if (this.#lostRemoteServers.get(name) !== state || this.#pendingReconnections.has(name)) return;
 			void this.#trackReconnect(name, this.#doReconnect(name, { scheduled: true }));
 		}, delayMs);
