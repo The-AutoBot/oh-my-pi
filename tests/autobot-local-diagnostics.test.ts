@@ -375,6 +375,67 @@ if (process.platform === "win32" && process.arch === "x64") {
 		OMP_PROCESS_TIMEOUT_MS,
 	);
 	test(
+		"reports a successful resolver that omits its mandatory repair intent",
+		async () => {
+			const workRoot = await createPrivateRoot();
+			const worktree = path.join(workRoot, "worktree");
+			await fs.mkdir(worktree);
+			const wrapper = path.join(workRoot, "omit-repair-intent.cmd");
+			await fs.writeFile(wrapper, "@echo off\r\nexit /b 0\r\n", "utf8");
+			const recorder = await createLocalCommandRecorder(workRoot);
+			const config: LocalAutomationConfig = {
+				schemaVersion: 1,
+				repository: "The-AutoBot/oh-my-pi",
+				canonicalBranch: "main",
+				integrationBranch: "autobot-local",
+				upstreamRepository: "https://github.com/example/upstream.git",
+				upstreamRef: "latest-release",
+				workRoot,
+				runnerBun: process.execPath,
+				runnerBunVersion: "0.0.0",
+				compilerBun: process.execPath,
+				compilerBunVersion: "0.0.0",
+				nativeAddonDirectory: workRoot,
+				nativeAddonProvenanceSha256: "a".repeat(64),
+				ompExecutable: wrapper,
+				coordinatorRoot: workRoot,
+				keyId: "test-key",
+				privateKeyPath: wrapper,
+				publicKeyPath: wrapper,
+				channelRepository: "The-AutoBot/channel",
+				channelBranch: "main",
+				channelPath: "signed-envelope.json",
+				allowInitial: false,
+				maxOmpAttempts: 1,
+				ompMaxTime: "30s",
+			};
+
+			await expect(
+				runLocalOmp(
+					config,
+					{
+						cwd: worktree,
+						reason: "conflicts",
+						forkCommit: "a".repeat(40),
+						upstreamCommit: "b".repeat(40),
+						sensitivePaths: [],
+					},
+					recorder,
+				),
+			).rejects.toThrow("Local OMP returned without a repair intent");
+			const records = JSON.parse(await fs.readFile(journalPath(workRoot), "utf8")).records;
+			expect(records.at(-1)).toEqual({
+				stage: "omp",
+				commandKind: "omp-invocation",
+				outcome: "exited",
+				timedOut: false,
+				exitCode: 0,
+				durationMs: expect.any(Number),
+			});
+		},
+		OMP_PROCESS_TIMEOUT_MS,
+	);
+	test(
 		"rejects invalid failed-step authority before launch and passes only the validated identity and source scope",
 		async () => {
 			const workRoot = await createPrivateRoot();

@@ -897,6 +897,19 @@ OMP is invoked only to resolve an integration conflict, perform the mandatory
 review of a sensitive compatibility change, or repair an eligible application
 build or smoke failure.
 
+Source synchronization keeps Git's whitespace gate strict for every authored
+integration change. The only exception is a path whose candidate mode, type,
+and blob exactly equal the same path in the immutable pinned upstream input;
+the controller applies that proof independently to the staged and committed
+snapshots, without caching it across mutations. Git-native conflict-marker
+checks still apply, and unknown diagnostics, same-path authored changes, and
+all other whitespace errors fail closed. During conflict resolution, an
+unavailable focused check caused only by dependencies or native artifacts not
+present in the isolated merge worktree is reported as not run rather than
+withholding the mandatory nonce-bound structural repair declaration. The
+controller's subsequent pinned dependency, build, test, native, signing, and
+publication gates remain authoritative.
+
 As a caller/controller integrity guard, the trusted producer checkout must keep
 the same pinned `HEAD` and have no staged or unstaged tracked changes at startup
 and immediately before and after every OMP hook. Untracked or ignored

@@ -90,9 +90,14 @@ poll status.
   them. Never bypass or weaken native validation or provenance. If a genuine cross-file source
   conflict cannot be resolved inside the owned paths, report a blocker rather than expanding
   scope.
-- Verify that the owned conflicts are cleared and run only existing checks appropriate to that
-  conflict repair. Do not preempt downstream normalization in order to make a check pass. Then
-  programmatically derive and declare the complete final staged merge path set against
+- Verify that the owned conflicts are cleared. Run only existing focused checks that are
+  immediately runnable with the dependencies already present in the isolated worktree; never
+  install or substitute dependencies to make a resolver-local check available. A missing local
+  dependency or native artifact is not evidence that the structural merge failed: report that
+  check as not run, without claiming it passed, and still write the mandatory repair intent so
+  the controller can apply its later pinned dependency, compilation, test, native, and signing
+  gates. A focused check that does run and exposes a defect in the owned resolution remains a
+  blocker. Programmatically derive and declare the complete final staged merge path set against
   `forkCommit`; do not hand-select it from the original conflict list.
 
 ### Compatibility
@@ -142,8 +147,8 @@ security, or release validation.
 
 ### Repair intent
 
-After an unblocked repair and its focused checks, write one UTF-8 JSON object to the exact private
-`repairIntent.path` from the context. It must contain exactly
+After an unblocked repair and its runnable focused checks, write one UTF-8 JSON object to the exact
+private `repairIntent.path` from the context. It must contain exactly
    `schemaVersion: 1`, the supplied `nonce`, and a `paths` array of distinct repository-relative
    paths. This nonce-bound repair intent is the worker's only output authority; it does not select
    commands, skip checks, or authorize continuation from any pipeline point. List every changed,

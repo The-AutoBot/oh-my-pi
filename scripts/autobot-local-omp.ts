@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
-import { getAgentDir, MAIN_CONFIG_FILENAMES } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isEnoent, MAIN_CONFIG_FILENAMES } from "@oh-my-pi/pi-utils";
 import {
 	assertAutoBotPrivateFile,
 	ensureAutoBotPrivateDirectory,
@@ -657,8 +657,14 @@ async function createPrivateContext(
 }
 
 async function readRepairIntent(context: PrivateContext): Promise<RepairIntent> {
+	let intentPath: string;
 	try {
-		const intentPath = await assertAutoBotPrivateFile(context.intentPath);
+		intentPath = await assertAutoBotPrivateFile(context.intentPath);
+	} catch (error) {
+		if (isEnoent(error)) throw new Error("Local OMP returned without a repair intent");
+		throw new Error("Local OMP repair intent is invalid");
+	}
+	try {
 		const stat = await fs.stat(intentPath);
 		if (!stat.isFile() || stat.size <= 0 || stat.size > maxRepairIntentBytes) throw new Error("invalid size");
 		let parsed: unknown;
@@ -668,7 +674,8 @@ async function readRepairIntent(context: PrivateContext): Promise<RepairIntent> 
 			throw new Error("invalid JSON");
 		}
 		return parseRepairIntent(parsed, context.intentNonce);
-	} catch {
+	} catch (error) {
+		if (isEnoent(error)) throw new Error("Local OMP returned without a repair intent");
 		throw new Error("Local OMP repair intent is invalid");
 	}
 }
